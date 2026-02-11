@@ -6,6 +6,7 @@
 
 use crate::arch::TargetArch;
 use crate::link::MergedLayout;
+use crate::segment::{align_up_usize, build_segment_buffer};
 use std::io::Write;
 
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
@@ -29,13 +30,6 @@ fn write_u64(w: &mut impl Write, val: u64) -> std::io::Result<()> {
     w.write_all(&val.to_le_bytes())
 }
 
-fn align_up(value: usize, align: usize) -> usize {
-    if align == 0 {
-        return value;
-    }
-    (value + align - 1) & !(align - 1)
-}
-
 fn pad_segname(name: &str) -> [u8; 16] {
     let mut buf = [0u8; 16];
     let len = name.len().min(16);
@@ -49,9 +43,9 @@ pub fn emit_macho_executable(
     entry: u64,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
-    let (base, seg_buffer) = build_segment_buffer(layout, arch);
+    let (base, seg_buffer) = build_segment_buffer(layout, 0x100000000);
     let text_size = seg_buffer.len();
-    let text_size_aligned = align_up(text_size, PAGE_SIZE);
+    let text_size_aligned = align_up_usize(text_size, PAGE_SIZE);
 
     let cputype = arch.to_macho_cputype();
     if cputype == 0 {
@@ -105,7 +99,7 @@ pub fn emit_macho_executable(
 
     let dyld_path = "/usr/lib/dyld\0";
     let dyld_len = dyld_path.len();
-    let dyld_cmd_size = align_up(24 + dyld_len, 8);
+    let dyld_cmd_size = align_up_usize(24 + dyld_len, 8);
     let mut lc_dyld = vec![0u8; dyld_cmd_size];
     lc_dyld[0..4].copy_from_slice(&LC_LOAD_DYLINKER.to_le_bytes());
     lc_dyld[4..8].copy_from_slice(&(dyld_cmd_size as u32).to_le_bytes());
@@ -120,7 +114,7 @@ pub fn emit_macho_executable(
 
     let lib_path = "/usr/lib/libSystem.B.dylib\0";
     let lib_len = lib_path.len();
-    let lib_cmd_size = align_up(24 + lib_len, 8);
+    let lib_cmd_size = align_up_usize(24 + lib_len, 8);
     let mut lc_lib = vec![0u8; lib_cmd_size];
     lc_lib[0..4].copy_from_slice(&LC_LOAD_DYLIB.to_le_bytes());
     lc_lib[4..8].copy_from_slice(&(lib_cmd_size as u32).to_le_bytes());
@@ -145,7 +139,7 @@ pub fn emit_macho_executable(
 
     out.write_all(&lc_buf)?;
 
-    let data_start = align_up(32 + sizeofcmds as usize, PAGE_SIZE);
+    let data_start = align_up_usize(32 + sizeofcmds as usize, PAGE_SIZE);
     let pad = data_start - 32 - sizeofcmds as usize;
     if pad > 0 {
         out.write_all(&vec![0u8; pad])?;
@@ -159,32 +153,6 @@ pub fn emit_macho_executable(
     }
 
     Ok(())
-}
-
-fn build_segment_buffer(layout: &MergedLayout, _arch: TargetArch) -> (u64, Vec<u8>) {
-    let base = layout
-        .sections
-        .first()
-        .map(|s| s.vaddr)
-        .unwrap_or(0x100000000);
-
-    let end = layout
-        .sections
-        .iter()
-        .map(|s| s.vaddr + s.data.len() as u64)
-        .max()
-        .unwrap_or(base);
-
-    let seg_size = (end - base) as usize;
-    let mut buf = vec![0u8; seg_size];
-
-    for sec in &layout.sections {
-        let off = (sec.vaddr - base) as usize;
-        let len = sec.data.len().min(seg_size.saturating_sub(off));
-        buf[off..off + len].copy_from_slice(&sec.data[..len]);
-    }
-
-    (base, buf)
 }
 
 #[cfg(test)]

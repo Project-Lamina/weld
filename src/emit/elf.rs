@@ -5,6 +5,7 @@
 
 use crate::arch::TargetArch;
 use crate::link::MergedLayout;
+use crate::segment::{align_up_u64, build_segment_buffer};
 use std::io::Write;
 
 const EI_MAG0: u8 = 0x7f;
@@ -23,27 +24,20 @@ const PF_W: u32 = 2;
 const PF_X: u32 = 1;
 const ELF64_PHDR_SIZE: usize = 56;
 
-fn align_up(value: u64, align: u64) -> u64 {
-    if align == 0 {
-        return value;
-    }
-    (value + align - 1) & !(align - 1)
-}
-
 pub fn emit_elf_executable(
     layout: &MergedLayout,
     arch: TargetArch,
     entry: u64,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
-    let (base, seg_buffer) = build_segment_buffer(layout, arch);
+    let (base, seg_buffer) = build_segment_buffer(layout, arch.default_load_base());
     let seg_size = seg_buffer.len() as u64;
     let seg_align = arch.page_align();
 
     let phoff = 64u64;
     let phnum = 2u16;
     let ph_size = (phnum as usize) * ELF64_PHDR_SIZE;
-    let seg_offset = align_up(phoff + ph_size as u64, seg_align);
+    let seg_offset = align_up_u64(phoff + ph_size as u64, seg_align);
 
     let mut ehdr = [0u8; 64];
     ehdr[0..4].copy_from_slice(&[EI_MAG0, EI_MAG1, EI_MAG2, EI_MAG3]);
@@ -88,36 +82,10 @@ pub fn emit_elf_executable(
     Ok(())
 }
 
-fn build_segment_buffer(layout: &MergedLayout, arch: TargetArch) -> (u64, Vec<u8>) {
-    let base = layout
-        .sections
-        .first()
-        .map(|s| s.vaddr)
-        .unwrap_or(arch.default_load_base());
-
-    let end = layout
-        .sections
-        .iter()
-        .map(|s| s.vaddr + s.data.len() as u64)
-        .max()
-        .unwrap_or(base);
-
-    let seg_size = (end - base) as usize;
-    let mut buf = vec![0u8; seg_size];
-
-    for sec in &layout.sections {
-        let off = (sec.vaddr - base) as usize;
-        let len = sec.data.len().min(seg_size.saturating_sub(off));
-        buf[off..off + len].copy_from_slice(&sec.data[..len]);
-    }
-
-    (base, buf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::{link_single_object, MergedSection};
+    use crate::link::{MergedSection, link_single_object};
     use std::collections::HashMap;
 
     #[test]
@@ -178,8 +146,8 @@ mod tests {
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_emit_test.o");
 
-        let mut ras = ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
-            .expect("ras");
+        let mut ras =
+            ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras");
         ras.assemble(asm, &tmp).expect("assemble");
 
         let data = std::fs::read(&tmp).expect("read");
@@ -187,14 +155,11 @@ mod tests {
 
         let result = link_single_object(&data).expect("link");
         let arch = TargetArch::from_elf_machine(result.e_machine).expect("arch");
-        let entry = result.symbol_addrs.get("main").copied().unwrap_or_else(|| {
-            result
-                .layout
-                .sections
-                .first()
-                .map(|s| s.vaddr)
-                .unwrap()
-        });
+        let entry = result
+            .symbol_addrs
+            .get("main")
+            .copied()
+            .unwrap_or_else(|| result.layout.sections.first().map(|s| s.vaddr).unwrap());
 
         let mut out = Vec::new();
         emit_elf_executable(&result.layout, arch, entry, &mut out).expect("emit");
