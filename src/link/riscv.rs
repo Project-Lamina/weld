@@ -11,6 +11,7 @@ pub fn apply_relocations(
     _sections: &[SectionHeader],
     _names: &[String],
     _symbol_addrs: &[Option<u64>],
+    _section_offset: Option<&std::collections::HashMap<String, u64>>,
 ) -> Result<(), String> {
     Err("RISC-V relocations not yet implemented".to_string())
 }
