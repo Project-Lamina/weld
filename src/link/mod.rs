@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 mod aarch64;
+pub mod macho;
 mod riscv;
 mod x86_64;
 
