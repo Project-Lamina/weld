@@ -23,6 +23,38 @@ pub enum SectionType {
     Rela = 4,
 }
 
+const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
+const ELF64_SYM_SIZE: usize = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SymBind {
+    Local = 0,
+    Global = 1,
+    Weak = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SymType {
+    Notype = 0,
+    Object = 1,
+    Func = 2,
+    Section = 3,
+    File = 4,
+}
+
+#[derive(Debug, Clone)]
+pub struct Symbol {
+    pub name_offset: u32,
+    pub bind: u8,
+    pub sym_type: u8,
+    pub st_shndx: u16,
+    pub st_value: u64,
+    pub st_size: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SectionHeader {
     pub name_offset: u32,
@@ -120,6 +152,60 @@ pub fn parse_section_header(data: &[u8], off: u64) -> Result<SectionHeader, Stri
     })
 }
 
+pub fn parse_symbol_entry(data: &[u8], off: usize) -> Result<Symbol, String> {
+    if data.len() < off + ELF64_SYM_SIZE {
+        return Err("file too short for symbol entry".to_string());
+    }
+    let st_name = read_u32_le(data, off).ok_or("bad st_name")?;
+    let st_info = data.get(off + 4).copied().ok_or("bad st_info")?;
+    let _st_other = data.get(off + 5).copied();
+    let st_shndx = read_u16_le(data, off + 6).ok_or("bad st_shndx")?;
+    let st_value = read_u64_le(data, off + 8).ok_or("bad st_value")?;
+    let st_size = read_u64_le(data, off + 16).ok_or("bad st_size")?;
+
+    let bind = st_info >> 4;
+    let sym_type = st_info & 0xf;
+
+    Ok(Symbol {
+        name_offset: st_name,
+        bind,
+        sym_type,
+        st_shndx,
+        st_value,
+        st_size,
+    })
+}
+
+pub fn get_strtab_string(strtab: &[u8], offset: u32) -> Option<String> {
+    if offset == 0 {
+        return Some(String::new());
+    }
+    let mut i = offset as usize;
+    while i < strtab.len() && strtab[i] != 0 {
+        i += 1;
+    }
+    let slice = strtab.get(offset as usize..i)?;
+    std::str::from_utf8(slice).ok().map(String::from)
+}
+
+pub fn parse_symtab(data: &[u8], symtab_sh: &SectionHeader) -> Result<Vec<Symbol>, String> {
+    let sym_start = symtab_sh.sh_offset as usize;
+    let entsize = symtab_sh.sh_entsize as usize;
+    let count = if entsize > 0 {
+        (symtab_sh.sh_size as usize) / entsize
+    } else {
+        (symtab_sh.sh_size as usize) / ELF64_SYM_SIZE
+    };
+
+    let mut symbols = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = sym_start + i * ELF64_SYM_SIZE;
+        let sym = parse_symbol_entry(data, off)?;
+        symbols.push(sym);
+    }
+    Ok(symbols)
+}
+
 pub fn get_section_name(_data: &[u8], shstrtab: &[u8], name_offset: u32) -> Option<String> {
     let mut i = name_offset as usize;
     while i < shstrtab.len() && shstrtab[i] != 0 {
@@ -132,6 +218,12 @@ pub fn get_section_name(_data: &[u8], shstrtab: &[u8], name_offset: u32) -> Opti
 pub fn parse_elf64_file(path: &Path) -> Result<(Elf64Header, Vec<SectionHeader>, Vec<String>), String> {
     let data = std::fs::read(path).map_err(|e| format!("read failed: {}", e))?;
     parse_elf64_slice(&data)
+}
+
+pub fn get_strtab_from_section<'a>(data: &'a [u8], sh: &SectionHeader) -> &'a [u8] {
+    let start = sh.sh_offset as usize;
+    let end = start + sh.sh_size as usize;
+    data.get(start..end).unwrap_or(&[])
 }
 
 pub fn parse_elf64_slice(data: &[u8]) -> Result<(Elf64Header, Vec<SectionHeader>, Vec<String>), String> {
@@ -192,5 +284,29 @@ mod tests {
         assert_eq!(header.e_machine, 62);
         assert_eq!(header.e_shoff, 64);
         assert_eq!(header.e_shnum, 3);
+    }
+
+    #[test]
+    fn test_parse_symbol_entry() {
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&1u32.to_le_bytes());
+        data[4] = 0x12;
+        data[6..8].copy_from_slice(&1u16.to_le_bytes());
+        data[8..16].copy_from_slice(&0x100u64.to_le_bytes());
+
+        let sym = parse_symbol_entry(&data, 0).expect("parse");
+        assert_eq!(sym.name_offset, 1);
+        assert_eq!(sym.bind, 1);
+        assert_eq!(sym.sym_type, 2);
+        assert_eq!(sym.st_shndx, 1);
+        assert_eq!(sym.st_value, 0x100);
+    }
+
+    #[test]
+    fn test_get_strtab_string() {
+        let strtab = b"\0main\0foo\0";
+        assert_eq!(get_strtab_string(strtab, 0).as_deref(), Some(""));
+        assert_eq!(get_strtab_string(strtab, 1).as_deref(), Some("main"));
+        assert_eq!(get_strtab_string(strtab, 6).as_deref(), Some("foo"));
     }
 }
