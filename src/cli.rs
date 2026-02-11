@@ -83,6 +83,14 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
                     i += 1;
                 }
             }
+            s if s.starts_with("-mmacosx-version-min") || s.starts_with("-mios") => {}
+            "-dead_strip" | "-exported_symbols_list" | "-install_name" => {
+                if argv.get(i).map(|s| !s.starts_with('-')).unwrap_or(false) {
+                    i += 1;
+                }
+            }
+            "-nodefaultlibs" | "-nostdlib" => {}
+            s if s.starts_with("-Wl,") => {}
             _ => {
                 if !a.starts_with('-') {
                     args.input_files.push(PathBuf::from(a.clone()));

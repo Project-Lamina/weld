@@ -10,6 +10,7 @@ use std::path::Path;
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
 const MH_CIGAM_64: u32 = 0xCFFAEDFE;
 const MH_OBJECT: u32 = 1;
+const MH_DYLIB: u32 = 6;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_SYMTAB: u32 = 0x0b;
 const LC_SYMSEG: u32 = 0x02;
@@ -64,6 +65,8 @@ pub const GENERIC_RELOC_VANILLA: u32 = 0;
 pub const ARM64_RELOC_BRANCH26: u32 = 2;
 pub const ARM64_RELOC_PAGE21: u32 = 3;
 pub const ARM64_RELOC_PAGEOFF12: u32 = 4;
+pub const ARM64_RELOC_GOT_LOAD_PAGE21: u32 = 5;
+pub const ARM64_RELOC_GOT_LOAD_PAGEOFF12: u32 = 6;
 pub const X86_64_RELOC_BRANCH: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
@@ -128,6 +131,12 @@ pub fn is_macho64(data: &[u8]) -> bool {
     }
     let magic = read_u32_le(data, 0).or_else(|| read_u32_be(data, 0));
     magic == Some(MH_MAGIC_64) || magic == Some(MH_CIGAM_64)
+}
+
+pub fn is_macho_dylib(data: &[u8]) -> bool {
+    is_macho64(data)
+        && data.len() >= 16
+        && read_u32_le(data, 12).map(|ft| ft == MH_DYLIB).unwrap_or(false)
 }
 
 pub fn parse_macho64_header(data: &[u8]) -> Result<Macho64Header, String> {
