@@ -68,11 +68,19 @@ pub struct ResolvedSymbol {
     pub is_defined: bool,
 }
 
+#[derive(Debug, Default)]
+pub struct DynamicLinkInfo {
+    pub needed: Vec<String>,
+    pub plt_symbols: Vec<String>,
+    pub interpreter: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct LinkResult {
     pub layout: MergedLayout,
     pub e_machine: u16,
     pub symbol_addrs: HashMap<String, u64>,
+    pub dynamic: Option<DynamicLinkInfo>,
 }
 
 fn align_up(value: u64, align: u64) -> u64 {
@@ -446,15 +454,17 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
         layout,
         e_machine: header.e_machine,
         symbol_addrs,
+        dynamic: None,
     })
 }
 
-/// Link multiple object files. Same e_machine required. No -l libraries.
-pub fn link_multi_object(objects: &[&[u8]]) -> Result<LinkResult, String> {
+/// Link multiple object files. Same e_machine required.
+/// When libs is Some and contains "c" or "System", adds PLT/GOT for undefined symbols.
+pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<LinkResult, String> {
     if objects.is_empty() {
         return Err("no objects to link".to_string());
     }
-    if objects.len() == 1 {
+    if objects.len() == 1 && libs.is_none() {
         return link_single_object(objects[0]);
     }
 
@@ -468,14 +478,14 @@ pub fn link_multi_object(objects: &[&[u8]]) -> Result<LinkResult, String> {
         parsed.push(h.join().map_err(|_| "thread join failed".to_string())??);
     }
 
-    link_multi_object_parsed(&parsed)
+    link_multi_object_parsed(&parsed, libs)
 }
 
-fn link_multi_object_parsed(parsed: &[ParsedObject]) -> Result<LinkResult, String> {
+fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) -> Result<LinkResult, String> {
     if parsed.is_empty() {
         return Err("no objects to link".to_string());
     }
-    if parsed.len() == 1 {
+    if parsed.len() == 1 && libs.is_none() {
         return link_single_object(&parsed[0].data);
     }
 
@@ -503,6 +513,133 @@ fn link_multi_object_parsed(parsed: &[ParsedObject]) -> Result<LinkResult, Strin
             if let Some(addr) = r.address {
                 global_symbols.entry(name).or_insert(addr);
             }
+        }
+    }
+
+    let mut dynamic_info: Option<DynamicLinkInfo> = None;
+    let has_libc = libs.map(|l| l.iter().any(|x| x == "c" || x == "System")).unwrap_or(false);
+
+    if has_libc
+        && arch == TargetArch::X86_64
+        && e_machine == 62
+    {
+        let mut undefined: Vec<String> = Vec::new();
+        for (obj_idx, obj) in parsed.iter().enumerate() {
+            let obj_by_index = &resolved_by_index_per_object[obj_idx];
+            let symbol_names = symbol_names_by_index(&obj.data, &obj.sections)?;
+            for (i, addr) in obj_by_index.iter().enumerate() {
+                if addr.is_none() {
+                    if let Some(name) = symbol_names.get(i) {
+                        if !name.is_empty() && !global_symbols.contains_key(name) {
+                            if !undefined.contains(name) {
+                                undefined.push(name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !undefined.is_empty() {
+            let (plt_data, got_plt_data) = build_plt_got_x86_64(&undefined, &layout)?;
+            let last = layout.sections.last().ok_or("no sections")?;
+            let mut vaddr = align_up(last.vaddr + last.data.len() as u64, 16);
+
+            let plt_vaddr = vaddr;
+            layout.sections.push(MergedSection {
+                name: ".plt".into(),
+                data: plt_data,
+                vaddr: plt_vaddr,
+                flags: SHF_ALLOC | SHF_EXECINSTR,
+                align: 16,
+            });
+            layout.section_by_name.insert(".plt".into(), layout.sections.len() - 1);
+            vaddr = align_up(vaddr + layout.sections.last().unwrap().data.len() as u64, 8);
+
+            let got_plt_vaddr = vaddr;
+            layout.sections.push(MergedSection {
+                name: ".got.plt".into(),
+                data: got_plt_data,
+                vaddr: got_plt_vaddr,
+                flags: SHF_ALLOC | SHF_WRITE,
+                align: 8,
+            });
+            layout.section_by_name.insert(".got.plt".into(), layout.sections.len() - 1);
+            let got_plt_size = 24 + (undefined.len() as u64) * 8;
+            vaddr = align_up(got_plt_vaddr + got_plt_size, 8);
+
+            let (dynsym_data, dynstr_data, rela_plt_data) =
+                build_dynamic_sections(&undefined, got_plt_vaddr)?;
+            let dynsym_vaddr = vaddr;
+            let dynsym_size = dynsym_data.len() as u64;
+            layout.sections.push(MergedSection {
+                name: ".dynsym".into(),
+                data: dynsym_data,
+                vaddr: dynsym_vaddr,
+                flags: SHF_ALLOC,
+                align: 8,
+            });
+            layout.section_by_name.insert(".dynsym".into(), layout.sections.len() - 1);
+            vaddr = align_up(vaddr + dynsym_size, 8);
+
+            let dynstr_vaddr = vaddr;
+            let dynstr_size = dynstr_data.len() as u64;
+            layout.sections.push(MergedSection {
+                name: ".dynstr".into(),
+                data: dynstr_data,
+                vaddr: dynstr_vaddr,
+                flags: SHF_ALLOC,
+                align: 1,
+            });
+            layout.section_by_name.insert(".dynstr".into(), layout.sections.len() - 1);
+            vaddr = align_up(vaddr + dynstr_size, 8);
+
+            let rela_plt_vaddr = vaddr;
+            let rela_plt_size = rela_plt_data.len() as u64;
+            layout.sections.push(MergedSection {
+                name: ".rela.plt".into(),
+                data: rela_plt_data,
+                vaddr: rela_plt_vaddr,
+                flags: SHF_ALLOC,
+                align: 8,
+            });
+            layout.section_by_name.insert(".rela.plt".into(), layout.sections.len() - 1);
+            vaddr = align_up(vaddr + rela_plt_size, 8);
+
+            let dynamic_data = build_dynamic_section_content(
+                got_plt_vaddr,
+                dynsym_vaddr,
+                dynstr_vaddr,
+                dynstr_size,
+                rela_plt_vaddr,
+                rela_plt_size,
+            )?;
+            let dynamic_vaddr = vaddr;
+            layout.sections.push(MergedSection {
+                name: ".dynamic".into(),
+                data: dynamic_data,
+                vaddr: dynamic_vaddr,
+                flags: SHF_ALLOC | SHF_WRITE,
+                align: 8,
+            });
+            layout.section_by_name.insert(".dynamic".into(), layout.sections.len() - 1);
+
+            for (i, sym) in undefined.iter().enumerate() {
+                let plt_entry_addr = plt_vaddr + 16 + (i as u64) * 16;
+                global_symbols.insert(sym.clone(), plt_entry_addr);
+            }
+
+            let interpreter = "/lib64/ld-linux-x86-64.so.2".to_string();
+            let needed = if libs.as_ref().map(|l| l.contains(&"System".into())).unwrap_or(false) {
+                vec!["libSystem.B.dylib".into()]
+            } else {
+                vec!["libc.so.6".into()]
+            };
+            dynamic_info = Some(DynamicLinkInfo {
+                needed,
+                plt_symbols: undefined,
+                interpreter: Some(interpreter),
+            });
         }
     }
 
@@ -542,7 +679,109 @@ fn link_multi_object_parsed(parsed: &[ParsedObject]) -> Result<LinkResult, Strin
         layout,
         e_machine,
         symbol_addrs: global_symbols,
+        dynamic: dynamic_info,
     })
+}
+
+fn build_dynamic_sections(
+    plt_symbols: &[String],
+    got_plt_vaddr: u64,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    let mut dynstr = vec![0u8];
+    dynstr.extend_from_slice(b"libc.so.6\0");
+
+    let mut str_offsets: Vec<u32> = Vec::with_capacity(plt_symbols.len());
+    for sym in plt_symbols {
+        let off = dynstr.len() as u32;
+        str_offsets.push(off);
+        dynstr.extend_from_slice(sym.as_bytes());
+        dynstr.push(0);
+    }
+
+    let mut dynsym = Vec::with_capacity(plt_symbols.len() * 24);
+    for &off in &str_offsets {
+        dynsym.extend_from_slice(&off.to_le_bytes());
+        dynsym.push((1 << 4) | 2); // STB_GLOBAL | STT_FUNC
+        dynsym.push(0);
+        dynsym.extend_from_slice(&0u16.to_le_bytes()); // st_shndx = SHN_UNDEF
+        dynsym.extend_from_slice(&0u64.to_le_bytes());
+        dynsym.extend_from_slice(&0u64.to_le_bytes());
+    }
+
+    let mut rela_plt = Vec::with_capacity(plt_symbols.len() * 24);
+    for (i, _) in plt_symbols.iter().enumerate() {
+        let r_offset = got_plt_vaddr + 24 + (i as u64) * 8;
+        let r_info = ((i as u64) << 32) | 7u64; // r_sym, R_X86_64_JUMP_SLOT
+        rela_plt.extend_from_slice(&r_offset.to_le_bytes());
+        rela_plt.extend_from_slice(&r_info.to_le_bytes());
+        rela_plt.extend_from_slice(&0i64.to_le_bytes());
+    }
+
+    Ok((dynsym, dynstr, rela_plt))
+}
+
+fn build_dynamic_section_content(
+    got_plt_vaddr: u64,
+    dynsym_vaddr: u64,
+    dynstr_vaddr: u64,
+    dynstr_size: u64,
+    rela_plt_vaddr: u64,
+    rela_plt_size: u64,
+) -> Result<Vec<u8>, String> {
+    let mut content = Vec::new();
+    fn push_dyn(content: &mut Vec<u8>, tag: u64, val: u64) {
+        content.extend_from_slice(&tag.to_le_bytes());
+        content.extend_from_slice(&val.to_le_bytes());
+    }
+    push_dyn(&mut content, 1, 1); // DT_NEEDED, "libc.so.6" at offset 1 in dynstr
+    push_dyn(&mut content, 5, dynstr_vaddr);
+    push_dyn(&mut content, 6, dynsym_vaddr);
+    push_dyn(&mut content, 10, dynstr_size);
+    push_dyn(&mut content, 11, 24);
+    push_dyn(&mut content, 3, got_plt_vaddr);
+    push_dyn(&mut content, 2, rela_plt_size);
+    push_dyn(&mut content, 20, 7);
+    push_dyn(&mut content, 23, rela_plt_vaddr);
+    push_dyn(&mut content, 0, 0);
+    Ok(content)
+}
+
+fn build_plt_got_x86_64(
+    plt_symbols: &[String],
+    layout: &MergedLayout,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let last = layout.sections.last().ok_or("no sections")?;
+    let vaddr = align_up(last.vaddr + last.data.len() as u64, 16);
+    let plt0_vaddr = vaddr;
+    let plt_size = 16 + (plt_symbols.len() as u64) * 16;
+    let got_plt_vaddr = align_up(vaddr + plt_size, 8);
+
+    let mut plt = Vec::new();
+    plt.extend_from_slice(&[0xff, 0x35]); // pushq rel32
+    let disp_push = (got_plt_vaddr as i64 + 8 - (plt0_vaddr as i64 + 6)) as i32;
+    plt.extend_from_slice(&disp_push.to_le_bytes());
+    plt.extend_from_slice(&[0xff, 0x25]); // jmpq *rel32
+    let disp_jmp = (got_plt_vaddr as i64 + 16 - (plt0_vaddr as i64 + 12)) as i32;
+    plt.extend_from_slice(&disp_jmp.to_le_bytes());
+    plt.extend_from_slice(&[0x90, 0x90]);
+
+    for (i, _) in plt_symbols.iter().enumerate() {
+        let plt_n_vaddr = plt0_vaddr + 16 + (i as u64) * 16;
+        let got_slot_vaddr = got_plt_vaddr + 24 + (i as u64) * 8;
+        plt.extend_from_slice(&[0xff, 0x25]);
+        let disp = (got_slot_vaddr as i64 - (plt_n_vaddr as i64 + 6)) as i32;
+        plt.extend_from_slice(&disp.to_le_bytes());
+        plt.push(0x68);
+        plt.extend_from_slice(&(i as u32).to_le_bytes());
+        plt.extend_from_slice(&[0xe9]);
+        let jmp_disp = (plt0_vaddr as i64 - (plt_n_vaddr as i64 + 11)) as i32;
+        plt.extend_from_slice(&jmp_disp.to_le_bytes());
+    }
+
+    let got_size = 24 + plt_symbols.len() * 8;
+    let got = vec![0u8; got_size];
+
+    Ok((plt, got))
 }
 
 pub fn apply_relocations(
@@ -657,7 +896,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp2);
 
         let objects: Vec<&[u8]> = vec![&d1, &d2];
-        let result = link_multi_object(&objects).expect("link_multi_object");
+        let result = link_multi_object(&objects, None).expect("link_multi_object");
         assert!(!result.layout.sections.is_empty());
         assert!(result.layout.section_by_name.get(".text").is_some());
         let text_idx = result
