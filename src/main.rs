@@ -1,13 +1,17 @@
 //! weld - Cross-platform linker for Lamina
 //!
 //! Drop-in replacement for ld/lld/mold. ld-style arguments.
+//! Platform priority: Linux and macOS first, Windows later.
 
+mod arch;
 mod elf;
+mod emit;
 mod link;
+mod platform;
 
 use std::env;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -154,12 +158,62 @@ fn run_linker(linker: &str, args: &[String], verbose: bool) -> i32 {
     }
 }
 
+fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
+    if args.input_files.len() != 1 || !args.libraries.is_empty() {
+        return None;
+    }
+    let out_path = args
+        .output_file
+        .as_ref()
+        .map(|p| p.as_path())
+        .unwrap_or(Path::new("a.out"));
+    let obj_path = args.input_files.first()?;
+    let obj_data = std::fs::read(obj_path).ok()?;
+    if obj_data.len() < 4 || &obj_data[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return None;
+    }
+
+    let result = match link::link_single_object(&obj_data) {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+
+    let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
+    let entry = args
+        .entry
+        .as_ref()
+        .and_then(|s| result.symbol_addrs.get(s).copied())
+        .or_else(|| result.symbol_addrs.get("main").copied())
+        .or_else(|| result.symbol_addrs.get("_start").copied())
+        .or_else(|| {
+            result
+                .layout
+                .sections
+                .first()
+                .filter(|s| s.name == ".text")
+                .map(|s| s.vaddr)
+        });
+
+    let entry = entry?;
+    let out_file = std::fs::File::create(out_path).ok()?;
+    let mut out = std::io::BufWriter::new(out_file);
+    emit::emit_elf_executable(&result.layout, arch, entry, &mut out).ok()?;
+    out.flush().ok()?;
+    Some(0)
+}
+
 fn main() {
     let argv: Vec<String> = env::args().collect();
     let link_args: Vec<String> = argv.get(1..).unwrap_or(&[]).to_vec();
 
     match parse_args() {
         Ok(args) => {
+            if let Some(0) = try_weld_link(&args) {
+                if args.verbose {
+                    eprintln!("[weld] linked with native backend");
+                }
+                std::process::exit(0);
+            }
             let linker = detect_linker();
             let status = run_linker(linker, &link_args, args.verbose);
             std::process::exit(status);
