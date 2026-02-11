@@ -4,8 +4,11 @@
 //! Supports single-object no-libc (ret42-style) initially.
 
 use crate::arch::TargetArch;
-use crate::link::{LinkResult, MergedLayout, MergedSection};
-use crate::macho::{Macho64Object, MachoSection, parse_macho64_object};
+use crate::link::{LinkResult, MergedLayout, MergedSection, ObjectSectionContrib};
+use crate::macho::{
+    parse_macho64_object, parse_macho_relocs, Macho64Object, MachoSection,
+    ARM64_RELOC_BRANCH26, GENERIC_RELOC_VANILLA,
+};
 use std::collections::HashMap;
 
 const PAGE_SIZE: u64 = 4096;
@@ -116,13 +119,212 @@ fn resolve_macho_symbols(obj: &Macho64Object, layout: &MergedLayout) -> HashMap<
     addrs
 }
 
+fn symbol_addr_by_index(
+    obj: &Macho64Object,
+    layout: &MergedLayout,
+    symbol_addrs: &HashMap<String, u64>,
+) -> Vec<Option<u64>> {
+    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
+    for (i, sec) in obj.sections.iter().enumerate() {
+        let sect_idx = (i + 1) as u8;
+        let name = if sec.sectname == "__text" {
+            ".text"
+        } else {
+            &sec.sectname
+        };
+        if let Some(&idx) = layout.section_by_name.get(name) {
+            vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr);
+        }
+    }
+
+    obj.symbols
+        .iter()
+        .map(|sym| {
+            if sym.is_defined {
+                vaddr_by_sect
+                    .get(&sym.sect)
+                    .map(|&base| base + sym.value)
+            } else {
+                symbol_addrs.get(sym.name.as_str()).copied()
+            }
+        })
+        .collect()
+}
+
+fn read_addend(data: &[u8], off: usize, length: u32) -> u64 {
+    match length {
+        0 => data.get(off).copied().unwrap_or(0) as u64,
+        1 => read_u16_le(data, off).unwrap_or(0) as u64,
+        2 => read_u32_le(data, off).unwrap_or(0) as u64,
+        3 => read_u64_le(data, off).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
+    data.get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
+    data.get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn read_u64_le(data: &[u8], off: usize) -> Option<u64> {
+    data.get(off..off + 8)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+}
+
+fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
+    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
+    buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
+}
+
+fn reloc_size(r_length: u32) -> usize {
+    match r_length {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => 4,
+    }
+}
+
+fn section_offset_from_contrib(
+    contrib: &HashMap<String, ObjectSectionContrib>,
+) -> HashMap<String, u64> {
+    contrib
+        .iter()
+        .map(|(k, v)| (k.clone(), v.offset_in_merged))
+        .collect()
+}
+
+fn apply_macho_relocations(
+    obj: &Macho64Object,
+    layout: &mut MergedLayout,
+    _symbol_addrs: &HashMap<String, u64>,
+    symbol_addr_by_idx: &[Option<u64>],
+    section_offset: Option<&HashMap<String, u64>>,
+) -> Result<(), String> {
+    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
+    for (i, sec) in obj.sections.iter().enumerate() {
+        let sect_idx = (i + 1) as u8;
+        let name: String = if sec.sectname == "__text" {
+            ".text".into()
+        } else {
+            sec.sectname.clone()
+        };
+        if let Some(&idx) = layout.section_by_name.get(&name) {
+            vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr);
+        }
+    }
+
+    for (_i, sec) in obj.sections.iter().enumerate() {
+        if sec.nreloc == 0 {
+            continue;
+        }
+        let merged_name: String = if sec.sectname == "__text" {
+            ".text".into()
+        } else {
+            sec.sectname.clone()
+        };
+        let Some(&merged_idx) = layout.section_by_name.get(&merged_name) else {
+            continue;
+        };
+        let merged = &mut layout.sections[merged_idx];
+        let relocs = parse_macho_relocs(&obj.data, sec.reloff, sec.nreloc);
+        let offset_in_merged = section_offset
+            .and_then(|m| m.get(&merged_name).copied())
+            .unwrap_or(0) as usize;
+
+        for r in &relocs {
+            let off = offset_in_merged + r.r_address as usize;
+            let size = reloc_size(r.r_length);
+            if merged.data.len() < off + size {
+                return Err(format!(
+                    "relocation offset {} + {} out of bounds (len {})",
+                    off,
+                    size,
+                    merged.data.len()
+                ));
+            }
+            let addend = read_addend(&merged.data, off, r.r_length);
+            let place_addr = merged.vaddr + off as u64;
+
+            let base = if r.r_extern {
+                let idx = r.r_symbolnum as usize;
+                let addr_opt = symbol_addr_by_idx.get(idx).and_then(|o| o.as_ref());
+                let Some(addr) = addr_opt else {
+                    let sym_name = obj.symbols.get(idx).map(|s| s.name.as_str()).unwrap_or("?");
+                    return Err(format!(
+                        "undefined symbol index {} ({}) for relocation",
+                        idx, sym_name
+                    ));
+                };
+                *addr
+            } else {
+                let sect_idx = r.r_symbolnum as u8;
+                let addr = vaddr_by_sect
+                    .get(&sect_idx)
+                    .copied()
+                    .ok_or_else(|| format!("unknown section index {} for relocation", sect_idx))?;
+                addr
+            };
+
+            let mut value = base.wrapping_add(addend);
+            if r.r_pcrel {
+                value = value.wrapping_sub(place_addr);
+            }
+
+            match r.r_type {
+                GENERIC_RELOC_VANILLA => {
+                    match r.r_length {
+                        0 => merged.data[off] = value as u8,
+                        1 => {
+                            let v = (value as u16).to_le_bytes();
+                            merged.data[off..off + 2].copy_from_slice(&v);
+                        }
+                        2 => write_u32_le(&mut merged.data, off, value as u32),
+                        3 => write_u64_le(&mut merged.data, off, value),
+                        _ => {}
+                    }
+                }
+                ARM64_RELOC_BRANCH26 => {
+                    let delta = value.wrapping_sub(place_addr);
+                    let imm26 = (delta >> 2) & 0x3FFFFFF;
+                    if merged.data.len() < off + 4 {
+                        return Err("branch reloc: buffer too short".to_string());
+                    }
+                    let insn = read_u32_le(&merged.data, off).unwrap_or(0);
+                    let patched = (insn & 0xFC000000) | (imm26 as u32);
+                    write_u32_le(&mut merged.data, off, patched);
+                }
+                _ => {
+                    return Err(format!(
+                        "unsupported Mach-O relocation type {}",
+                        r.r_type
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let obj = parse_macho64_object(data)?;
     let arch = TargetArch::from_macho_cputype(obj.header.cputype)
         .ok_or_else(|| format!("unsupported Mach-O cputype {}", obj.header.cputype))?;
 
-    let layout = merge_macho_sections(&obj);
+    let mut layout = merge_macho_sections(&obj);
     let symbol_addrs = resolve_macho_symbols(&obj, &layout);
+    let symbol_addr_by_idx = symbol_addr_by_index(&obj, &layout, &symbol_addrs);
+    apply_macho_relocations(&obj, &mut layout, &symbol_addrs, &symbol_addr_by_idx, None)?;
 
     let e_machine = arch.to_elf_machine();
 
@@ -130,5 +332,228 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
         layout,
         e_machine,
         symbol_addrs,
+        dynamic: None,
     })
+}
+
+pub fn link_macho_multi_object(datas: &[&[u8]]) -> Result<LinkResult, String> {
+    if datas.is_empty() {
+        return Err("no objects to link".to_string());
+    }
+    if datas.len() == 1 {
+        return link_macho_single_object(datas[0]);
+    }
+
+    let objects: Vec<Macho64Object> = datas
+        .iter()
+        .map(|d| parse_macho64_object(d))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (mut layout, section_contribs) = merge_macho_sections_multi(&objects)?;
+    let arch = TargetArch::from_macho_cputype(objects[0].header.cputype)
+        .ok_or_else(|| format!("unsupported Mach-O cputype {}", objects[0].header.cputype))?;
+    let e_machine = arch.to_elf_machine();
+
+    let mut global_symbols: HashMap<String, u64> = HashMap::new();
+    for (obj_idx, obj) in objects.iter().enumerate() {
+        let contrib = &section_contribs[obj_idx];
+        let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
+        for (i, sec) in obj.sections.iter().enumerate() {
+            let sect_idx = (i + 1) as u8;
+            let merged_name: String = if sec.sectname == "__text" {
+                ".text".into()
+            } else {
+                sec.sectname.clone()
+            };
+            if let (Some(&idx), Some(off)) = (
+                layout.section_by_name.get(&merged_name),
+                contrib.get(&merged_name),
+            ) {
+                vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr + off.offset_in_merged);
+            }
+        }
+        for sym in &obj.symbols {
+            if !sym.is_defined || sym.name.is_empty() {
+                continue;
+            }
+            if let Some(&base) = vaddr_by_sect.get(&sym.sect) {
+                let addr = base + sym.value;
+                global_symbols.entry(sym.name.clone()).or_insert(addr);
+            }
+        }
+    }
+
+    for (obj_idx, obj) in objects.iter().enumerate() {
+        let contrib = &section_contribs[obj_idx];
+        let symbol_addrs = symbol_addr_by_index_multi(obj, &layout, &global_symbols, contrib);
+        let offset_map = section_offset_from_contrib(contrib);
+        apply_macho_relocations(
+            obj,
+            &mut layout,
+            &global_symbols,
+            &symbol_addrs,
+            Some(&offset_map),
+        )?;
+    }
+
+    Ok(LinkResult {
+        layout,
+        e_machine,
+        symbol_addrs: global_symbols,
+        dynamic: None,
+    })
+}
+
+fn symbol_addr_by_index_multi(
+    obj: &Macho64Object,
+    layout: &MergedLayout,
+    global_symbols: &HashMap<String, u64>,
+    contrib: &HashMap<String, ObjectSectionContrib>,
+) -> Vec<Option<u64>> {
+    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
+    for (i, sec) in obj.sections.iter().enumerate() {
+        let sect_idx = (i + 1) as u8;
+        let merged_name: String = if sec.sectname == "__text" {
+            ".text".into()
+        } else {
+            sec.sectname.clone()
+        };
+        if let (Some(&idx), Some(off)) = (
+            layout.section_by_name.get(&merged_name),
+            contrib.get(&merged_name),
+        ) {
+            vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr + off.offset_in_merged);
+        }
+    }
+
+    obj.symbols
+        .iter()
+        .map(|sym| {
+            if sym.is_defined {
+                vaddr_by_sect
+                    .get(&sym.sect)
+                    .map(|&base| base + sym.value)
+            } else {
+                global_symbols
+                    .get(sym.name.as_str())
+                    .copied()
+                    .or_else(|| {
+                        let stripped = sym.name.strip_prefix('_').unwrap_or(sym.name.as_str());
+                        global_symbols.get(stripped).copied()
+                    })
+                    .or_else(|| {
+                        let with_underscore = format!("_{}", sym.name);
+                        global_symbols.get(&with_underscore).copied()
+                    })
+            }
+        })
+        .collect()
+}
+
+fn merge_macho_sections_multi(
+    objects: &[Macho64Object],
+) -> Result<(MergedLayout, Vec<HashMap<String, ObjectSectionContrib>>), String> {
+    if objects.is_empty() {
+        return Err("no objects to merge".to_string());
+    }
+    let cputype = objects[0].header.cputype;
+    for obj in objects.iter().skip(1) {
+        if obj.header.cputype != cputype {
+            return Err("Mach-O objects must have same cputype".to_string());
+        }
+    }
+
+    let section_order = [
+        ("__text", ".text"),
+        ("__cstring", "__cstring"),
+        ("__rodata", "__rodata"),
+        ("__data", "__data"),
+        ("__bss", "__bss"),
+    ];
+
+    let mut section_contribs: Vec<HashMap<String, ObjectSectionContrib>> =
+        (0..objects.len()).map(|_| HashMap::new()).collect();
+    let mut merged_data: HashMap<String, Vec<(Vec<u8>, u64)>> = HashMap::new();
+    let mut section_cumul: HashMap<String, u64> = HashMap::new();
+    let mut section_aligns: HashMap<String, u64> = HashMap::new();
+    let mut section_flags: HashMap<String, u64> = HashMap::new();
+
+    for (obj_idx, obj) in objects.iter().enumerate() {
+        for (sectname, merged_name) in &section_order {
+            let sec = obj
+                .sections
+                .iter()
+                .find(|s| s.sectname == *sectname && is_mergeable_section(s));
+            let Some(sec) = sec else {
+                continue;
+            };
+            let data = read_section_data(obj, sec);
+            let size = data.len() as u64;
+            let offset_in_merged = *section_cumul.get(*merged_name).unwrap_or(&0);
+            section_cumul.insert((*merged_name).to_string(), offset_in_merged + size);
+
+            let a = if sec.align > 0 { sec.align as u64 } else { 4 };
+            section_aligns
+                .entry((*merged_name).to_string())
+                .and_modify(|x| *x = (*x).max(a))
+                .or_insert(a);
+
+            let flags = if *sectname == "__text" { 6 } else { 2 };
+            section_flags
+                .entry((*merged_name).to_string())
+                .and_modify(|f| *f |= flags)
+                .or_insert(flags);
+
+            merged_data
+                .entry((*merged_name).to_string())
+                .or_default()
+                .push((data, size));
+
+            section_contribs[obj_idx].insert(
+                (*merged_name).to_string(),
+                ObjectSectionContrib {
+                    offset_in_merged,
+                    size,
+                },
+            );
+        }
+    }
+
+    let mut layout = MergedLayout {
+        sections: Vec::new(),
+        section_by_name: HashMap::new(),
+    };
+    let mut vaddr = SEG_BASE;
+
+    for (_sectname, merged_name) in &section_order {
+        let Some(contribs) = merged_data.get(*merged_name) else {
+            continue;
+        };
+        let mut merged_bytes = Vec::new();
+        for (data, _size) in contribs {
+            merged_bytes.extend_from_slice(data);
+        }
+        if merged_bytes.is_empty() {
+            continue;
+        }
+
+        let align = *section_aligns.get(*merged_name).unwrap_or(&4);
+        let flags = *section_flags.get(*merged_name).unwrap_or(&2);
+        vaddr = align_up(vaddr, align);
+
+        let idx = layout.sections.len();
+        layout
+            .section_by_name
+            .insert((*merged_name).to_string(), idx);
+        layout.sections.push(MergedSection {
+            name: (*merged_name).to_string(),
+            data: merged_bytes,
+            vaddr,
+            flags,
+            align,
+        });
+        vaddr += layout.sections[idx].data.len() as u64;
+    }
+
+    Ok((layout, section_contribs))
 }
