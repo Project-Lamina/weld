@@ -12,7 +12,7 @@ mod riscv;
 mod x86_64;
 
 use crate::arch::TargetArch;
-use crate::elf::{parse_elf64_slice, parse_symtab, Elf64Header, SectionHeader};
+use crate::elf::{Elf64Header, SectionHeader, Symbol, parse_elf64_slice, parse_symtab};
 use std::collections::HashMap;
 use std::path::Path;
 use std::thread;
@@ -43,10 +43,7 @@ const SHF_EXECINSTR: u64 = 4;
 const SHF_WRITE: u64 = 1;
 const SHT_PROGBITS: u32 = 1;
 const SHT_NOBITS: u32 = 8;
-
-const TEXT_ALIGN: u64 = 16;
-const RODATA_ALIGN: u64 = 16;
-const DATA_ALIGN: u64 = 8;
+const SHT_SYMTAB: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct MergedSection {
@@ -98,22 +95,79 @@ fn section_merge_order(name: &str) -> usize {
     }
 }
 
-pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String> {
-    let (_header, sections, names) = parse_elf64_slice(data)?;
-
-    let mut to_merge: Vec<(String, &SectionHeader)> = Vec::new();
-    for (i, sh) in sections.iter().enumerate() {
-        if sh.sh_type != SHT_PROGBITS && sh.sh_type != SHT_NOBITS {
-            continue;
-        }
-        if !is_allocatable(sh.sh_flags) {
-            continue;
-        }
-        let name = names.get(i).cloned().unwrap_or_default();
-        to_merge.push((name, sh));
-    }
+fn collect_mergeable_sections<'a>(
+    sections: &'a [SectionHeader],
+    names: &[String],
+) -> Vec<(String, &'a SectionHeader)> {
+    let mut to_merge: Vec<(String, &SectionHeader)> = sections
+        .iter()
+        .enumerate()
+        .filter(|(_, sh)| {
+            (sh.sh_type == SHT_PROGBITS || sh.sh_type == SHT_NOBITS) && is_allocatable(sh.sh_flags)
+        })
+        .map(|(i, sh)| (names.get(i).cloned().unwrap_or_default(), sh))
+        .collect();
 
     to_merge.sort_by_key(|(name, _)| section_merge_order(name));
+    to_merge
+}
+
+fn read_section_data(data: &[u8], sh: &SectionHeader) -> Vec<u8> {
+    if sh.sh_type == SHT_PROGBITS && sh.sh_size > 0 {
+        let start = sh.sh_offset as usize;
+        let end = start + sh.sh_size as usize;
+        data.get(start..end).unwrap_or(&[]).to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+fn default_flags_for_section(name: &str) -> u64 {
+    match name {
+        ".text" => SHF_ALLOC | SHF_EXECINSTR,
+        ".rodata" => SHF_ALLOC,
+        ".data" | ".bss" => SHF_ALLOC | SHF_WRITE,
+        _ => SHF_ALLOC,
+    }
+}
+
+fn append_merged_section(
+    layout: &mut MergedLayout,
+    name: &str,
+    contribs: &[(Vec<u8>, u64)],
+    align: u64,
+    flags: u64,
+    vaddr: &mut u64,
+) {
+    let total_size: u64 = contribs.iter().map(|(_, size)| *size).sum();
+    if total_size == 0 {
+        return;
+    }
+
+    let mut merged_bytes = Vec::new();
+    for (data, _) in contribs {
+        merged_bytes.extend_from_slice(data);
+    }
+
+    let align = align.max(1);
+    *vaddr = align_up(*vaddr, align);
+
+    let idx = layout.sections.len();
+    layout.section_by_name.insert(name.to_string(), idx);
+    layout.sections.push(MergedSection {
+        name: name.to_string(),
+        data: merged_bytes,
+        vaddr: *vaddr,
+        flags,
+        align,
+    });
+
+    *vaddr += total_size;
+}
+
+pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String> {
+    let (_header, sections, names) = parse_elf64_slice(data)?;
+    let to_merge = collect_mergeable_sections(&sections, &names);
 
     let mut layout = MergedLayout {
         sections: Vec::new(),
@@ -126,13 +180,7 @@ pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String>
         let align = sh.sh_addralign.max(1);
         vaddr = align_up(vaddr, align);
 
-        let data_slice = if sh.sh_type == SHT_PROGBITS && sh.sh_size > 0 {
-            let start = sh.sh_offset as usize;
-            let end = start + sh.sh_size as usize;
-            data.get(start..end).unwrap_or(&[]).to_vec()
-        } else {
-            Vec::new()
-        };
+        let data_slice = read_section_data(data, sh);
 
         let merged = MergedSection {
             name: name.clone(),
@@ -165,7 +213,9 @@ pub struct ObjectSectionContrib {
 }
 
 /// Merge sections from multiple objects. Same e_machine required.
-pub fn merge_sections_multi_object(objects: &[&[u8]]) -> Result<(MergedLayout, Vec<HashMap<String, ObjectSectionContrib>>), String> {
+pub fn merge_sections_multi_object(
+    objects: &[&[u8]],
+) -> Result<(MergedLayout, Vec<HashMap<String, ObjectSectionContrib>>), String> {
     if objects.is_empty() {
         return Err("no objects to merge".to_string());
     }
@@ -173,50 +223,47 @@ pub fn merge_sections_multi_object(objects: &[&[u8]]) -> Result<(MergedLayout, V
     let first_header = parse_elf64_slice(objects[0])?.0;
     let e_machine = first_header.e_machine;
 
-    let mut section_contribs: Vec<HashMap<String, ObjectSectionContrib>> = Vec::with_capacity(objects.len());
+    let mut section_contribs: Vec<HashMap<String, ObjectSectionContrib>> =
+        Vec::with_capacity(objects.len());
     let mut merged_data: HashMap<String, Vec<(Vec<u8>, u64)>> = HashMap::new();
     let mut section_cumul: HashMap<String, u64> = HashMap::new();
+    let mut section_aligns: HashMap<String, u64> = HashMap::new();
+    let mut section_flags: HashMap<String, u64> = HashMap::new();
 
     for obj_data in objects {
         let (header, sections, names) = parse_elf64_slice(obj_data)?;
         if header.e_machine != e_machine {
-            return Err(format!("e_machine mismatch: {} vs {}", header.e_machine, e_machine));
+            return Err(format!(
+                "e_machine mismatch: {} vs {}",
+                header.e_machine, e_machine
+            ));
         }
 
         let mut obj_contribs = HashMap::new();
 
-        let mut to_merge: Vec<(String, &SectionHeader)> = Vec::new();
-        for (i, sh) in sections.iter().enumerate() {
-            if sh.sh_type != SHT_PROGBITS && sh.sh_type != SHT_NOBITS {
-                continue;
-            }
-            if !is_allocatable(sh.sh_flags) {
-                continue;
-            }
-            let name = names.get(i).cloned().unwrap_or_default();
-            to_merge.push((name, sh));
-        }
-
-        to_merge.sort_by_key(|(name, _)| section_merge_order(name));
-
-        for (name, sh) in &to_merge {
-            let data_slice = if sh.sh_type == SHT_PROGBITS && sh.sh_size > 0 {
-                let start = sh.sh_offset as usize;
-                let end = start + sh.sh_size as usize;
-                obj_data.get(start..end).unwrap_or(&[]).to_vec()
-            } else {
-                Vec::new()
-            };
+        for (name, sh) in collect_mergeable_sections(&sections, &names) {
+            let data_slice = read_section_data(obj_data, sh);
 
             let size = sh.sh_size;
-            let offset_in_merged = *section_cumul.get(name).unwrap_or(&0);
+            let offset_in_merged = *section_cumul.get(&name).unwrap_or(&0);
             section_cumul.insert(name.clone(), offset_in_merged + size);
+
+            let align = sh.sh_addralign.max(1);
+            section_aligns
+                .entry(name.clone())
+                .and_modify(|a| *a = (*a).max(align))
+                .or_insert(align);
+
+            section_flags
+                .entry(name.clone())
+                .and_modify(|f| *f |= sh.sh_flags)
+                .or_insert(sh.sh_flags);
 
             let entry = merged_data.entry(name.clone()).or_default();
             entry.push((data_slice, size));
 
             obj_contribs.insert(
-                name.clone(),
+                name,
                 ObjectSectionContrib {
                     offset_in_merged,
                     size,
@@ -239,93 +286,66 @@ pub fn merge_sections_multi_object(objects: &[&[u8]]) -> Result<(MergedLayout, V
         let Some(contribs) = merged_data.get(sec_name) else {
             continue;
         };
-        let total_size: u64 = contribs.iter().map(|(_, sz)| sz).sum();
-        if total_size == 0 {
-            continue;
-        }
-
-        let mut merged_bytes = Vec::new();
-        for (data, _) in contribs {
-            merged_bytes.extend_from_slice(data);
-        }
-
-        let align = 16u64.max(1);
-        vaddr = align_up(vaddr, align);
-
-        let flags = if sec_name == ".text" {
-            SHF_ALLOC | SHF_EXECINSTR
-        } else {
-            SHF_ALLOC | SHF_WRITE
-        };
-
-        let merged = MergedSection {
-            name: sec_name.to_string(),
-            data: merged_bytes,
-            vaddr,
-            flags,
-            align,
-        };
-
-        let idx = layout.sections.len();
-        layout.section_by_name.insert(sec_name.to_string(), idx);
-        layout.sections.push(merged);
-
-        vaddr += total_size;
+        let align = section_aligns.get(sec_name).copied().unwrap_or(1);
+        let flags = section_flags
+            .get(sec_name)
+            .copied()
+            .unwrap_or_else(|| default_flags_for_section(sec_name));
+        append_merged_section(&mut layout, sec_name, contribs, align, flags, &mut vaddr);
     }
 
-    for (name, contribs) in &merged_data {
-        if !section_order.contains(&name.as_str()) {
-            let total_size: u64 = contribs.iter().map(|(_, sz)| sz).sum();
-            if total_size == 0 {
-                continue;
-            }
-            let mut merged_bytes = Vec::new();
-            for (data, _) in contribs {
-                merged_bytes.extend_from_slice(data);
-            }
-            let align = 16u64.max(1);
-            vaddr = align_up(vaddr, align);
-            let merged = MergedSection {
-                name: name.clone(),
-                data: merged_bytes,
-                vaddr,
-                flags: SHF_ALLOC,
-                align,
-            };
-            let idx = layout.sections.len();
-            layout.section_by_name.insert(name.clone(), idx);
-            layout.sections.push(merged);
-            vaddr += total_size;
-        }
+    let mut extra_sections: Vec<&str> = merged_data
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !section_order.contains(name))
+        .collect();
+    extra_sections.sort_unstable();
+
+    for name in extra_sections {
+        let Some(contribs) = merged_data.get(name) else {
+            continue;
+        };
+        let align = section_aligns.get(name).copied().unwrap_or(1);
+        let flags = section_flags
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| default_flags_for_section(name));
+        append_merged_section(&mut layout, name, contribs, align, flags, &mut vaddr);
     }
 
     Ok((layout, section_contribs))
 }
 
-pub fn resolve_symbols(
+fn parse_symtab_view<'a>(
+    data: &'a [u8],
+    sections: &'a [SectionHeader],
+) -> Result<Option<(Vec<Symbol>, &'a [u8])>, String> {
+    let Some(symtab_sh) = sections.iter().find(|sh| sh.sh_type == SHT_SYMTAB) else {
+        return Ok(None);
+    };
+
+    let strtab_idx = symtab_sh.sh_link as usize;
+    let strtab_sh = sections.get(strtab_idx).ok_or("symtab sh_link invalid")?;
+    let strtab = crate::elf::get_strtab_from_section(data, strtab_sh);
+    let symbols = parse_symtab(data, symtab_sh)?;
+
+    Ok(Some((symbols, strtab)))
+}
+
+fn resolve_symbols_with_offsets<F>(
     data: &[u8],
     layout: &MergedLayout,
     sections: &[SectionHeader],
     names: &[String],
-) -> Result<(HashMap<String, ResolvedSymbol>, Vec<Option<u64>>), String> {
-    const SHT_SYMTAB: u32 = 2;
-
-    let symtab_idx = sections
-        .iter()
-        .enumerate()
-        .find(|(_, sh)| sh.sh_type == SHT_SYMTAB)
-        .map(|(i, _)| i);
-
-    let Some(symtab_idx) = symtab_idx else {
+    mut section_offset: F,
+) -> Result<(HashMap<String, ResolvedSymbol>, Vec<Option<u64>>), String>
+where
+    F: FnMut(&str) -> Option<u64>,
+{
+    let Some((symbols, strtab)) = parse_symtab_view(data, sections)? else {
         return Ok((HashMap::new(), Vec::new()));
     };
 
-    let symtab_sh = &sections[symtab_idx];
-    let strtab_idx = symtab_sh.sh_link as usize;
-    let strtab_sh = sections.get(strtab_idx).ok_or("symtab sh_link invalid")?;
-    let strtab = crate::elf::get_strtab_from_section(data, strtab_sh);
-
-    let symbols = parse_symtab(data, symtab_sh)?;
     let mut resolved = HashMap::new();
     let mut by_index: Vec<Option<u64>> = Vec::with_capacity(symbols.len());
 
@@ -337,24 +357,14 @@ pub fn resolve_symbols(
             SHN_UNDEF => (None, false),
             SHN_ABS => (Some(sym.st_value), true),
             shndx => {
-                let section_name = names.get(shndx as usize).cloned().unwrap_or_default();
-                let Some(&merged_idx) = layout.section_by_name.get(&section_name) else {
-                    by_index.push(None);
-                    if !name.is_empty() {
-                        resolved.insert(
-                            name,
-                            ResolvedSymbol {
-                                address: None,
-                                size: sym.st_size,
-                                is_defined: false,
-                            },
-                        );
-                    }
-                    continue;
-                };
-                let merged = &layout.sections[merged_idx];
-                let addr = merged.vaddr + sym.st_value;
-                (Some(addr), true)
+                let section_name = names.get(shndx as usize).map(String::as_str).unwrap_or("");
+                if let Some(&merged_idx) = layout.section_by_name.get(section_name) {
+                    let merged = &layout.sections[merged_idx];
+                    let base_offset = section_offset(section_name).unwrap_or(0);
+                    (Some(merged.vaddr + base_offset + sym.st_value), true)
+                } else {
+                    (None, false)
+                }
             }
         };
 
@@ -372,6 +382,29 @@ pub fn resolve_symbols(
     }
 
     Ok((resolved, by_index))
+}
+
+fn symbol_names_by_index(data: &[u8], sections: &[SectionHeader]) -> Result<Vec<String>, String> {
+    let Some((symbols, strtab)) = parse_symtab_view(data, sections)? else {
+        return Ok(Vec::new());
+    };
+
+    Ok(symbols
+        .iter()
+        .map(|sym| {
+            crate::elf::get_strtab_string(strtab, sym.name_offset)
+                .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset))
+        })
+        .collect())
+}
+
+pub fn resolve_symbols(
+    data: &[u8],
+    layout: &MergedLayout,
+    sections: &[SectionHeader],
+    names: &[String],
+) -> Result<(HashMap<String, ResolvedSymbol>, Vec<Option<u64>>), String> {
+    resolve_symbols_with_offsets(data, layout, sections, names, |_| Some(0))
 }
 
 fn resolve_symbols_for_object(
@@ -381,87 +414,16 @@ fn resolve_symbols_for_object(
     names: &[String],
     obj_contribs: &HashMap<String, ObjectSectionContrib>,
 ) -> Result<(HashMap<String, ResolvedSymbol>, Vec<Option<u64>>), String> {
-    const SHT_SYMTAB: u32 = 2;
-
-    let symtab_idx = sections
-        .iter()
-        .enumerate()
-        .find(|(_, sh)| sh.sh_type == SHT_SYMTAB)
-        .map(|(i, _)| i);
-
-    let Some(symtab_idx) = symtab_idx else {
-        return Ok((HashMap::new(), Vec::new()));
-    };
-
-    let symtab_sh = &sections[symtab_idx];
-    let strtab_idx = symtab_sh.sh_link as usize;
-    let strtab_sh = sections.get(strtab_idx).ok_or("symtab sh_link invalid")?;
-    let strtab = crate::elf::get_strtab_from_section(data, strtab_sh);
-
-    let symbols = parse_symtab(data, symtab_sh)?;
-    let mut resolved = HashMap::new();
-    let mut by_index: Vec<Option<u64>> = Vec::with_capacity(symbols.len());
-
-    for sym in &symbols {
-        let name = crate::elf::get_strtab_string(strtab, sym.name_offset)
-            .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset));
-
-        let (address, is_defined) = match sym.st_shndx {
-            SHN_UNDEF => (None, false),
-            SHN_ABS => (Some(sym.st_value), true),
-            shndx => {
-                let section_name = names.get(shndx as usize).cloned().unwrap_or_default();
-                let Some(contrib) = obj_contribs.get(&section_name) else {
-                    by_index.push(None);
-                    if !name.is_empty() {
-                        resolved.insert(
-                            name,
-                            ResolvedSymbol {
-                                address: None,
-                                size: sym.st_size,
-                                is_defined: false,
-                            },
-                        );
-                    }
-                    continue;
-                };
-                let Some(&merged_idx) = layout.section_by_name.get(&section_name) else {
-                    by_index.push(None);
-                    if !name.is_empty() {
-                        resolved.insert(
-                            name,
-                            ResolvedSymbol {
-                                address: None,
-                                size: sym.st_size,
-                                is_defined: false,
-                            },
-                        );
-                    }
-                    continue;
-                };
-                let merged = &layout.sections[merged_idx];
-                let addr = merged.vaddr + contrib.offset_in_merged + sym.st_value;
-                (Some(addr), true)
-            }
-        };
-
-        by_index.push(address);
-        if !name.is_empty() {
-            resolved.insert(
-                name,
-                ResolvedSymbol {
-                    address,
-                    size: sym.st_size,
-                    is_defined,
-                },
-            );
-        }
-    }
-
-    Ok((resolved, by_index))
+    resolve_symbols_with_offsets(data, layout, sections, names, |section_name| {
+        obj_contribs
+            .get(section_name)
+            .map(|contrib| contrib.offset_in_merged)
+    })
 }
 
-pub fn merge_and_resolve(data: &[u8]) -> Result<(MergedLayout, HashMap<String, ResolvedSymbol>), String> {
+pub fn merge_and_resolve(
+    data: &[u8],
+) -> Result<(MergedLayout, HashMap<String, ResolvedSymbol>), String> {
     let (_header, sections, names) = parse_elf64_slice(data)?;
     let layout = merge_sections_single_object(data)?;
     let (symbols, _by_index) = resolve_symbols(data, &layout, &sections, &names)?;
@@ -523,10 +485,19 @@ fn link_multi_object_parsed(parsed: &[ParsedObject]) -> Result<LinkResult, Strin
         .ok_or_else(|| format!("unsupported machine {}", e_machine))?;
 
     let mut global_symbols: HashMap<String, u64> = HashMap::new();
+    let mut resolved_by_index_per_object: Vec<Vec<Option<u64>>> = Vec::with_capacity(parsed.len());
 
     for (obj_idx, obj) in parsed.iter().enumerate() {
         let obj_contribs = &section_contribs[obj_idx];
-        let (resolved, _) = resolve_symbols_for_object(&obj.data, &layout, &obj.sections, &obj.names, obj_contribs)?;
+        let (resolved, by_index) = resolve_symbols_for_object(
+            &obj.data,
+            &layout,
+            &obj.sections,
+            &obj.names,
+            obj_contribs,
+        )?;
+        resolved_by_index_per_object.push(by_index);
+
         for (name, r) in resolved {
             if let Some(addr) = r.address {
                 global_symbols.entry(name).or_insert(addr);
@@ -536,26 +507,16 @@ fn link_multi_object_parsed(parsed: &[ParsedObject]) -> Result<LinkResult, Strin
 
     for (obj_idx, obj) in parsed.iter().enumerate() {
         let obj_contribs = &section_contribs[obj_idx];
-        let (_resolved, obj_by_index) = resolve_symbols_for_object(&obj.data, &layout, &obj.sections, &obj.names, obj_contribs)?;
-
-        const SHT_SYMTAB: u32 = 2;
-        let symtab_idx = obj.sections.iter().enumerate().find(|(_, sh)| sh.sh_type == SHT_SYMTAB).map(|(i, _)| i);
+        let obj_by_index = &resolved_by_index_per_object[obj_idx];
+        let symbol_names = symbol_names_by_index(&obj.data, &obj.sections)?;
 
         let mut by_index: Vec<Option<u64>> = Vec::with_capacity(obj_by_index.len());
         for (i, addr) in obj_by_index.iter().enumerate() {
             let resolved_addr = match addr {
                 Some(a) => Some(*a),
-                None => {
-                    let name = symtab_idx.and_then(|si| {
-                        let symtab_sh = &obj.sections[si];
-                        let strtab_sh = obj.sections.get(symtab_sh.sh_link as usize)?;
-                        let strtab = crate::elf::get_strtab_from_section(&obj.data, strtab_sh);
-                        let syms = parse_symtab(&obj.data, symtab_sh).ok()?;
-                        let sym = syms.get(i)?;
-                        crate::elf::get_strtab_string(strtab, sym.name_offset)
-                    }).unwrap_or_default();
-                    global_symbols.get(&name).copied()
-                }
+                None => symbol_names
+                    .get(i)
+                    .and_then(|name| global_symbols.get(name).copied()),
             };
             by_index.push(resolved_addr);
         }
@@ -565,7 +526,15 @@ fn link_multi_object_parsed(parsed: &[ParsedObject]) -> Result<LinkResult, Strin
             .map(|(k, v)| (k.clone(), v.offset_in_merged))
             .collect();
 
-        apply_relocations(arch, &mut layout, &obj.data, &obj.sections, &obj.names, &by_index, Some(&section_off))?;
+        apply_relocations(
+            arch,
+            &mut layout,
+            &obj.data,
+            &obj.sections,
+            &obj.names,
+            &by_index,
+            Some(&section_off),
+        )?;
     }
 
     Ok(LinkResult {
@@ -585,9 +554,15 @@ pub fn apply_relocations(
     section_offset: Option<&HashMap<String, u64>>,
 ) -> Result<(), String> {
     match arch {
-        TargetArch::X86_64 => x86_64::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset),
-        TargetArch::AArch64 => aarch64::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset),
-        TargetArch::RiscV => riscv::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset),
+        TargetArch::X86_64 => {
+            x86_64::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset)
+        }
+        TargetArch::AArch64 => {
+            aarch64::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset)
+        }
+        TargetArch::RiscV => {
+            riscv::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset)
+        }
     }
 }
 
@@ -611,8 +586,8 @@ mod tests {
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_merge_test.o");
 
-        let mut ras = ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
-            .expect("ras");
+        let mut ras =
+            ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras");
         ras.assemble(asm, &tmp).expect("assemble");
 
         let layout = merge_object_file(&tmp).expect("merge");
@@ -629,8 +604,8 @@ mod tests {
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_resolve_test.o");
 
-        let mut ras = ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
-            .expect("ras");
+        let mut ras =
+            ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras");
         ras.assemble(asm, &tmp).expect("assemble");
 
         let data = std::fs::read(&tmp).expect("read");
@@ -649,8 +624,8 @@ mod tests {
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_link_test.o");
 
-        let mut ras = ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
-            .expect("ras");
+        let mut ras =
+            ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras");
         ras.assemble(asm, &tmp).expect("assemble");
 
         let data = std::fs::read(&tmp).expect("read");
@@ -670,8 +645,8 @@ mod tests {
         let tmp1 = std::env::temp_dir().join("weld_multi_1.o");
         let tmp2 = std::env::temp_dir().join("weld_multi_2.o");
 
-        let mut ras = ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
-            .expect("ras");
+        let mut ras =
+            ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras");
         ras.assemble(asm1, &tmp1).expect("assemble");
         ras.assemble(asm2, &tmp2).expect("assemble");
 
@@ -684,7 +659,12 @@ mod tests {
         let result = link_multi_object(&objects).expect("link_multi_object");
         assert!(!result.layout.sections.is_empty());
         assert!(result.layout.section_by_name.get(".text").is_some());
-        let text_idx = result.layout.section_by_name.get(".text").copied().unwrap_or(0);
+        let text_idx = result
+            .layout
+            .section_by_name
+            .get(".text")
+            .copied()
+            .unwrap_or(0);
         let text = &result.layout.sections[text_idx];
         assert!(text.data.len() >= 2);
     }
@@ -696,8 +676,8 @@ mod tests {
         let asm = ".text\n.globl main\nmain:\n  mov x0, #42\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_link_aarch64_test.o");
 
-        let mut ras = ras::Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
-            .expect("ras");
+        let mut ras =
+            ras::Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux).expect("ras");
         ras.assemble(asm, &tmp).expect("assemble");
 
         let data = std::fs::read(&tmp).expect("read");

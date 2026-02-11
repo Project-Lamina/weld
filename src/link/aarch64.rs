@@ -4,7 +4,7 @@
 //! ADR_PREL_PG_HI21, CALL26, JUMP26.
 
 use crate::elf::reloc_type;
-use crate::elf::{parse_rela_section, SectionHeader};
+use crate::elf::{SectionHeader, parse_rela_section};
 use crate::link::MergedLayout;
 
 fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
@@ -43,7 +43,9 @@ pub fn apply_relocations(
             continue;
         };
         let merged = &mut layout.sections[merged_idx];
-        let data_off = section_offset.and_then(|m| m.get(&target_name).copied()).unwrap_or(0) as usize;
+        let data_off = section_offset
+            .and_then(|m| m.get(&target_name).copied())
+            .unwrap_or(0) as usize;
         let relas = parse_rela_section(data, rela_sh)?;
 
         for rel in &relas {
@@ -142,7 +144,10 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off, patched);
                 }
                 _ => {
-                    return Err(format!("unsupported AArch64 relocation type {}", rel.r_type));
+                    return Err(format!(
+                        "unsupported AArch64 relocation type {}",
+                        rel.r_type
+                    ));
                 }
             }
         }
