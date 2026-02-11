@@ -81,7 +81,12 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
 fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
     let obj_data_list = crate::object::load_macho_objects(&args.input_files)?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
-    let result = link::macho::link_macho_multi_object(&obj_refs).ok()?;
+    let libs = if args.libraries.is_empty() {
+        None
+    } else {
+        Some(args.libraries.as_slice())
+    };
+    let result = link::macho::link_macho_multi_object(&obj_refs, libs).ok()?;
     let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
     let entry = select_entry(args, &result)?;
     let out_path = args
@@ -91,7 +96,18 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
         .unwrap_or(Path::new("a.out"));
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
-    emit::macho::emit_macho_executable(&result.layout, arch, entry, &mut out).ok()?;
+    if let Some(ref dyn_info) = result.dynamic {
+        emit::macho::emit_macho_executable_dynamic(
+            &result.layout,
+            arch,
+            entry,
+            dyn_info,
+            &mut out,
+        )
+        .ok()?;
+    } else {
+        emit::macho::emit_macho_executable(&result.layout, arch, entry, &mut out).ok()?;
+    }
     out.flush().ok()?;
     Some(0)
 }
@@ -138,9 +154,11 @@ fn main() {
                                 crate::object::ObjectFormat::Elf => {
                                     crate::link::link_multi_object(&refs, Some(&args.libraries)).err()
                                 }
-                                crate::object::ObjectFormat::MachO => {
-                                    crate::link::macho::link_macho_multi_object(&refs).err()
-                                }
+                                crate::object::ObjectFormat::MachO => crate::link::macho::link_macho_multi_object(
+                                    &refs,
+                                    Some(&args.libraries),
+                                )
+                                .err()
                             };
                             if let Some(e) = err {
                                 eprintln!("[weld] native link failed: {}", e);
