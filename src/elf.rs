@@ -42,6 +42,11 @@ pub mod reloc_type {
     pub const R_AARCH64_ABS64: u32 = 257;
     pub const R_AARCH64_ABS32: u32 = 258;
     pub const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+    pub const R_AARCH64_ADR_PREL_LO21: u32 = 274;
+    pub const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
+    pub const R_AARCH64_JUMP26: u32 = 282;
+    pub const R_AARCH64_CALL26: u32 = 283;
+    pub const R_AARCH64_RELATIVE: u32 = 1027;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
