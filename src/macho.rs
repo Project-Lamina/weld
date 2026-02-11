@@ -49,15 +49,18 @@ pub struct Macho64Header {
 }
 
 fn read_u32_be(data: &[u8], off: usize) -> Option<u32> {
-    data.get(off..off + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    data.get(off..off + 4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
-    data.get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    data.get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn read_u64_le(data: &[u8], off: usize) -> Option<u64> {
-    data.get(off..off + 8).map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    data.get(off..off + 8)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
 fn trim_cstr(b: &[u8]) -> &[u8] {
@@ -78,7 +81,9 @@ pub fn parse_macho64_header(data: &[u8]) -> Result<Macho64Header, String> {
         return Err("file too short for Mach-O 64 header".to_string());
     }
 
-    let magic = read_u32_le(data, 0).or_else(|| read_u32_be(data, 0)).ok_or("bad magic")?;
+    let magic = read_u32_le(data, 0)
+        .or_else(|| read_u32_be(data, 0))
+        .ok_or("bad magic")?;
     if magic != MH_MAGIC_64 && magic != MH_CIGAM_64 {
         return Err("not Mach-O 64".to_string());
     }
@@ -104,7 +109,9 @@ pub fn parse_macho64_header(data: &[u8]) -> Result<Macho64Header, String> {
 
         if cmd == LC_SEGMENT_64 && cmdsize >= 72 {
             let segname = data.get(off + 8..off + 24).unwrap_or(&[]);
-            let name = String::from_utf8_lossy(trim_cstr(segname)).trim_end_matches('\0').to_string();
+            let name = String::from_utf8_lossy(trim_cstr(segname))
+                .trim_end_matches('\0')
+                .to_string();
             let vmaddr = read_u64_le(data, off + 24).ok_or("bad vmaddr")?;
             let vmsize = read_u64_le(data, off + 32).ok_or("bad vmsize")?;
             let fileoff = read_u64_le(data, off + 40).ok_or("bad fileoff")?;
