@@ -1,11 +1,10 @@
 //! weld - Cross-platform linker for Lamina
 //!
-//! Drop-in replacement for ld/lld/mold. ld-style arguments.
-//! Platform priority: Linux and macOS first, Windows later.
+//! Native linking only. Supports object files and dynamic libs (-lc, -lSystem).
+//! No delegation to system linker.
 
 mod arch;
 mod cli;
-mod delegate;
 mod elf;
 mod emit;
 mod link;
