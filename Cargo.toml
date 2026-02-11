@@ -3,3 +3,7 @@ name = "weld"
 version = "0.1.0"
 edition = "2024"
 description = "Cross-platform linker for Lamina. Fast, minimal, drop-in for ld/lld/mold."
+
+[dev-dependencies]
+lamina-platform = { path = "../lamina-platform" }
+ras = { path = "../ras", features = ["encoder"] }
