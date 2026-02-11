@@ -39,6 +39,14 @@ impl TargetArch {
     pub fn page_align(self) -> u64 {
         0x1000
     }
+
+    pub fn to_macho_cputype(self) -> u32 {
+        match self {
+            Self::X86_64 => 0x01000007,
+            Self::AArch64 => 0x0100000C,
+            Self::RiscV => 0,
+        }
+    }
 }
 
 #[cfg(test)]
