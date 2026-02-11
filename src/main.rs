@@ -2,8 +2,13 @@
 //!
 //! Drop-in replacement for ld/lld/mold. ld-style arguments.
 
+mod elf;
+mod link;
+
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::Command;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -77,11 +82,15 @@ fn parse_args() -> Result<ParsedArgs, String> {
             "-v" | "--verbose" => args.verbose = true,
             "-h" | "--help" => return Err("help".to_string()),
             "--version" => return Err("version".to_string()),
-            _ => {
-                if a.starts_with('-') {
-                    return Err(format!("Unknown option: {}", a));
+            "-arch" | "-syslibroot" | "-platform_version" | "-L" | "-B" => {
+                if argv.get(i).map(|s| !s.starts_with('-')).unwrap_or(false) {
+                    i += 1;
                 }
-                args.input_files.push(PathBuf::from(a.clone()));
+            }
+            _ => {
+                if !a.starts_with('-') {
+                    args.input_files.push(PathBuf::from(a.clone()));
+                }
             }
         }
     }
@@ -89,13 +98,71 @@ fn parse_args() -> Result<ParsedArgs, String> {
     Ok(args)
 }
 
+fn detect_linker() -> &'static str {
+    #[cfg(windows)]
+    {
+        if Command::new("link").arg("/?").output().is_ok() {
+            return "link";
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        if Command::new("mold").arg("--version").output().is_ok() {
+            return "mold";
+        }
+        if Command::new("lld").arg("-v").output().is_ok()
+            || Command::new("ld.lld").arg("-v").output().is_ok()
+        {
+            return "lld";
+        }
+        if Command::new("ld").arg("--version").output().is_ok()
+            || Command::new("ld").arg("-v").output().is_ok()
+        {
+            return "ld";
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if Command::new("ld64").arg("-version").output().is_ok() {
+            return "ld64";
+        }
+    }
+
+    "ld"
+}
+
+fn run_linker(linker: &str, args: &[String], verbose: bool) -> i32 {
+    if verbose {
+        eprintln!("[weld] Using linker: {}", linker);
+        eprintln!("[weld] Args: {:?}", args);
+    }
+
+    let output = Command::new(linker).args(args).output();
+
+    match output {
+        Ok(out) => {
+            let _ = std::io::stdout().lock().write_all(&out.stdout);
+            let _ = std::io::stderr().lock().write_all(&out.stderr);
+            out.status.code().unwrap_or(1)
+        }
+        Err(e) => {
+            eprintln!("weld: failed to run {}: {}", linker, e);
+            1
+        }
+    }
+}
+
 fn main() {
+    let argv: Vec<String> = env::args().collect();
+    let link_args: Vec<String> = argv.get(1..).unwrap_or(&[]).to_vec();
+
     match parse_args() {
         Ok(args) => {
-            if args.verbose {
-                eprintln!("[weld] Output: {:?}", args.output_file);
-                eprintln!("[weld] Inputs: {:?}", args.input_files);
-            }
+            let linker = detect_linker();
+            let status = run_linker(linker, &link_args, args.verbose);
+            std::process::exit(status);
         }
         Err(e) => {
             if e == "help" {
