@@ -12,6 +12,7 @@ const MH_CIGAM_64: u32 = 0xCFFAEDFE;
 const MH_OBJECT: u32 = 1;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_SYMTAB: u32 = 0x0b;
+const LC_SYMSEG: u32 = 0x02;
 
 const CPU_TYPE_X86_64: u32 = 0x01000007;
 const CPU_TYPE_ARM64: u32 = 0x0100000C;
@@ -55,6 +56,22 @@ pub struct MachoSection {
     pub align: u32,
     pub reloff: u32,
     pub nreloc: u32,
+}
+
+/// Mach-O relocation_info: r_address (4) + r_info (4).
+/// r_info: r_symbolnum:24, r_pcrel:1, r_length:2, r_extern:1, r_type:4
+pub const GENERIC_RELOC_VANILLA: u32 = 0;
+pub const ARM64_RELOC_BRANCH26: u32 = 2;
+pub const X86_64_RELOC_BRANCH: u32 = 2;
+
+#[derive(Debug, Clone, Copy)]
+pub struct MachoReloc {
+    pub r_address: u32,
+    pub r_symbolnum: u32,
+    pub r_pcrel: bool,
+    pub r_length: u32,
+    pub r_extern: bool,
+    pub r_type: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +267,33 @@ fn parse_symtab(
     symbols
 }
 
+pub fn parse_macho_relocs(data: &[u8], reloff: u32, nreloc: u32) -> Vec<MachoReloc> {
+    let mut out = Vec::with_capacity(nreloc as usize);
+    let base = reloff as usize;
+    for i in 0..nreloc {
+        let off = base + i as usize * 8;
+        if data.len() < off + 8 {
+            break;
+        }
+        let r_address = read_u32_le(data, off).unwrap_or(0);
+        let r_info = read_u32_le(data, off + 4).unwrap_or(0);
+        let r_symbolnum = r_info & 0xFFFFFF;
+        let r_pcrel = (r_info >> 24) & 1 != 0;
+        let r_length = (r_info >> 25) & 3;
+        let r_extern = (r_info >> 27) & 1 != 0;
+        let r_type = (r_info >> 28) & 0xF;
+        out.push(MachoReloc {
+            r_address,
+            r_symbolnum,
+            r_pcrel,
+            r_length,
+            r_extern,
+            r_type,
+        });
+    }
+    out
+}
+
 pub fn parse_macho64_object(data: &[u8]) -> Result<Macho64Object, String> {
     let header = parse_macho64_header(data)?;
     if header.filetype != MH_OBJECT {
@@ -273,11 +317,17 @@ pub fn parse_macho64_object(data: &[u8]) -> Result<Macho64Object, String> {
         if cmd == LC_SEGMENT_64 && cmdsize >= 72 {
             let mut secs = parse_sections_from_segment(data, off, cmdsize);
             all_sections.append(&mut secs);
-        } else if cmd == LC_SYMTAB && cmdsize >= 24 {
-            symoff = read_u32_le(data, off + 8).ok_or("bad symoff")?;
-            nsyms = read_u32_le(data, off + 12).ok_or("bad nsyms")?;
-            stroff = read_u32_le(data, off + 16).ok_or("bad stroff")?;
-            strsize = read_u32_le(data, off + 20).ok_or("bad strsize")?;
+        } else if (cmd == LC_SYMTAB || cmd == LC_SYMSEG) && cmdsize >= 24 {
+            let read_symoff = read_u32_le(data, off + 8).ok_or("bad symoff")?;
+            let read_nsyms = read_u32_le(data, off + 12).ok_or("bad nsyms")?;
+            let read_stroff = read_u32_le(data, off + 16).ok_or("bad stroff")?;
+            let read_strsize = read_u32_le(data, off + 20).ok_or("bad strsize")?;
+            if read_nsyms > nsyms {
+                symoff = read_symoff;
+                nsyms = read_nsyms;
+                stroff = read_stroff;
+                strsize = read_strsize;
+            }
         }
 
         off += cmdsize;
@@ -332,5 +382,54 @@ mod tests {
         assert_eq!(h.ncmds, 1);
         assert_eq!(h.segments.len(), 1);
         assert_eq!(h.segments[0].name, "__TEXT");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_parse_real_object_symbol_count() {
+        use std::process::Command;
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let main_add_c = manifest_dir.join("tests/c/main_add.c");
+        if !main_add_c.exists() {
+            return;
+        }
+        let tmp = std::env::temp_dir();
+        let obj = tmp.join("weld_parse_symbol_test.o");
+        let cc = Command::new("clang")
+            .args(["-c", "-o"])
+            .arg(&obj)
+            .arg(&main_add_c)
+            .output();
+        let Ok(out) = cc else { return };
+        if !out.status.success() {
+            return;
+        }
+        let data = std::fs::read(&obj).unwrap_or_default();
+        let _ = std::fs::remove_file(&obj);
+        if data.len() < 100 {
+            return;
+        }
+        let parsed = parse_macho64_object(&data).expect("parse");
+        assert!(
+            parsed.symbols.len() >= 4,
+            "main_add.o should have at least 4 symbols, got {}",
+            parsed.symbols.len()
+        );
+    }
+
+    #[test]
+    fn test_parse_macho_relocs() {
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(&4u32.to_le_bytes());
+        data[4..8].copy_from_slice(&(1u32 << 27).to_le_bytes());
+        data[8..12].copy_from_slice(&8u32.to_le_bytes());
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let relocs = parse_macho_relocs(&data, 0, 2);
+        assert_eq!(relocs.len(), 2);
+        assert_eq!(relocs[0].r_address, 4);
+        assert!(!relocs[0].r_pcrel);
+        assert!(relocs[0].r_extern);
+        assert_eq!(relocs[1].r_address, 8);
+        assert!(!relocs[1].r_extern);
     }
 }
