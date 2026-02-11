@@ -7,6 +7,7 @@ mod arch;
 mod elf;
 mod emit;
 mod link;
+mod macho;
 mod platform;
 
 use std::env;
