@@ -7,8 +7,8 @@ use crate::arch::TargetArch;
 use crate::link::{LinkResult, MergedLayout, MergedSection, ObjectSectionContrib};
 use crate::macho::{
     parse_macho64_object, parse_macho_relocs, Macho64Object, MachoSection,
-    ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12,
-    GENERIC_RELOC_VANILLA,
+    ARM64_RELOC_BRANCH26, ARM64_RELOC_GOT_LOAD_PAGE21, ARM64_RELOC_GOT_LOAD_PAGEOFF12,
+    ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12, GENERIC_RELOC_VANILLA,
 };
 use std::collections::HashMap;
 
@@ -76,11 +76,7 @@ fn merge_macho_sections(obj: &Macho64Object) -> MergedLayout {
         let align = if sec.align > 0 { sec.align as u64 } else { 4 };
         vaddr = align_up(vaddr, align);
 
-        let name = if sec.sectname == "__text" {
-            ".text".to_string()
-        } else {
-            sec.sectname.clone()
-        };
+        let name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
 
         let data = read_section_data(obj, sec);
         let flags = if sec.sectname == "__text" { 6 } else { 2 };
@@ -105,12 +101,8 @@ fn resolve_macho_symbols(obj: &Macho64Object, layout: &MergedLayout) -> HashMap<
 
     for (i, sec) in obj.sections.iter().enumerate() {
         let sect_idx = (i + 1) as u8;
-        let name = if sec.sectname == "__text" {
-            ".text"
-        } else {
-            &sec.sectname
-        };
-        if let Some(&idx) = layout.section_by_name.get(name) {
+        let name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
+        if let Some(&idx) = layout.section_by_name.get(&name) {
             vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr);
         }
     }
@@ -135,12 +127,8 @@ fn symbol_addr_by_index(
     let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
     for (i, sec) in obj.sections.iter().enumerate() {
         let sect_idx = (i + 1) as u8;
-        let name = if sec.sectname == "__text" {
-            ".text"
-        } else {
-            &sec.sectname
-        };
-        if let Some(&idx) = layout.section_by_name.get(name) {
+        let name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
+        if let Some(&idx) = layout.section_by_name.get(&name) {
             vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr);
         }
     }
@@ -217,17 +205,17 @@ fn apply_macho_relocations(
     _symbol_addrs: &HashMap<String, u64>,
     symbol_addr_by_idx: &[Option<u64>],
     section_offset: Option<&HashMap<String, u64>>,
+    got_slot_by_symbol: Option<&HashMap<String, u64>>,
 ) -> Result<(), String> {
     let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
     for (i, sec) in obj.sections.iter().enumerate() {
         let sect_idx = (i + 1) as u8;
-        let name: String = if sec.sectname == "__text" {
-            ".text".into()
-        } else {
-            sec.sectname.clone()
-        };
-        if let Some(&idx) = layout.section_by_name.get(&name) {
-            vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr);
+        let merged_name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
+        if let Some(&idx) = layout.section_by_name.get(&merged_name) {
+            let off = section_offset
+                .and_then(|m| m.get(&merged_name).copied())
+                .unwrap_or(0);
+            vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr + off);
         }
     }
 
@@ -235,11 +223,7 @@ fn apply_macho_relocations(
         if sec.nreloc == 0 {
             continue;
         }
-        let merged_name: String = if sec.sectname == "__text" {
-            ".text".into()
-        } else {
-            sec.sectname.clone()
-        };
+        let merged_name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
         let Some(&merged_idx) = layout.section_by_name.get(&merged_name) else {
             continue;
         };
@@ -265,7 +249,18 @@ fn apply_macho_relocations(
 
             let base = if r.r_extern {
                 let idx = r.r_symbolnum as usize;
-                let addr_opt = symbol_addr_by_idx.get(idx).and_then(|o| o.as_ref());
+                let addr_opt = if (r.r_type == ARM64_RELOC_GOT_LOAD_PAGE21
+                    || r.r_type == ARM64_RELOC_GOT_LOAD_PAGEOFF12)
+                    && got_slot_by_symbol.is_some()
+                {
+                    obj.symbols
+                        .get(idx)
+                        .and_then(|s| got_slot_by_symbol.and_then(|m| m.get(&s.name).copied()))
+                } else {
+                    None
+                };
+                let addr_opt = addr_opt
+                    .or_else(|| symbol_addr_by_idx.get(idx).and_then(|o| o.as_ref().copied()));
                 let Some(addr) = addr_opt else {
                     let sym_name = obj.symbols.get(idx).map(|s| s.name.as_str()).unwrap_or("?");
                     return Err(format!(
@@ -273,7 +268,7 @@ fn apply_macho_relocations(
                         idx, sym_name
                     ));
                 };
-                *addr
+                addr
             } else {
                 let sect_idx = r.r_symbolnum as u8;
                 let addr = vaddr_by_sect
@@ -333,6 +328,28 @@ fn apply_macho_relocations(
                     let patched = (insn & 0xFFC003FF) | (pageoff << 10);
                     write_u32_le(&mut merged.data, off, patched);
                 }
+                ARM64_RELOC_GOT_LOAD_PAGE21 => {
+                    let page = (value >> 12) << 12;
+                    let place_page = (place_addr >> 12) << 12;
+                    let imm = ((page as i64 - place_page as i64) >> 12) as i32;
+                    let imm_lo = (imm & 3) as u32;
+                    let imm_hi = ((imm >> 2) & 0x7FFFF) as u32;
+                    if merged.data.len() < off + 4 {
+                        return Err("got_page21 reloc: buffer too short".to_string());
+                    }
+                    let insn = read_u32_le(&merged.data, off).unwrap_or(0);
+                    let patched = (insn & 0x9F00001F) | (imm_lo << 29) | (imm_hi << 5);
+                    write_u32_le(&mut merged.data, off, patched);
+                }
+                ARM64_RELOC_GOT_LOAD_PAGEOFF12 => {
+                    let pageoff = (value & 0xFFF) as u32;
+                    if merged.data.len() < off + 4 {
+                        return Err("got_pageoff12 reloc: buffer too short".to_string());
+                    }
+                    let insn = read_u32_le(&merged.data, off).unwrap_or(0);
+                    let patched = (insn & 0xFFC003FF) | (pageoff << 10);
+                    write_u32_le(&mut merged.data, off, patched);
+                }
                 _ => {
                     return Err(format!(
                         "unsupported Mach-O relocation type {}",
@@ -354,7 +371,7 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let mut layout = merge_macho_sections(&obj);
     let symbol_addrs = resolve_macho_symbols(&obj, &layout);
     let symbol_addr_by_idx = symbol_addr_by_index(&obj, &layout, &symbol_addrs);
-    apply_macho_relocations(&obj, &mut layout, &symbol_addrs, &symbol_addr_by_idx, None)?;
+    apply_macho_relocations(&obj, &mut layout, &symbol_addrs, &symbol_addr_by_idx, None, None)?;
 
     let e_machine = arch.to_elf_machine();
 
@@ -366,9 +383,47 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
     })
 }
 
+fn resolve_rust_std_dylib_from_paths(
+    _dylib_paths: &[std::path::PathBuf],
+) -> Option<String> {
+    let sysroot = std::env::var("RUST_SYSROOT").ok().or_else(|| {
+        std::process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+    })?;
+    let host = std::process::Command::new("rustc")
+        .args(["-vV"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("host:"))
+                .map(|l| l.trim_start_matches("host:").trim().to_string())
+        })
+        .unwrap_or_else(|| format!("{}-apple-darwin", std::env::consts::ARCH));
+    let lib_dir = std::path::Path::new(&sysroot)
+        .join("lib/rustlib")
+        .join(&host)
+        .join("lib");
+    for e in std::fs::read_dir(&lib_dir).ok()?.flatten() {
+        let fname = e.file_name();
+        let name = fname.to_string_lossy();
+        if name.starts_with("libstd-") && name.ends_with(".dylib") {
+            return Some(e.path().to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
 pub fn link_macho_multi_object(
     datas: &[&[u8]],
     libs: Option<&[String]>,
+    dylib_paths: &[std::path::PathBuf],
+    _input_paths: &[std::path::PathBuf],
 ) -> Result<LinkResult, String> {
     if datas.is_empty() {
         return Err("no objects to link".to_string());
@@ -393,11 +448,7 @@ pub fn link_macho_multi_object(
         let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
         for (i, sec) in obj.sections.iter().enumerate() {
             let sect_idx = (i + 1) as u8;
-            let merged_name: String = if sec.sectname == "__text" {
-                ".text".into()
-            } else {
-                sec.sectname.clone()
-            };
+            let merged_name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
             if let (Some(&idx), Some(off)) = (
                 layout.section_by_name.get(&merged_name),
                 contrib.get(&merged_name),
@@ -417,7 +468,7 @@ pub fn link_macho_multi_object(
     }
 
     let has_system = libs
-        .map(|l| l.iter().any(|x| x == "System" || x == "c"))
+        .map(|l| l.iter().any(|x| x == "System" || x == "c" || x == "m"))
         .unwrap_or(false);
 
     let mut undefined: Vec<String> = Vec::new();
@@ -481,6 +532,18 @@ pub fn link_macho_multi_object(
         }
     }
 
+    let got_slot_by_symbol: HashMap<String, u64> = if layout.section_by_name.contains_key("__got") {
+        let got_idx = layout.section_by_name["__got"];
+        let got_vaddr = layout.sections[got_idx].vaddr;
+        undefined
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), got_vaddr + (i as u64) * 8))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
     for (obj_idx, obj) in objects.iter().enumerate() {
         let contrib = &section_contribs[obj_idx];
         let symbol_addrs = symbol_addr_by_index_multi(obj, &layout, &global_symbols, contrib);
@@ -491,12 +554,24 @@ pub fn link_macho_multi_object(
             &global_symbols,
             &symbol_addrs,
             Some(&offset_map),
+            Some(&got_slot_by_symbol),
         )?;
     }
 
     let dynamic = if layout.section_by_name.contains_key("__got") {
+        let has_undefined = !undefined.is_empty();
         let plt_symbols = undefined;
-        let needed = vec!["libSystem.B.dylib".into()];
+        let mut needed = vec!["libSystem.B.dylib".into()];
+        for p in dylib_paths {
+            if let Some(s) = p.to_str() {
+                needed.push(s.to_string());
+            }
+        }
+        if needed.len() == 1 && has_undefined {
+            if let Some(std_path) = resolve_rust_std_dylib_from_paths(dylib_paths) {
+                needed.push(std_path);
+            }
+        }
         Some(crate::link::DynamicLinkInfo {
             needed,
             plt_symbols,
@@ -564,6 +639,16 @@ fn build_macho_stubs_arm64(
     Ok((stubs, stub_helper, got))
 }
 
+fn merged_section_name_for_lookup(segname: &str, sectname: &str) -> String {
+    if sectname == "__text" {
+        ".text".into()
+    } else if segname == "__TEXT" || segname == "__DATA" {
+        format!("{}.{}", segname, sectname)
+    } else {
+        sectname.to_string()
+    }
+}
+
 fn symbol_addr_by_index_multi(
     obj: &Macho64Object,
     layout: &MergedLayout,
@@ -573,11 +658,7 @@ fn symbol_addr_by_index_multi(
     let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
     for (i, sec) in obj.sections.iter().enumerate() {
         let sect_idx = (i + 1) as u8;
-        let merged_name: String = if sec.sectname == "__text" {
-            ".text".into()
-        } else {
-            sec.sectname.clone()
-        };
+        let merged_name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
         if let (Some(&idx), Some(off)) = (
             layout.section_by_name.get(&merged_name),
             contrib.get(&merged_name),
@@ -623,12 +704,19 @@ fn merge_macho_sections_multi(
         }
     }
 
-    let section_order = [
-        ("__text", ".text"),
-        ("__cstring", "__cstring"),
-        ("__rodata", "__rodata"),
-        ("__data", "__data"),
-        ("__bss", "__bss"),
+    let section_merge_order: &[(&str, &str)] = &[
+        ("__TEXT", "__text"),
+        ("__TEXT", "__cstring"),
+        ("__TEXT", "__const"),
+        ("__TEXT", "__rodata"),
+        ("__TEXT", "__literal4"),
+        ("__TEXT", "__literal8"),
+        ("__TEXT", "__literal16"),
+        ("__TEXT", "__literals"),
+        ("__TEXT", "__gcc_except_tab"),
+        ("__DATA", "__const"),
+        ("__DATA", "__data"),
+        ("__DATA", "__bss"),
     ];
 
     let mut section_contribs: Vec<HashMap<String, ObjectSectionContrib>> =
@@ -639,38 +727,32 @@ fn merge_macho_sections_multi(
     let mut section_flags: HashMap<String, u64> = HashMap::new();
 
     for (obj_idx, obj) in objects.iter().enumerate() {
-        for (sectname, merged_name) in &section_order {
-            let sec = obj
-                .sections
-                .iter()
-                .find(|s| s.sectname == *sectname && is_mergeable_section(s));
-            let Some(sec) = sec else {
+        for sec in &obj.sections {
+            if !is_mergeable_section(sec) {
                 continue;
-            };
+            }
+            let merged_name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
             let data = read_section_data(obj, sec);
             let size = data.len() as u64;
-            let offset_in_merged = *section_cumul.get(*merged_name).unwrap_or(&0);
-            section_cumul.insert((*merged_name).to_string(), offset_in_merged + size);
+            let offset_in_merged = *section_cumul.get(&merged_name).unwrap_or(&0);
+            section_cumul.insert(merged_name.clone(), offset_in_merged + size);
 
             let a = if sec.align > 0 { sec.align as u64 } else { 4 };
             section_aligns
-                .entry((*merged_name).to_string())
+                .entry(merged_name.clone())
                 .and_modify(|x| *x = (*x).max(a))
                 .or_insert(a);
 
-            let flags = if *sectname == "__text" { 6 } else { 2 };
+            let flags = if sec.sectname == "__text" { 6 } else { 2 };
             section_flags
-                .entry((*merged_name).to_string())
+                .entry(merged_name.clone())
                 .and_modify(|f| *f |= flags)
                 .or_insert(flags);
 
-            merged_data
-                .entry((*merged_name).to_string())
-                .or_default()
-                .push((data, size));
+            merged_data.entry(merged_name.clone()).or_default().push((data, size));
 
             section_contribs[obj_idx].insert(
-                (*merged_name).to_string(),
+                merged_name.clone(),
                 ObjectSectionContrib {
                     offset_in_merged,
                     size,
@@ -685,8 +767,9 @@ fn merge_macho_sections_multi(
     };
     let mut vaddr = SEG_BASE;
 
-    for (_sectname, merged_name) in &section_order {
-        let Some(contribs) = merged_data.get(*merged_name) else {
+    for (segname, sectname) in section_merge_order {
+        let merged_name = merged_section_name_for_lookup(segname, sectname);
+        let Some(contribs) = merged_data.get(&merged_name) else {
             continue;
         };
         let mut merged_bytes = Vec::new();
@@ -697,16 +780,14 @@ fn merge_macho_sections_multi(
             continue;
         }
 
-        let align = *section_aligns.get(*merged_name).unwrap_or(&4);
-        let flags = *section_flags.get(*merged_name).unwrap_or(&2);
+        let align = *section_aligns.get(&merged_name).unwrap_or(&4);
+        let flags = *section_flags.get(&merged_name).unwrap_or(&2);
         vaddr = align_up(vaddr, align);
 
         let idx = layout.sections.len();
-        layout
-            .section_by_name
-            .insert((*merged_name).to_string(), idx);
+        layout.section_by_name.insert(merged_name.clone(), idx);
         layout.sections.push(MergedSection {
-            name: (*merged_name).to_string(),
+            name: merged_name.clone(),
             data: merged_bytes,
             vaddr,
             flags,

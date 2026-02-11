@@ -79,14 +79,20 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
 }
 
 fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
-    let obj_data_list = crate::object::load_macho_objects(&args.input_files)?;
+    let (obj_data_list, dylib_paths) = crate::object::load_macho_objects(&args.input_files)?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
         None
     } else {
         Some(args.libraries.as_slice())
     };
-    let result = link::macho::link_macho_multi_object(&obj_refs, libs).ok()?;
+    let result = link::macho::link_macho_multi_object(
+        &obj_refs,
+        libs,
+        &dylib_paths,
+        &args.input_files,
+    )
+    .ok()?;
     let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
     let entry = select_entry(args, &result)?;
     let out_path = args
@@ -117,7 +123,7 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         return None;
     }
 
-    let (format, _) = load_objects(&args.input_files)?;
+    let (format, _, _) = load_objects(&args.input_files)?;
 
     match format {
         ObjectFormat::Elf => try_weld_link_elf(args),
@@ -147,22 +153,27 @@ fn main() {
                 }
                 None => {
                     if args.verbose {
-                        if let Some((format, data)) = crate::object::load_objects(&args.input_files)
+                        if let Some((format, data, dylib_paths)) =
+                            crate::object::load_objects(&args.input_files)
                         {
                             let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
                             let err = match format {
                                 crate::object::ObjectFormat::Elf => {
                                     crate::link::link_multi_object(&refs, Some(&args.libraries)).err()
                                 }
-                                crate::object::ObjectFormat::MachO => crate::link::macho::link_macho_multi_object(
+                                crate::object::ObjectFormat::MachO =>                                 crate::link::macho::link_macho_multi_object(
                                     &refs,
                                     Some(&args.libraries),
+                                    &dylib_paths,
+                                    &args.input_files,
                                 )
                                 .err()
                             };
                             if let Some(e) = err {
                                 eprintln!("[weld] native link failed: {}", e);
                             }
+                        } else {
+                            eprintln!("[weld] load_objects returned None (check input paths/format)");
                         }
                     }
                     eprintln!("weld: link failed");
