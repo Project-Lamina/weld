@@ -101,17 +101,18 @@ pub struct Elf64Header {
 }
 
 fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
-    data.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    data.get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 
 fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
-    data.get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    data.get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn read_u64_le(data: &[u8], off: usize) -> Option<u64> {
-    data.get(off..off + 8).map(|b| {
-        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-    })
+    data.get(off..off + 8)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
 pub fn parse_elf64_header(data: &[u8]) -> Result<Elf64Header, String> {
@@ -237,7 +238,9 @@ pub fn get_section_name(_data: &[u8], shstrtab: &[u8], name_offset: u32) -> Opti
     std::str::from_utf8(slice).ok().map(String::from)
 }
 
-pub fn parse_elf64_file(path: &Path) -> Result<(Elf64Header, Vec<SectionHeader>, Vec<String>), String> {
+pub fn parse_elf64_file(
+    path: &Path,
+) -> Result<(Elf64Header, Vec<SectionHeader>, Vec<String>), String> {
     let data = std::fs::read(path).map_err(|e| format!("read failed: {}", e))?;
     parse_elf64_slice(&data)
 }
@@ -290,7 +293,9 @@ pub fn get_strtab_from_section<'a>(data: &'a [u8], sh: &SectionHeader) -> &'a [u
     data.get(start..end).unwrap_or(&[])
 }
 
-pub fn parse_elf64_slice(data: &[u8]) -> Result<(Elf64Header, Vec<SectionHeader>, Vec<String>), String> {
+pub fn parse_elf64_slice(
+    data: &[u8],
+) -> Result<(Elf64Header, Vec<SectionHeader>, Vec<String>), String> {
     let header = parse_elf64_header(data)?;
 
     let shoff = header.e_shoff as usize;
