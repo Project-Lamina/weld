@@ -1,7 +1,7 @@
 //! Minimal Mach-O 64-bit reader skeleton.
 //!
-//! Parses header and LC_SEGMENT_64 for __TEXT and __DATA.
-//! Used for future Mach-O linking (Phase 6.2).
+//! Parses header, LC_SEGMENT_64 with sections, LC_SYMTAB for object files.
+//! Used for native Mach-O linking (Phase 6.2).
 
 #![allow(dead_code)]
 
@@ -9,10 +9,16 @@ use std::path::Path;
 
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
 const MH_CIGAM_64: u32 = 0xCFFAEDFE;
+const MH_OBJECT: u32 = 1;
 const LC_SEGMENT_64: u32 = 0x19;
+const LC_SYMTAB: u32 = 0x0b;
 
 const CPU_TYPE_X86_64: u32 = 0x01000007;
 const CPU_TYPE_ARM64: u32 = 0x0100000C;
+
+const N_TYPE: u8 = 0x0e;
+const N_SECT: u8 = 0x0e;
+const N_EXT: u8 = 0x01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachoCpuType {
@@ -40,12 +46,41 @@ pub struct MachoSegment {
 }
 
 #[derive(Debug, Clone)]
+pub struct MachoSection {
+    pub sectname: String,
+    pub segname: String,
+    pub addr: u64,
+    pub size: u64,
+    pub offset: u32,
+    pub align: u32,
+    pub reloff: u32,
+    pub nreloc: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MachoSymbol {
+    pub name: String,
+    pub value: u64,
+    pub sect: u8,
+    pub n_type: u8,
+    pub is_defined: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct Macho64Header {
     pub cputype: u32,
     pub filetype: u32,
     pub ncmds: u32,
     pub sizeofcmds: u32,
     pub segments: Vec<MachoSegment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Macho64Object {
+    pub header: Macho64Header,
+    pub sections: Vec<MachoSection>,
+    pub symbols: Vec<MachoSymbol>,
+    pub data: Vec<u8>,
 }
 
 fn read_u32_be(data: &[u8], off: usize) -> Option<u32> {
@@ -135,6 +170,126 @@ pub fn parse_macho64_header(data: &[u8]) -> Result<Macho64Header, String> {
         ncmds,
         sizeofcmds,
         segments,
+    })
+}
+
+fn parse_sections_from_segment(data: &[u8], off: usize, _cmdsize: usize) -> Vec<MachoSection> {
+    let mut sections = Vec::new();
+    let nsects = read_u32_le(data, off + 64).unwrap_or(0) as usize;
+    let mut sec_off = off + 72;
+    for _ in 0..nsects {
+        if data.len() < sec_off + 80 {
+            break;
+        }
+        let sectname = String::from_utf8_lossy(trim_cstr(&data[sec_off..sec_off + 16]))
+            .trim_end_matches('\0')
+            .to_string();
+        let segname = String::from_utf8_lossy(trim_cstr(&data[sec_off + 16..sec_off + 32]))
+            .trim_end_matches('\0')
+            .to_string();
+        let addr = read_u64_le(data, sec_off + 32).unwrap_or(0);
+        let size = read_u64_le(data, sec_off + 40).unwrap_or(0);
+        let offset = read_u32_le(data, sec_off + 48).unwrap_or(0);
+        let align = read_u32_le(data, sec_off + 52).unwrap_or(0);
+        let reloff = read_u32_le(data, sec_off + 56).unwrap_or(0);
+        let nreloc = read_u32_le(data, sec_off + 60).unwrap_or(0);
+        sections.push(MachoSection {
+            sectname,
+            segname,
+            addr,
+            size,
+            offset,
+            align,
+            reloff,
+            nreloc,
+        });
+        sec_off += 80;
+    }
+    sections
+}
+
+fn parse_symtab(
+    data: &[u8],
+    symoff: u32,
+    nsyms: u32,
+    stroff: u32,
+    strsize: u32,
+) -> Vec<MachoSymbol> {
+    let mut symbols = Vec::new();
+    let soff = symoff as usize;
+    let st_end = (stroff + strsize) as usize;
+    for i in 0..nsyms {
+        let off = soff + i as usize * 16;
+        if data.len() < off + 16 {
+            break;
+        }
+        let n_strx = read_u32_le(data, off).unwrap_or(0) as usize;
+        let n_type = data.get(off + 4).copied().unwrap_or(0);
+        let n_sect = data.get(off + 5).copied().unwrap_or(0);
+        let n_value = read_u64_le(data, off + 8).unwrap_or(0);
+
+        let name = if n_strx > 0 && st_end > stroff as usize + n_strx {
+            let sstart = stroff as usize + n_strx;
+            let s = &data[sstart..];
+            String::from_utf8_lossy(trim_cstr(s)).to_string()
+        } else {
+            String::new()
+        };
+
+        let sect_type = n_type & N_TYPE;
+        let is_defined = sect_type == N_SECT && n_sect != 0;
+
+        symbols.push(MachoSymbol {
+            name,
+            value: n_value,
+            sect: n_sect,
+            n_type,
+            is_defined,
+        });
+    }
+    symbols
+}
+
+pub fn parse_macho64_object(data: &[u8]) -> Result<Macho64Object, String> {
+    let header = parse_macho64_header(data)?;
+    if header.filetype != MH_OBJECT {
+        return Err("expected MH_OBJECT".to_string());
+    }
+
+    let mut all_sections = Vec::new();
+    let mut symoff = 0u32;
+    let mut nsyms = 0u32;
+    let mut stroff = 0u32;
+    let mut strsize = 0u32;
+
+    let mut off = 32usize;
+    for _ in 0..header.ncmds {
+        if data.len() < off + 8 {
+            break;
+        }
+        let cmd = read_u32_le(data, off).ok_or("bad cmd")?;
+        let cmdsize = read_u32_le(data, off + 4).ok_or("bad cmdsize")? as usize;
+
+        if cmd == LC_SEGMENT_64 && cmdsize >= 72 {
+            let mut secs = parse_sections_from_segment(data, off, cmdsize);
+            all_sections.append(&mut secs);
+        } else if cmd == LC_SYMTAB && cmdsize >= 24 {
+            symoff = read_u32_le(data, off + 8).ok_or("bad symoff")?;
+            nsyms = read_u32_le(data, off + 12).ok_or("bad nsyms")?;
+            stroff = read_u32_le(data, off + 16).ok_or("bad stroff")?;
+            strsize = read_u32_le(data, off + 20).ok_or("bad strsize")?;
+        }
+
+        off += cmdsize;
+    }
+
+    let symbols = parse_symtab(data, symoff, nsyms, stroff, strsize);
+
+    Ok(Macho64Object {
+        header,
+        sections: all_sections,
+        symbols,
+        data: data.to_vec(),
     })
 }
 
