@@ -47,6 +47,14 @@ impl TargetArch {
             Self::RiscV => 0,
         }
     }
+
+    pub fn from_macho_cputype(cputype: u32) -> Option<Self> {
+        match cputype {
+            0x01000007 => Some(Self::X86_64),
+            0x0100000C => Some(Self::AArch64),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
