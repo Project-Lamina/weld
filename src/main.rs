@@ -6,6 +6,7 @@
 mod arch;
 mod elf;
 mod emit;
+mod emit_macho;
 mod link;
 mod macho;
 mod platform;
