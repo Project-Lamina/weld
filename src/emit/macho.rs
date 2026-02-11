@@ -60,8 +60,19 @@ pub fn emit_macho_executable(
 
     let mut lc_buf = Vec::new();
 
+    let mut lc_pagezero = [0u8; 72];
+    lc_pagezero[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+    lc_pagezero[4..8].copy_from_slice(&72u32.to_le_bytes());
+    lc_pagezero[8..24].copy_from_slice(&pad_segname("__PAGEZERO"));
+    lc_pagezero[24..32].copy_from_slice(&0u64.to_le_bytes());
+    lc_pagezero[32..40].copy_from_slice(&0x100000000u64.to_le_bytes());
+    lc_buf.extend_from_slice(&lc_pagezero);
+    total_cmds += 1;
+    sizeofcmds += 72;
+
     let data_file_off = PAGE_SIZE as u64;
-    let seg_total_size = 72 + 76;
+    const SECT64_SIZE: usize = 80;
+    let seg_total_size = 72 + SECT64_SIZE;
     let mut seg_cmd = vec![0u8; seg_total_size];
     seg_cmd[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
     seg_cmd[4..8].copy_from_slice(&(seg_total_size as u32).to_le_bytes());
@@ -82,6 +93,11 @@ pub fn emit_macho_executable(
     seg_cmd[112..120].copy_from_slice(&(text_size as u64).to_le_bytes());
     seg_cmd[120..124].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
     seg_cmd[124..128].copy_from_slice(&4u32.to_le_bytes());
+    seg_cmd[128..132].copy_from_slice(&0u32.to_le_bytes());
+    seg_cmd[132..136].copy_from_slice(&0u32.to_le_bytes());
+    seg_cmd[136..140].copy_from_slice(&0x80000400u32.to_le_bytes());
+    seg_cmd[140..144].copy_from_slice(&0u32.to_le_bytes());
+    seg_cmd[144..148].copy_from_slice(&0u32.to_le_bytes());
 
     lc_buf.extend_from_slice(&seg_cmd);
     total_cmds += 1;
@@ -130,11 +146,11 @@ pub fn emit_macho_executable(
     let mut hdr = [0u8; 32];
     hdr[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
     hdr[4..8].copy_from_slice(&cputype.to_le_bytes());
-    hdr[8..12].copy_from_slice(&0x80000003u32.to_le_bytes());
+    hdr[8..12].copy_from_slice(&0u32.to_le_bytes());
     hdr[12..16].copy_from_slice(&MH_EXECUTABLE.to_le_bytes());
     hdr[16..20].copy_from_slice(&total_cmds.to_le_bytes());
     hdr[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
-    hdr[24..28].copy_from_slice(&0x2000u32.to_le_bytes());
+    hdr[24..28].copy_from_slice(&0u32.to_le_bytes());
     out.write_all(&hdr)?;
 
     out.write_all(&lc_buf)?;
