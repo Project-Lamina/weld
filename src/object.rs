@@ -9,7 +9,11 @@ fn is_elf(data: &[u8]) -> bool {
 
 fn read_elf(path: &PathBuf) -> Option<Vec<u8>> {
     let data = std::fs::read(path).ok()?;
-    if is_elf(&data) { Some(data) } else { None }
+    if is_elf(&data) {
+        Some(data)
+    } else {
+        None
+    }
 }
 
 fn read_macho(path: &PathBuf) -> Option<Vec<u8>> {
