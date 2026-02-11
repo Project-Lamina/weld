@@ -12,9 +12,28 @@ mod riscv;
 mod x86_64;
 
 use crate::arch::TargetArch;
-use crate::elf::{parse_elf64_slice, parse_symtab, SectionHeader};
+use crate::elf::{parse_elf64_slice, parse_symtab, Elf64Header, SectionHeader};
 use std::collections::HashMap;
 use std::path::Path;
+use std::thread;
+
+/// Pre-parsed object for reuse in multi-object linking.
+pub struct ParsedObject {
+    pub data: Vec<u8>,
+    pub header: Elf64Header,
+    pub sections: Vec<SectionHeader>,
+    pub names: Vec<String>,
+}
+
+fn parse_object(data: Vec<u8>) -> Result<ParsedObject, String> {
+    let (header, sections, names) = parse_elf64_slice(&data)?;
+    Ok(ParsedObject {
+        data,
+        header,
+        sections,
+        names,
+    })
+}
 
 const SHN_UNDEF: u16 = 0;
 const SHN_ABS: u16 = 0xfff1;
@@ -476,18 +495,38 @@ pub fn link_multi_object(objects: &[&[u8]]) -> Result<LinkResult, String> {
         return link_single_object(objects[0]);
     }
 
-    let (mut layout, section_contribs) = merge_sections_multi_object(objects)?;
-    let first_header = parse_elf64_slice(objects[0])?.0;
-    let e_machine = first_header.e_machine;
+    let owned: Vec<Vec<u8>> = objects.iter().map(|s| s.to_vec()).collect();
+    let handles: Vec<_> = owned
+        .into_iter()
+        .map(|data| thread::spawn(move || parse_object(data)))
+        .collect();
+    let mut parsed = Vec::with_capacity(handles.len());
+    for h in handles {
+        parsed.push(h.join().map_err(|_| "thread join failed".to_string())??);
+    }
+
+    link_multi_object_parsed(&parsed)
+}
+
+fn link_multi_object_parsed(parsed: &[ParsedObject]) -> Result<LinkResult, String> {
+    if parsed.is_empty() {
+        return Err("no objects to link".to_string());
+    }
+    if parsed.len() == 1 {
+        return link_single_object(&parsed[0].data);
+    }
+
+    let objects: Vec<&[u8]> = parsed.iter().map(|p| p.data.as_slice()).collect();
+    let (mut layout, section_contribs) = merge_sections_multi_object(&objects)?;
+    let e_machine = parsed[0].header.e_machine;
     let arch = TargetArch::from_elf_machine(e_machine)
         .ok_or_else(|| format!("unsupported machine {}", e_machine))?;
 
     let mut global_symbols: HashMap<String, u64> = HashMap::new();
 
-    for (obj_idx, obj_data) in objects.iter().enumerate() {
-        let (_, sections, names) = parse_elf64_slice(obj_data)?;
+    for (obj_idx, obj) in parsed.iter().enumerate() {
         let obj_contribs = &section_contribs[obj_idx];
-        let (resolved, _) = resolve_symbols_for_object(obj_data, &layout, &sections, &names, obj_contribs)?;
+        let (resolved, _) = resolve_symbols_for_object(&obj.data, &layout, &obj.sections, &obj.names, obj_contribs)?;
         for (name, r) in resolved {
             if let Some(addr) = r.address {
                 global_symbols.entry(name).or_insert(addr);
@@ -495,14 +534,12 @@ pub fn link_multi_object(objects: &[&[u8]]) -> Result<LinkResult, String> {
         }
     }
 
-    for (obj_idx, obj_data) in objects.iter().enumerate() {
-        let (_, sections, names) = parse_elf64_slice(obj_data)?;
+    for (obj_idx, obj) in parsed.iter().enumerate() {
         let obj_contribs = &section_contribs[obj_idx];
-        let (_resolved, obj_by_index) = resolve_symbols_for_object(obj_data, &layout, &sections, &names, obj_contribs)?;
+        let (_resolved, obj_by_index) = resolve_symbols_for_object(&obj.data, &layout, &obj.sections, &obj.names, obj_contribs)?;
 
         const SHT_SYMTAB: u32 = 2;
-        let symtab_idx = sections.iter().enumerate().find(|(_, sh)| sh.sh_type == SHT_SYMTAB).map(|(i, _)| i);
-        let _symbols = symtab_idx.and_then(|si| parse_symtab(obj_data, &sections[si]).ok());
+        let symtab_idx = obj.sections.iter().enumerate().find(|(_, sh)| sh.sh_type == SHT_SYMTAB).map(|(i, _)| i);
 
         let mut by_index: Vec<Option<u64>> = Vec::with_capacity(obj_by_index.len());
         for (i, addr) in obj_by_index.iter().enumerate() {
@@ -510,10 +547,10 @@ pub fn link_multi_object(objects: &[&[u8]]) -> Result<LinkResult, String> {
                 Some(a) => Some(*a),
                 None => {
                     let name = symtab_idx.and_then(|si| {
-                        let symtab_sh = &sections[si];
-                        let strtab_sh = sections.get(symtab_sh.sh_link as usize)?;
-                        let strtab = crate::elf::get_strtab_from_section(obj_data, strtab_sh);
-                        let syms = parse_symtab(obj_data, symtab_sh).ok()?;
+                        let symtab_sh = &obj.sections[si];
+                        let strtab_sh = obj.sections.get(symtab_sh.sh_link as usize)?;
+                        let strtab = crate::elf::get_strtab_from_section(&obj.data, strtab_sh);
+                        let syms = parse_symtab(&obj.data, symtab_sh).ok()?;
                         let sym = syms.get(i)?;
                         crate::elf::get_strtab_string(strtab, sym.name_offset)
                     }).unwrap_or_default();
@@ -528,7 +565,7 @@ pub fn link_multi_object(objects: &[&[u8]]) -> Result<LinkResult, String> {
             .map(|(k, v)| (k.clone(), v.offset_in_merged))
             .collect();
 
-        apply_relocations(arch, &mut layout, obj_data, &sections, &names, &by_index, Some(&section_off))?;
+        apply_relocations(arch, &mut layout, &obj.data, &obj.sections, &obj.names, &by_index, Some(&section_off))?;
     }
 
     Ok(LinkResult {
