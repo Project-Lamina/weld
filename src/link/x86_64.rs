@@ -18,6 +18,7 @@ pub fn apply_relocations(
     sections: &[SectionHeader],
     names: &[String],
     symbol_addrs: &[Option<u64>],
+    section_offset: Option<&std::collections::HashMap<String, u64>>,
 ) -> Result<(), String> {
     const SHT_RELA: u32 = 4;
 
@@ -31,10 +32,12 @@ pub fn apply_relocations(
             continue;
         };
         let merged = &mut layout.sections[merged_idx];
+        let data_off = section_offset.and_then(|m| m.get(&target_name).copied()).unwrap_or(0) as usize;
         let relas = parse_rela_section(data, rela_sh)?;
 
         for rel in &relas {
-            let place = merged.vaddr + rel.r_offset;
+            let off = data_off + rel.r_offset as usize;
+            let place = merged.vaddr + off as u64;
             let a = rel.r_addend;
             let p = place as i64;
 
@@ -43,7 +46,6 @@ pub fn apply_relocations(
                 reloc_type::R_X86_64_RELATIVE => {
                     let base = merged.vaddr as i64;
                     let val = base.wrapping_add(a) as u64;
-                    let off = rel.r_offset as usize;
                     if merged.data.len() < off + 8 {
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }
@@ -54,7 +56,6 @@ pub fn apply_relocations(
                         return Err(format!("undefined symbol index {}", rel.r_sym));
                     };
                     let val = s_addr.wrapping_add_signed(a);
-                    let off = rel.r_offset as usize;
                     if merged.data.len() < off + 8 {
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }
@@ -65,7 +66,6 @@ pub fn apply_relocations(
                         return Err(format!("undefined symbol index {}", rel.r_sym));
                     };
                     let val = s_addr.wrapping_add_signed(a) as u32;
-                    let off = rel.r_offset as usize;
                     if merged.data.len() < off + 4 {
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }
@@ -76,7 +76,6 @@ pub fn apply_relocations(
                         return Err(format!("undefined symbol index {}", rel.r_sym));
                     };
                     let val = (*s_addr as i64).wrapping_add(a).wrapping_sub(p) as u32;
-                    let off = rel.r_offset as usize;
                     if merged.data.len() < off + 4 {
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }

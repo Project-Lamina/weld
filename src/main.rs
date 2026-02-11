@@ -159,7 +159,7 @@ fn run_linker(linker: &str, args: &[String], verbose: bool) -> i32 {
 }
 
 fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
-    if args.input_files.len() != 1 || !args.libraries.is_empty() {
+    if args.input_files.is_empty() || !args.libraries.is_empty() {
         return None;
     }
     let out_path = args
@@ -167,13 +167,18 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         .as_ref()
         .map(|p| p.as_path())
         .unwrap_or(Path::new("a.out"));
-    let obj_path = args.input_files.first()?;
-    let obj_data = std::fs::read(obj_path).ok()?;
-    if obj_data.len() < 4 || &obj_data[0..4] != [0x7f, b'E', b'L', b'F'] {
-        return None;
+
+    let mut obj_data_list: Vec<Vec<u8>> = Vec::with_capacity(args.input_files.len());
+    for path in &args.input_files {
+        let data = std::fs::read(path).ok()?;
+        if data.len() < 4 || &data[0..4] != [0x7f, b'E', b'L', b'F'] {
+            return None;
+        }
+        obj_data_list.push(data);
     }
 
-    let result = match link::link_single_object(&obj_data) {
+    let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
+    let result = match link::link_multi_object(&obj_refs) {
         Ok(r) => r,
         Err(_) => return None,
     };
