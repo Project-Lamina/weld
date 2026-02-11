@@ -148,6 +148,30 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_aarch64() {
+        let layout = MergedLayout {
+            sections: vec![MergedSection {
+                name: ".text".into(),
+                data: vec![0xd6, 0x5f, 0x03, 0xc0],
+                vaddr: 0x400000,
+                flags: 4,
+                align: 16,
+            }],
+            section_by_name: {
+                let mut m = HashMap::new();
+                m.insert(".text".into(), 0);
+                m
+            },
+        };
+
+        let mut out = Vec::new();
+        emit_elf_executable(&layout, TargetArch::AArch64, 0x400000, &mut out).expect("emit");
+        assert!(out.len() >= 64);
+        assert_eq!(&out[0..4], &[0x7f, b'E', b'L', b'F']);
+        assert_eq!(out[18..20], 183u16.to_le_bytes());
+    }
+
+    #[test]
     fn test_link_and_emit() {
         use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
