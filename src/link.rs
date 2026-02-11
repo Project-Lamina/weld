@@ -2,9 +2,11 @@
 
 #![allow(dead_code)]
 
+use crate::arch::TargetArch;
 use crate::elf::{
-    get_strtab_from_section, parse_elf64_slice, parse_symtab, SectionHeader,
+    get_strtab_from_section, parse_elf64_slice, parse_rela_section, parse_symtab, SectionHeader,
 };
+use crate::elf::reloc_type;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -41,6 +43,13 @@ pub struct ResolvedSymbol {
     pub address: Option<u64>,
     pub size: u64,
     pub is_defined: bool,
+}
+
+#[derive(Debug)]
+pub struct LinkResult {
+    pub layout: MergedLayout,
+    pub e_machine: u16,
+    pub symbol_addrs: HashMap<String, u64>,
 }
 
 fn align_up(value: u64, align: u64) -> u64 {
@@ -128,7 +137,7 @@ pub fn resolve_symbols(
     layout: &MergedLayout,
     sections: &[SectionHeader],
     names: &[String],
-) -> Result<HashMap<String, ResolvedSymbol>, String> {
+) -> Result<(HashMap<String, ResolvedSymbol>, Vec<Option<u64>>), String> {
     const SHT_SYMTAB: u32 = 2;
 
     let symtab_idx = sections
@@ -138,7 +147,7 @@ pub fn resolve_symbols(
         .map(|(i, _)| i);
 
     let Some(symtab_idx) = symtab_idx else {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), Vec::new()));
     };
 
     let symtab_sh = &sections[symtab_idx];
@@ -148,13 +157,11 @@ pub fn resolve_symbols(
 
     let symbols = parse_symtab(data, symtab_sh)?;
     let mut resolved = HashMap::new();
+    let mut by_index: Vec<Option<u64>> = Vec::with_capacity(symbols.len());
 
     for sym in &symbols {
         let name = crate::elf::get_strtab_string(strtab, sym.name_offset)
             .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset));
-        if name.is_empty() {
-            continue;
-        }
 
         let (address, is_defined) = match sym.st_shndx {
             SHN_UNDEF => (None, false),
@@ -162,14 +169,17 @@ pub fn resolve_symbols(
             shndx => {
                 let section_name = names.get(shndx as usize).cloned().unwrap_or_default();
                 let Some(&merged_idx) = layout.section_by_name.get(&section_name) else {
-                    resolved.insert(
-                        name.clone(),
-                        ResolvedSymbol {
-                            address: None,
-                            size: sym.st_size,
-                            is_defined: false,
-                        },
-                    );
+                    by_index.push(None);
+                    if !name.is_empty() {
+                        resolved.insert(
+                            name,
+                            ResolvedSymbol {
+                                address: None,
+                                size: sym.st_size,
+                                is_defined: false,
+                            },
+                        );
+                    }
                     continue;
                 };
                 let merged = &layout.sections[merged_idx];
@@ -178,24 +188,149 @@ pub fn resolve_symbols(
             }
         };
 
-        resolved.insert(
-            name,
-            ResolvedSymbol {
-                address,
-                size: sym.st_size,
-                is_defined,
-            },
-        );
+        by_index.push(address);
+        if !name.is_empty() {
+            resolved.insert(
+                name,
+                ResolvedSymbol {
+                    address,
+                    size: sym.st_size,
+                    is_defined,
+                },
+            );
+        }
     }
 
-    Ok(resolved)
+    Ok((resolved, by_index))
 }
 
 pub fn merge_and_resolve(data: &[u8]) -> Result<(MergedLayout, HashMap<String, ResolvedSymbol>), String> {
     let (_header, sections, names) = parse_elf64_slice(data)?;
     let layout = merge_sections_single_object(data)?;
-    let symbols = resolve_symbols(data, &layout, &sections, &names)?;
+    let (symbols, _by_index) = resolve_symbols(data, &layout, &sections, &names)?;
     Ok((layout, symbols))
+}
+
+pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
+    let (header, sections, names) = parse_elf64_slice(data)?;
+    let mut layout = merge_sections_single_object(data)?;
+    let (resolved, by_index) = resolve_symbols(data, &layout, &sections, &names)?;
+    let arch = TargetArch::from_elf_machine(header.e_machine)
+        .ok_or_else(|| format!("unsupported machine {}", header.e_machine))?;
+    apply_relocations(arch, &mut layout, data, &sections, &names, &by_index)?;
+    let symbol_addrs: HashMap<String, u64> = resolved
+        .into_iter()
+        .filter_map(|(name, r)| r.address.map(|a| (name, a)))
+        .collect();
+    Ok(LinkResult {
+        layout,
+        e_machine: header.e_machine,
+        symbol_addrs,
+    })
+}
+
+fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
+    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
+    buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
+}
+
+pub fn apply_relocations(
+    arch: TargetArch,
+    layout: &mut MergedLayout,
+    data: &[u8],
+    sections: &[SectionHeader],
+    names: &[String],
+    symbol_addrs: &[Option<u64>],
+) -> Result<(), String> {
+    match arch {
+        TargetArch::X86_64 => apply_relocations_x86_64(layout, data, sections, names, symbol_addrs),
+        TargetArch::AArch64 | TargetArch::RiscV => {
+            Err(format!("relocations for {:?} not yet implemented", arch))
+        }
+    }
+}
+
+fn apply_relocations_x86_64(
+    layout: &mut MergedLayout,
+    data: &[u8],
+    sections: &[SectionHeader],
+    names: &[String],
+    symbol_addrs: &[Option<u64>],
+) -> Result<(), String> {
+    const SHT_RELA: u32 = 4;
+
+    for (_rela_idx, rela_sh) in sections.iter().enumerate() {
+        if rela_sh.sh_type != SHT_RELA {
+            continue;
+        }
+        let target_section_idx = rela_sh.sh_info as usize;
+        let target_name = names.get(target_section_idx).cloned().unwrap_or_default();
+        let Some(&merged_idx) = layout.section_by_name.get(&target_name) else {
+            continue;
+        };
+        let merged = &mut layout.sections[merged_idx];
+        let relas = parse_rela_section(data, rela_sh)?;
+
+        for rel in &relas {
+            let place = merged.vaddr + rel.r_offset;
+            let a = rel.r_addend;
+            let p = place as i64;
+
+            match rel.r_type {
+                reloc_type::R_X86_64_NONE => {}
+                reloc_type::R_X86_64_RELATIVE => {
+                    let base = merged.vaddr as i64;
+                    let val = base.wrapping_add(a) as u64;
+                    let off = rel.r_offset as usize;
+                    if merged.data.len() < off + 8 {
+                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                    }
+                    write_u64_le(&mut merged.data, off, val);
+                }
+                reloc_type::R_X86_64_64 => {
+                    let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
+                        return Err(format!("undefined symbol index {}", rel.r_sym));
+                    };
+                    let val = s_addr.wrapping_add_signed(a);
+                    let off = rel.r_offset as usize;
+                    if merged.data.len() < off + 8 {
+                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                    }
+                    write_u64_le(&mut merged.data, off, val);
+                }
+                reloc_type::R_X86_64_32 => {
+                    let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
+                        return Err(format!("undefined symbol index {}", rel.r_sym));
+                    };
+                    let val = s_addr.wrapping_add_signed(a) as u32;
+                    let off = rel.r_offset as usize;
+                    if merged.data.len() < off + 4 {
+                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                    }
+                    write_u32_le(&mut merged.data, off, val);
+                }
+                reloc_type::R_X86_64_PC32 => {
+                    let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
+                        return Err(format!("undefined symbol index {}", rel.r_sym));
+                    };
+                    let val = (*s_addr as i64).wrapping_add(a).wrapping_sub(p) as u32;
+                    let off = rel.r_offset as usize;
+                    if merged.data.len() < off + 4 {
+                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                    }
+                    write_u32_le(&mut merged.data, off, val);
+                }
+                _ => {
+                    return Err(format!("unsupported relocation type {}", rel.r_type));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -247,5 +382,24 @@ mod tests {
         assert!(!layout.sections.is_empty());
         assert!(layout.section_by_name.get(".text").is_some());
         assert!(symbols.is_empty() || symbols.contains_key("main"));
+    }
+
+    #[test]
+    fn test_link_single_object() {
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+        let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
+        let tmp = std::env::temp_dir().join("weld_link_test.o");
+
+        let mut ras = ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .expect("ras");
+        ras.assemble(asm, &tmp).expect("assemble");
+
+        let data = std::fs::read(&tmp).expect("read");
+        let _ = std::fs::remove_file(&tmp);
+
+        let result = link_single_object(&data).expect("link_single_object");
+        assert!(!result.layout.sections.is_empty());
+        assert!(result.layout.section_by_name.get(".text").is_some());
     }
 }
