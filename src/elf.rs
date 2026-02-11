@@ -25,7 +25,24 @@ pub enum SectionType {
 
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
+const SHT_RELA: u32 = 4;
 const ELF64_SYM_SIZE: usize = 24;
+const ELF64_RELA_SIZE: usize = 24;
+
+pub mod reloc_type {
+    pub const R_X86_64_NONE: u32 = 0;
+    pub const R_X86_64_64: u32 = 1;
+    pub const R_X86_64_PC32: u32 = 2;
+    pub const R_X86_64_32: u32 = 10;
+    pub const R_X86_64_RELATIVE: u32 = 8;
+    pub const R_X86_64_PLT32: u32 = 4;
+    pub const R_X86_64_GOTPCREL: u32 = 9;
+
+    pub const R_AARCH64_NONE: u32 = 0;
+    pub const R_AARCH64_ABS64: u32 = 257;
+    pub const R_AARCH64_ABS32: u32 = 258;
+    pub const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -220,6 +237,48 @@ pub fn parse_elf64_file(path: &Path) -> Result<(Elf64Header, Vec<SectionHeader>,
     parse_elf64_slice(&data)
 }
 
+#[derive(Debug, Clone)]
+pub struct RelaEntry {
+    pub r_offset: u64,
+    pub r_sym: u32,
+    pub r_type: u32,
+    pub r_addend: i64,
+}
+
+pub fn parse_rela_entry(data: &[u8], off: usize) -> Result<RelaEntry, String> {
+    if data.len() < off + ELF64_RELA_SIZE {
+        return Err("file too short for RELA entry".to_string());
+    }
+    let r_offset = read_u64_le(data, off).ok_or("bad r_offset")?;
+    let r_info = read_u64_le(data, off + 8).ok_or("bad r_info")?;
+    let r_addend = read_u64_le(data, off + 16).ok_or("bad r_addend")? as i64;
+
+    let r_sym = (r_info >> 32) as u32;
+    let r_type = (r_info & 0xffff_ffff) as u32;
+
+    Ok(RelaEntry {
+        r_offset,
+        r_sym,
+        r_type,
+        r_addend,
+    })
+}
+
+pub fn parse_rela_section(data: &[u8], rela_sh: &SectionHeader) -> Result<Vec<RelaEntry>, String> {
+    let start = rela_sh.sh_offset as usize;
+    let entsize = rela_sh.sh_entsize as usize;
+    let size = entsize.max(ELF64_RELA_SIZE);
+    let count = (rela_sh.sh_size as usize) / size;
+
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = start + i * size;
+        let entry = parse_rela_entry(data, off)?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
 pub fn get_strtab_from_section<'a>(data: &'a [u8], sh: &SectionHeader) -> &'a [u8] {
     let start = sh.sh_offset as usize;
     let end = start + sh.sh_size as usize;
@@ -308,5 +367,19 @@ mod tests {
         assert_eq!(get_strtab_string(strtab, 0).as_deref(), Some(""));
         assert_eq!(get_strtab_string(strtab, 1).as_deref(), Some("main"));
         assert_eq!(get_strtab_string(strtab, 6).as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn test_parse_rela_entry() {
+        let mut data = vec![0u8; 24];
+        data[0..8].copy_from_slice(&0x10u64.to_le_bytes());
+        data[8..16].copy_from_slice(&(1u64 | (5u64 << 32)).to_le_bytes());
+        data[16..24].copy_from_slice(&(-4i64 as u64).to_le_bytes());
+
+        let rel = parse_rela_entry(&data, 0).expect("parse");
+        assert_eq!(rel.r_offset, 0x10);
+        assert_eq!(rel.r_sym, 5);
+        assert_eq!(rel.r_type, 1);
+        assert_eq!(rel.r_addend, -4);
     }
 }
