@@ -13,6 +13,7 @@ use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -168,14 +169,32 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         .map(|p| p.as_path())
         .unwrap_or(Path::new("a.out"));
 
-    let mut obj_data_list: Vec<Vec<u8>> = Vec::with_capacity(args.input_files.len());
-    for path in &args.input_files {
+    let obj_data_list: Vec<Vec<u8>> = if args.input_files.len() > 1 {
+        let paths: Vec<PathBuf> = args.input_files.clone();
+        let handles: Vec<_> = paths
+            .into_iter()
+            .map(|p| thread::spawn(move || std::fs::read(&p)))
+            .collect();
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            let data = match h.join() {
+                Ok(Ok(d)) => d,
+                _ => return None,
+            };
+            if data.len() < 4 || &data[0..4] != [0x7f, b'E', b'L', b'F'] {
+                return None;
+            }
+            out.push(data);
+        }
+        out
+    } else {
+        let path = args.input_files.first()?;
         let data = std::fs::read(path).ok()?;
         if data.len() < 4 || &data[0..4] != [0x7f, b'E', b'L', b'F'] {
             return None;
         }
-        obj_data_list.push(data);
-    }
+        vec![data]
+    };
 
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let result = match link::link_multi_object(&obj_refs) {
