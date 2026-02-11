@@ -62,6 +62,8 @@ pub struct MachoSection {
 /// r_info: r_symbolnum:24, r_pcrel:1, r_length:2, r_extern:1, r_type:4
 pub const GENERIC_RELOC_VANILLA: u32 = 0;
 pub const ARM64_RELOC_BRANCH26: u32 = 2;
+pub const ARM64_RELOC_PAGE21: u32 = 3;
+pub const ARM64_RELOC_PAGEOFF12: u32 = 4;
 pub const X86_64_RELOC_BRANCH: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
