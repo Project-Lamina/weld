@@ -1,12 +1,18 @@
 //! Section merging and layout for single-object linking.
+//!
+//! Architecture-specific relocation logic lives in parallel modules:
+//! - x86_64: x86_64.rs
+//! - aarch64: aarch64.rs
+//! - riscv: riscv.rs
 
 #![allow(dead_code)]
 
+mod aarch64;
+mod riscv;
+mod x86_64;
+
 use crate::arch::TargetArch;
-use crate::elf::{
-    get_strtab_from_section, parse_elf64_slice, parse_rela_section, parse_symtab, SectionHeader,
-};
-use crate::elf::reloc_type;
+use crate::elf::{parse_elf64_slice, parse_symtab, SectionHeader};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -153,7 +159,7 @@ pub fn resolve_symbols(
     let symtab_sh = &sections[symtab_idx];
     let strtab_idx = symtab_sh.sh_link as usize;
     let strtab_sh = sections.get(strtab_idx).ok_or("symtab sh_link invalid")?;
-    let strtab = get_strtab_from_section(data, strtab_sh);
+    let strtab = crate::elf::get_strtab_from_section(data, strtab_sh);
 
     let symbols = parse_symtab(data, symtab_sh)?;
     let mut resolved = HashMap::new();
@@ -229,14 +235,6 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     })
 }
 
-fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
-    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
-}
-
-fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
-    buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
-}
-
 pub fn apply_relocations(
     arch: TargetArch,
     layout: &mut MergedLayout,
@@ -246,91 +244,10 @@ pub fn apply_relocations(
     symbol_addrs: &[Option<u64>],
 ) -> Result<(), String> {
     match arch {
-        TargetArch::X86_64 => apply_relocations_x86_64(layout, data, sections, names, symbol_addrs),
-        TargetArch::AArch64 | TargetArch::RiscV => {
-            Err(format!("relocations for {:?} not yet implemented", arch))
-        }
+        TargetArch::X86_64 => x86_64::apply_relocations(layout, data, sections, names, symbol_addrs),
+        TargetArch::AArch64 => aarch64::apply_relocations(layout, data, sections, names, symbol_addrs),
+        TargetArch::RiscV => riscv::apply_relocations(layout, data, sections, names, symbol_addrs),
     }
-}
-
-fn apply_relocations_x86_64(
-    layout: &mut MergedLayout,
-    data: &[u8],
-    sections: &[SectionHeader],
-    names: &[String],
-    symbol_addrs: &[Option<u64>],
-) -> Result<(), String> {
-    const SHT_RELA: u32 = 4;
-
-    for (_rela_idx, rela_sh) in sections.iter().enumerate() {
-        if rela_sh.sh_type != SHT_RELA {
-            continue;
-        }
-        let target_section_idx = rela_sh.sh_info as usize;
-        let target_name = names.get(target_section_idx).cloned().unwrap_or_default();
-        let Some(&merged_idx) = layout.section_by_name.get(&target_name) else {
-            continue;
-        };
-        let merged = &mut layout.sections[merged_idx];
-        let relas = parse_rela_section(data, rela_sh)?;
-
-        for rel in &relas {
-            let place = merged.vaddr + rel.r_offset;
-            let a = rel.r_addend;
-            let p = place as i64;
-
-            match rel.r_type {
-                reloc_type::R_X86_64_NONE => {}
-                reloc_type::R_X86_64_RELATIVE => {
-                    let base = merged.vaddr as i64;
-                    let val = base.wrapping_add(a) as u64;
-                    let off = rel.r_offset as usize;
-                    if merged.data.len() < off + 8 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
-                    }
-                    write_u64_le(&mut merged.data, off, val);
-                }
-                reloc_type::R_X86_64_64 => {
-                    let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
-                        return Err(format!("undefined symbol index {}", rel.r_sym));
-                    };
-                    let val = s_addr.wrapping_add_signed(a);
-                    let off = rel.r_offset as usize;
-                    if merged.data.len() < off + 8 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
-                    }
-                    write_u64_le(&mut merged.data, off, val);
-                }
-                reloc_type::R_X86_64_32 => {
-                    let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
-                        return Err(format!("undefined symbol index {}", rel.r_sym));
-                    };
-                    let val = s_addr.wrapping_add_signed(a) as u32;
-                    let off = rel.r_offset as usize;
-                    if merged.data.len() < off + 4 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
-                    }
-                    write_u32_le(&mut merged.data, off, val);
-                }
-                reloc_type::R_X86_64_PC32 => {
-                    let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
-                        return Err(format!("undefined symbol index {}", rel.r_sym));
-                    };
-                    let val = (*s_addr as i64).wrapping_add(a).wrapping_sub(p) as u32;
-                    let off = rel.r_offset as usize;
-                    if merged.data.len() < off + 4 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
-                    }
-                    write_u32_le(&mut merged.data, off, val);
-                }
-                _ => {
-                    return Err(format!("unsupported relocation type {}", rel.r_type));
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -401,5 +318,25 @@ mod tests {
         let result = link_single_object(&data).expect("link_single_object");
         assert!(!result.layout.sections.is_empty());
         assert!(result.layout.section_by_name.get(".text").is_some());
+    }
+
+    #[test]
+    fn test_link_aarch64_object() {
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+        let asm = ".text\n.globl main\nmain:\n  mov x0, #42\n  ret\n";
+        let tmp = std::env::temp_dir().join("weld_link_aarch64_test.o");
+
+        let mut ras = ras::Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
+            .expect("ras");
+        ras.assemble(asm, &tmp).expect("assemble");
+
+        let data = std::fs::read(&tmp).expect("read");
+        let _ = std::fs::remove_file(&tmp);
+
+        let result = link_single_object(&data).expect("link_single_object");
+        assert!(!result.layout.sections.is_empty());
+        assert!(result.layout.section_by_name.get(".text").is_some());
+        assert_eq!(result.e_machine, 183);
     }
 }
