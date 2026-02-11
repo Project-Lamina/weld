@@ -7,7 +7,8 @@ use crate::arch::TargetArch;
 use crate::link::{LinkResult, MergedLayout, MergedSection, ObjectSectionContrib};
 use crate::macho::{
     parse_macho64_object, parse_macho_relocs, Macho64Object, MachoSection,
-    ARM64_RELOC_BRANCH26, GENERIC_RELOC_VANILLA,
+    ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12,
+    GENERIC_RELOC_VANILLA,
 };
 use std::collections::HashMap;
 
@@ -48,6 +49,13 @@ fn align_up(value: u64, align: u64) -> u64 {
     }
     let a = 1u64 << align;
     (value + a - 1) & !(a - 1)
+}
+
+fn align_up_bytes(value: u64, align_bytes: u64) -> u64 {
+    if align_bytes == 0 {
+        return value;
+    }
+    (value + align_bytes - 1) & !(align_bytes - 1)
 }
 
 fn merge_macho_sections(obj: &Macho64Object) -> MergedLayout {
@@ -303,6 +311,28 @@ fn apply_macho_relocations(
                     let patched = (insn & 0xFC000000) | (imm26 as u32);
                     write_u32_le(&mut merged.data, off, patched);
                 }
+                ARM64_RELOC_PAGE21 => {
+                    let page = (value >> 12) << 12;
+                    let place_page = (place_addr >> 12) << 12;
+                    let imm = ((page as i64 - place_page as i64) >> 12) as i32;
+                    let imm_lo = (imm & 3) as u32;
+                    let imm_hi = ((imm >> 2) & 0x7FFFF) as u32;
+                    if merged.data.len() < off + 4 {
+                        return Err("page21 reloc: buffer too short".to_string());
+                    }
+                    let insn = read_u32_le(&merged.data, off).unwrap_or(0);
+                    let patched = (insn & 0x9F00001F) | (imm_lo << 29) | (imm_hi << 5);
+                    write_u32_le(&mut merged.data, off, patched);
+                }
+                ARM64_RELOC_PAGEOFF12 => {
+                    let pageoff = (value & 0xFFF) as u32;
+                    if merged.data.len() < off + 4 {
+                        return Err("pageoff12 reloc: buffer too short".to_string());
+                    }
+                    let insn = read_u32_le(&merged.data, off).unwrap_or(0);
+                    let patched = (insn & 0xFFC003FF) | (pageoff << 10);
+                    write_u32_le(&mut merged.data, off, patched);
+                }
                 _ => {
                     return Err(format!(
                         "unsupported Mach-O relocation type {}",
@@ -336,11 +366,14 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
     })
 }
 
-pub fn link_macho_multi_object(datas: &[&[u8]]) -> Result<LinkResult, String> {
+pub fn link_macho_multi_object(
+    datas: &[&[u8]],
+    libs: Option<&[String]>,
+) -> Result<LinkResult, String> {
     if datas.is_empty() {
         return Err("no objects to link".to_string());
     }
-    if datas.len() == 1 {
+    if datas.len() == 1 && libs.is_none() {
         return link_macho_single_object(datas[0]);
     }
 
@@ -383,6 +416,71 @@ pub fn link_macho_multi_object(datas: &[&[u8]]) -> Result<LinkResult, String> {
         }
     }
 
+    let has_system = libs
+        .map(|l| l.iter().any(|x| x == "System" || x == "c"))
+        .unwrap_or(false);
+
+    let mut undefined: Vec<String> = Vec::new();
+    if has_system && arch == TargetArch::AArch64 {
+        for obj in &objects {
+            for sym in &obj.symbols {
+                if !sym.is_defined && !sym.name.is_empty() {
+                    if !global_symbols.contains_key(&sym.name)
+                        && !undefined.contains(&sym.name)
+                    {
+                        undefined.push(sym.name.clone());
+                    }
+                }
+            }
+        }
+
+        if !undefined.is_empty() {
+            let last = layout.sections.last().ok_or("no sections")?;
+            let mut vaddr = align_up_bytes(last.vaddr + last.data.len() as u64, 16);
+
+            let (stubs_data, stub_helper_data, got_data) =
+                build_macho_stubs_arm64(&undefined, vaddr)?;
+
+            let stubs_vaddr = vaddr;
+            layout.sections.push(MergedSection {
+                name: "__stubs".into(),
+                data: stubs_data,
+                vaddr: stubs_vaddr,
+                flags: 6,
+                align: 4,
+            });
+            layout.section_by_name.insert("__stubs".into(), layout.sections.len() - 1);
+            vaddr += layout.sections.last().unwrap().data.len() as u64;
+
+            let stub_helper_vaddr = vaddr;
+            layout.sections.push(MergedSection {
+                name: "__stub_helper".into(),
+                data: stub_helper_data,
+                vaddr: stub_helper_vaddr,
+                flags: 6,
+                align: 4,
+            });
+            layout.section_by_name.insert("__stub_helper".into(), layout.sections.len() - 1);
+            vaddr += layout.sections.last().unwrap().data.len() as u64;
+
+            vaddr = align_up_bytes(vaddr, 0x8000);
+            let got_vaddr = vaddr;
+            layout.sections.push(MergedSection {
+                name: "__got".into(),
+                data: got_data,
+                vaddr: got_vaddr,
+                flags: 2,
+                align: 8,
+            });
+            layout.section_by_name.insert("__got".into(), layout.sections.len() - 1);
+
+            for (i, sym) in undefined.iter().enumerate() {
+                let stub_addr = stubs_vaddr + (i as u64) * 12;
+                global_symbols.insert(sym.clone(), stub_addr);
+            }
+        }
+    }
+
     for (obj_idx, obj) in objects.iter().enumerate() {
         let contrib = &section_contribs[obj_idx];
         let symbol_addrs = symbol_addr_by_index_multi(obj, &layout, &global_symbols, contrib);
@@ -396,12 +494,74 @@ pub fn link_macho_multi_object(datas: &[&[u8]]) -> Result<LinkResult, String> {
         )?;
     }
 
+    let dynamic = if layout.section_by_name.contains_key("__got") {
+        let plt_symbols = undefined;
+        let needed = vec!["libSystem.B.dylib".into()];
+        Some(crate::link::DynamicLinkInfo {
+            needed,
+            plt_symbols,
+            interpreter: None,
+        })
+    } else {
+        None
+    };
+
     Ok(LinkResult {
         layout,
         e_machine,
         symbol_addrs: global_symbols,
-        dynamic: None,
+        dynamic,
     })
+}
+
+fn build_macho_stubs_arm64(
+    symbols: &[String],
+    stubs_start_vaddr: u64,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    const STUB_SIZE: u64 = 12;
+    let stub_helper_len = 36;
+    let got_vaddr = align_up_bytes(
+        stubs_start_vaddr + (symbols.len() as u64) * STUB_SIZE + stub_helper_len as u64,
+        0x8000,
+    );
+
+    let mut stubs = Vec::with_capacity(symbols.len() * 12);
+    for (i, _) in symbols.iter().enumerate() {
+        let stub_addr = stubs_start_vaddr + (i as u64) * STUB_SIZE;
+        let got_slot = got_vaddr + (i as u64) * 8;
+        let page = got_slot & !0xFFF;
+        let pageoff = (got_slot & 0xFFF) as u32;
+        let stub_page = stub_addr & !0xFFF;
+        let imm = ((page - stub_page) >> 12) as i32;
+        let imm_lo = (imm & 3) as u32;
+        let imm_hi = ((imm >> 2) & 0x7FFFF) as u32;
+        let adrp = 0x90000010u32 | (imm_lo << 29) | (imm_hi << 5);
+        let ldr = 0xF9400210u32 | (pageoff << 10);
+        let br = 0xD61F0200u32;
+        stubs.extend_from_slice(&adrp.to_le_bytes());
+        stubs.extend_from_slice(&ldr.to_le_bytes());
+        stubs.extend_from_slice(&br.to_le_bytes());
+    }
+
+    let _stub_helper_vaddr = stubs_start_vaddr + (symbols.len() as u64) * STUB_SIZE;
+    let _dyld_private_approx = got_vaddr + 0x8000;
+    let mut stub_helper = Vec::with_capacity(stub_helper_len);
+    let h0 = 0x90000011u32;
+    let h1 = 0x91002231u32;
+    let h2 = 0xA9BF46F0u32;
+    let h3 = 0x90000010u32;
+    let h4 = 0xF9400210u32;
+    let h5 = 0xD61F0200u32;
+    stub_helper.extend_from_slice(&h0.to_le_bytes());
+    stub_helper.extend_from_slice(&h1.to_le_bytes());
+    stub_helper.extend_from_slice(&h2.to_le_bytes());
+    stub_helper.extend_from_slice(&h3.to_le_bytes());
+    stub_helper.extend_from_slice(&h4.to_le_bytes());
+    stub_helper.extend_from_slice(&h5.to_le_bytes());
+
+    let got = vec![0u8; symbols.len() * 8];
+
+    Ok((stubs, stub_helper, got))
 }
 
 fn symbol_addr_by_index_multi(
