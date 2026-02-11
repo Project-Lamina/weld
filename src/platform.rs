@@ -35,7 +35,7 @@ impl TargetPlatform {
     }
 
     pub fn supports_native_linking(self) -> bool {
-        matches!(self, Self::Linux)
+        matches!(self, Self::Linux | Self::MacOS)
     }
 
     pub fn output_format(self) -> &'static str {
