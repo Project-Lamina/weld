@@ -1,7 +1,7 @@
 //! x86_64 relocation application.
 
 use crate::elf::reloc_type;
-use crate::elf::{SectionHeader, parse_rela_section};
+use crate::elf::{parse_rela_section, SectionHeader};
 use crate::link::MergedLayout;
 
 fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {

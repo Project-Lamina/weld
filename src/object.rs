@@ -94,7 +94,11 @@ fn is_ar(data: &[u8]) -> bool {
 
 fn read_elf(path: &PathBuf) -> Option<Vec<u8>> {
     let data = normalize_macho_container(std::fs::read(path).ok()?);
-    if is_elf(&data) { Some(data) } else { None }
+    if is_elf(&data) {
+        Some(data)
+    } else {
+        None
+    }
 }
 
 #[allow(dead_code)]
