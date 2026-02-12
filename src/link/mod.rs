@@ -72,6 +72,7 @@ pub struct ResolvedSymbol {
 pub struct DynamicLinkInfo {
     pub needed: Vec<String>,
     pub plt_symbols: Vec<String>,
+    pub weak_plt_symbols: Vec<String>,
     pub interpreter: Option<String>,
 }
 
@@ -481,7 +482,10 @@ pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<L
     link_multi_object_parsed(&parsed, libs)
 }
 
-fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) -> Result<LinkResult, String> {
+fn link_multi_object_parsed(
+    parsed: &[ParsedObject],
+    libs: Option<&[String]>,
+) -> Result<LinkResult, String> {
     if parsed.is_empty() {
         return Err("no objects to link".to_string());
     }
@@ -517,12 +521,11 @@ fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) ->
     }
 
     let mut dynamic_info: Option<DynamicLinkInfo> = None;
-    let has_libc = libs.map(|l| l.iter().any(|x| x == "c" || x == "System")).unwrap_or(false);
+    let has_libc = libs
+        .map(|l| l.iter().any(|x| x == "c" || x == "System"))
+        .unwrap_or(false);
 
-    if has_libc
-        && arch == TargetArch::X86_64
-        && e_machine == 62
-    {
+    if has_libc && arch == TargetArch::X86_64 && e_machine == 62 {
         let mut undefined: Vec<String> = Vec::new();
         for (obj_idx, obj) in parsed.iter().enumerate() {
             let obj_by_index = &resolved_by_index_per_object[obj_idx];
@@ -553,7 +556,9 @@ fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) ->
                 flags: SHF_ALLOC | SHF_EXECINSTR,
                 align: 16,
             });
-            layout.section_by_name.insert(".plt".into(), layout.sections.len() - 1);
+            layout
+                .section_by_name
+                .insert(".plt".into(), layout.sections.len() - 1);
             vaddr = align_up(vaddr + layout.sections.last().unwrap().data.len() as u64, 8);
 
             let got_plt_vaddr = vaddr;
@@ -564,7 +569,9 @@ fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) ->
                 flags: SHF_ALLOC | SHF_WRITE,
                 align: 8,
             });
-            layout.section_by_name.insert(".got.plt".into(), layout.sections.len() - 1);
+            layout
+                .section_by_name
+                .insert(".got.plt".into(), layout.sections.len() - 1);
             let got_plt_size = 24 + (undefined.len() as u64) * 8;
             vaddr = align_up(got_plt_vaddr + got_plt_size, 8);
 
@@ -579,7 +586,9 @@ fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) ->
                 flags: SHF_ALLOC,
                 align: 8,
             });
-            layout.section_by_name.insert(".dynsym".into(), layout.sections.len() - 1);
+            layout
+                .section_by_name
+                .insert(".dynsym".into(), layout.sections.len() - 1);
             vaddr = align_up(vaddr + dynsym_size, 8);
 
             let dynstr_vaddr = vaddr;
@@ -591,7 +600,9 @@ fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) ->
                 flags: SHF_ALLOC,
                 align: 1,
             });
-            layout.section_by_name.insert(".dynstr".into(), layout.sections.len() - 1);
+            layout
+                .section_by_name
+                .insert(".dynstr".into(), layout.sections.len() - 1);
             vaddr = align_up(vaddr + dynstr_size, 8);
 
             let rela_plt_vaddr = vaddr;
@@ -603,7 +614,9 @@ fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) ->
                 flags: SHF_ALLOC,
                 align: 8,
             });
-            layout.section_by_name.insert(".rela.plt".into(), layout.sections.len() - 1);
+            layout
+                .section_by_name
+                .insert(".rela.plt".into(), layout.sections.len() - 1);
             vaddr = align_up(vaddr + rela_plt_size, 8);
 
             let dynamic_data = build_dynamic_section_content(
@@ -622,7 +635,9 @@ fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) ->
                 flags: SHF_ALLOC | SHF_WRITE,
                 align: 8,
             });
-            layout.section_by_name.insert(".dynamic".into(), layout.sections.len() - 1);
+            layout
+                .section_by_name
+                .insert(".dynamic".into(), layout.sections.len() - 1);
 
             for (i, sym) in undefined.iter().enumerate() {
                 let plt_entry_addr = plt_vaddr + 16 + (i as u64) * 16;
@@ -630,7 +645,11 @@ fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) ->
             }
 
             let interpreter = "/lib64/ld-linux-x86-64.so.2".to_string();
-            let needed = if libs.as_ref().map(|l| l.contains(&"System".into())).unwrap_or(false) {
+            let needed = if libs
+                .as_ref()
+                .map(|l| l.contains(&"System".into()))
+                .unwrap_or(false)
+            {
                 vec!["libSystem.B.dylib".into()]
             } else {
                 vec!["libc.so.6".into()]
@@ -638,6 +657,7 @@ fn link_multi_object_parsed(parsed: &[ParsedObject], libs: Option<&[String]>) ->
             dynamic_info = Some(DynamicLinkInfo {
                 needed,
                 plt_symbols: undefined,
+                weak_plt_symbols: Vec::new(),
                 interpreter: Some(interpreter),
             });
         }
