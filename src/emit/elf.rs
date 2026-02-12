@@ -27,22 +27,38 @@ const PF_W: u32 = 2;
 const PF_X: u32 = 1;
 const ELF64_PHDR_SIZE: usize = 56;
 
+#[allow(dead_code)]
 const DT_NEEDED: u64 = 1;
+#[allow(dead_code)]
 const DT_PLTRELSZ: u64 = 2;
+#[allow(dead_code)]
 const DT_PLTGOT: u64 = 3;
+#[allow(dead_code)]
 const DT_STRTAB: u64 = 5;
+#[allow(dead_code)]
 const DT_SYMTAB: u64 = 6;
+#[allow(dead_code)]
 const DT_RELA: u64 = 7;
+#[allow(dead_code)]
 const DT_RELASZ: u64 = 8;
+#[allow(dead_code)]
 const DT_RELAENT: u64 = 9;
+#[allow(dead_code)]
 const DT_STRSZ: u64 = 10;
+#[allow(dead_code)]
 const DT_SYMENT: u64 = 11;
+#[allow(dead_code)]
 const DT_PLTREL: u64 = 20;
+#[allow(dead_code)]
 const DT_JMPREL: u64 = 23;
 
+#[allow(dead_code)]
 const STB_GLOBAL: u8 = 1;
+#[allow(dead_code)]
 const STT_FUNC: u8 = 2;
+#[allow(dead_code)]
 const SHN_UNDEF: u16 = 0;
+#[allow(dead_code)]
 const R_X86_64_JUMP_SLOT: u32 = 7;
 
 pub fn emit_elf_executable(
