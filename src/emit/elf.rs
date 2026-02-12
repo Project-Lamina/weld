@@ -225,7 +225,7 @@ pub fn emit_elf_executable_dynamic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::{MergedSection, link_single_object};
+    use crate::link::{link_single_object, MergedSection};
     use std::collections::HashMap;
 
     #[test]
