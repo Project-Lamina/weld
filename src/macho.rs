@@ -21,6 +21,7 @@ const CPU_TYPE_ARM64: u32 = 0x0100000C;
 const N_TYPE: u8 = 0x0e;
 const N_SECT: u8 = 0x0e;
 const N_EXT: u8 = 0x01;
+const N_WEAK_REF: u16 = 0x0040;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachoCpuType {
@@ -57,6 +58,7 @@ pub struct MachoSection {
     pub align: u32,
     pub reloff: u32,
     pub nreloc: u32,
+    pub flags: u32,
 }
 
 /// Mach-O relocation_info: r_address (4) + r_info (4).
@@ -67,6 +69,9 @@ pub const ARM64_RELOC_PAGE21: u32 = 3;
 pub const ARM64_RELOC_PAGEOFF12: u32 = 4;
 pub const ARM64_RELOC_GOT_LOAD_PAGE21: u32 = 5;
 pub const ARM64_RELOC_GOT_LOAD_PAGEOFF12: u32 = 6;
+pub const ARM64_RELOC_TLVP_LOAD_PAGE21: u32 = 8;
+pub const ARM64_RELOC_TLVP_LOAD_PAGEOFF12: u32 = 9;
+pub const ARM64_RELOC_ADDEND: u32 = 10;
 pub const X86_64_RELOC_BRANCH: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
@@ -85,7 +90,9 @@ pub struct MachoSymbol {
     pub value: u64,
     pub sect: u8,
     pub n_type: u8,
+    pub n_desc: u16,
     pub is_defined: bool,
+    pub is_weak_ref: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +122,11 @@ fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
+fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
+    data.get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+
 fn read_u64_le(data: &[u8], off: usize) -> Option<u64> {
     data.get(off..off + 8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
@@ -136,7 +148,9 @@ pub fn is_macho64(data: &[u8]) -> bool {
 pub fn is_macho_dylib(data: &[u8]) -> bool {
     is_macho64(data)
         && data.len() >= 16
-        && read_u32_le(data, 12).map(|ft| ft == MH_DYLIB).unwrap_or(false)
+        && read_u32_le(data, 12)
+            .map(|ft| ft == MH_DYLIB)
+            .unwrap_or(false)
 }
 
 pub fn parse_macho64_header(data: &[u8]) -> Result<Macho64Header, String> {
@@ -221,6 +235,7 @@ fn parse_sections_from_segment(data: &[u8], off: usize, _cmdsize: usize) -> Vec<
         let align = read_u32_le(data, sec_off + 52).unwrap_or(0);
         let reloff = read_u32_le(data, sec_off + 56).unwrap_or(0);
         let nreloc = read_u32_le(data, sec_off + 60).unwrap_or(0);
+        let flags = read_u32_le(data, sec_off + 64).unwrap_or(0);
         sections.push(MachoSection {
             sectname,
             segname,
@@ -230,6 +245,7 @@ fn parse_sections_from_segment(data: &[u8], off: usize, _cmdsize: usize) -> Vec<
             align,
             reloff,
             nreloc,
+            flags,
         });
         sec_off += 80;
     }
@@ -254,6 +270,7 @@ fn parse_symtab(
         let n_strx = read_u32_le(data, off).unwrap_or(0) as usize;
         let n_type = data.get(off + 4).copied().unwrap_or(0);
         let n_sect = data.get(off + 5).copied().unwrap_or(0);
+        let n_desc = read_u16_le(data, off + 6).unwrap_or(0);
         let n_value = read_u64_le(data, off + 8).unwrap_or(0);
 
         let name = if n_strx > 0 && st_end > stroff as usize + n_strx {
@@ -266,13 +283,16 @@ fn parse_symtab(
 
         let sect_type = n_type & N_TYPE;
         let is_defined = sect_type == N_SECT && n_sect != 0;
+        let is_weak_ref = !is_defined && (n_desc & N_WEAK_REF) != 0;
 
         symbols.push(MachoSymbol {
             name,
             value: n_value,
             sect: n_sect,
             n_type,
+            n_desc,
             is_defined,
+            is_weak_ref,
         });
     }
     symbols
