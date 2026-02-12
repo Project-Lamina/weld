@@ -1,9 +1,9 @@
 //! Target platform support ordering.
 //!
 //! Priority: Linux and macOS first, Windows later.
-//! - Linux: ELF executable emission (native weld linking)
-//! - macOS: delegate to ld64; Mach-O emission planned
-//! - Windows: delegate to link.exe; PE support planned
+//! - Linux: ELF native linking (done)
+//! - macOS: Mach-O native linking (done)
+//! - Windows: PE support planned
 
 #![allow(dead_code)]
 
