@@ -48,6 +48,22 @@ pub mod reloc_type {
     pub const R_AARCH64_JUMP26: u32 = 282;
     pub const R_AARCH64_CALL26: u32 = 283;
     pub const R_AARCH64_RELATIVE: u32 = 1027;
+
+    // RISC-V ELF psABI relocations
+    pub const R_RISCV_NONE: u32 = 0;
+    pub const R_RISCV_32: u32 = 1;
+    pub const R_RISCV_64: u32 = 2;
+    pub const R_RISCV_RELATIVE: u32 = 3;
+    pub const R_RISCV_BRANCH: u32 = 16;
+    pub const R_RISCV_JAL: u32 = 17;
+    pub const R_RISCV_CALL: u32 = 18;
+    pub const R_RISCV_CALL_PLT: u32 = 19;
+    pub const R_RISCV_PCREL_HI20: u32 = 23;
+    pub const R_RISCV_PCREL_LO12_I: u32 = 24;
+    pub const R_RISCV_PCREL_LO12_S: u32 = 25;
+    pub const R_RISCV_HI20: u32 = 26;
+    pub const R_RISCV_LO12_I: u32 = 27;
+    pub const R_RISCV_LO12_S: u32 = 28;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

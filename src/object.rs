@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::thread;
 
@@ -7,6 +8,24 @@ const FAT_MAGIC: u32 = 0xCAFEBABE;
 const FAT_MAGIC_64: u32 = 0xCAFEBABF;
 const CPU_TYPE_X86_64: u32 = 0x01000007;
 const CPU_TYPE_ARM64: u32 = 0x0100000C;
+const SHN_UNDEF: u16 = 0;
+const SHT_SYMTAB: u32 = 2;
+const STB_GLOBAL: u8 = 1;
+const STB_WEAK: u8 = 2;
+const N_EXT: u8 = 0x01;
+
+#[derive(Default, Clone)]
+struct ObjectSymbolSummary {
+    defined: HashSet<String>,
+    undefined: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct ArchiveMember {
+    data: Vec<u8>,
+    symbols: ObjectSymbolSummary,
+    selected: bool,
+}
 
 fn read_u32_be(data: &[u8], off: usize) -> Option<u32> {
     data.get(off..off + 4)
@@ -94,11 +113,7 @@ fn is_ar(data: &[u8]) -> bool {
 
 fn read_elf(path: &PathBuf) -> Option<Vec<u8>> {
     let data = normalize_macho_container(std::fs::read(path).ok()?);
-    if is_elf(&data) {
-        Some(data)
-    } else {
-        None
-    }
+    if is_elf(&data) { Some(data) } else { None }
 }
 
 #[allow(dead_code)]
@@ -111,7 +126,90 @@ fn read_macho(path: &PathBuf) -> Option<Vec<u8>> {
     }
 }
 
-fn extract_ar_objects(data: &[u8]) -> Vec<Vec<u8>> {
+fn collect_elf_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
+    let (_header, sections, _names) = crate::elf::parse_elf64_slice(data).ok()?;
+    let mut summary = ObjectSymbolSummary::default();
+
+    for symtab_sh in sections.iter().filter(|sh| sh.sh_type == SHT_SYMTAB) {
+        let strtab_sh = sections.get(symtab_sh.sh_link as usize)?;
+        let strtab = crate::elf::get_strtab_from_section(data, strtab_sh);
+        let symbols = crate::elf::parse_symtab(data, symtab_sh).ok()?;
+        for sym in symbols {
+            if sym.bind != STB_GLOBAL && sym.bind != STB_WEAK {
+                continue;
+            }
+            let name = crate::elf::get_strtab_string(strtab, sym.name_offset)?;
+            if name.is_empty() {
+                continue;
+            }
+            if sym.st_shndx == SHN_UNDEF {
+                if sym.bind == STB_WEAK {
+                    continue;
+                }
+                summary.undefined.insert(name);
+            } else {
+                summary.defined.insert(name);
+            }
+        }
+    }
+
+    summary
+        .undefined
+        .retain(|sym| !summary.defined.contains(sym));
+    Some(summary)
+}
+
+fn collect_macho_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
+    let obj = crate::macho::parse_macho64_object(data).ok()?;
+    let mut summary = ObjectSymbolSummary::default();
+
+    for sym in obj.symbols {
+        if sym.name.is_empty() || (sym.n_type & N_EXT) == 0 {
+            continue;
+        }
+        if sym.is_defined {
+            summary.defined.insert(sym.name);
+        } else {
+            if sym.is_weak_ref {
+                continue;
+            }
+            summary.undefined.insert(sym.name);
+        }
+    }
+
+    summary
+        .undefined
+        .retain(|sym| !summary.defined.contains(sym));
+    Some(summary)
+}
+
+fn collect_object_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
+    if is_elf(data) {
+        collect_elf_symbol_summary(data)
+    } else if crate::macho::is_macho64(data) {
+        collect_macho_symbol_summary(data)
+    } else {
+        None
+    }
+}
+
+fn apply_symbol_summary(
+    summary: &ObjectSymbolSummary,
+    defined_symbols: &mut HashSet<String>,
+    unresolved_symbols: &mut HashSet<String>,
+) {
+    for sym in &summary.defined {
+        defined_symbols.insert(sym.clone());
+        unresolved_symbols.remove(sym);
+    }
+    for sym in &summary.undefined {
+        if !defined_symbols.contains(sym) {
+            unresolved_symbols.insert(sym.clone());
+        }
+    }
+}
+
+fn extract_ar_members(data: &[u8]) -> Vec<ArchiveMember> {
     let mut out = Vec::new();
     if !is_ar(data) || data.len() < 8 + 60 {
         return out;
@@ -139,12 +237,19 @@ fn extract_ar_objects(data: &[u8]) -> Vec<Vec<u8>> {
             } else {
                 member
             };
+
+            let normalized = normalize_macho_container(payload.to_vec());
             if !name.is_empty()
                 && name != "/"
                 && name != "//"
-                && (is_elf(payload) || crate::macho::is_macho64(payload))
+                && (is_elf(&normalized) || crate::macho::is_macho64(&normalized))
             {
-                out.push(payload.to_vec());
+                let symbols = collect_object_symbol_summary(&normalized).unwrap_or_default();
+                out.push(ArchiveMember {
+                    data: normalized,
+                    symbols,
+                    selected: false,
+                });
             }
         }
         off += member_size;
@@ -162,13 +267,7 @@ pub enum ObjectFormat {
 }
 
 fn expand_data_to_objects(data: Vec<u8>) -> Option<Vec<Vec<u8>>> {
-    if is_ar(&data) {
-        let objs = extract_ar_objects(&data);
-        if objs.is_empty() {
-            return None;
-        }
-        Some(objs)
-    } else if is_elf(&data) {
+    if is_elf(&data) {
         Some(vec![data])
     } else if crate::macho::is_macho64(&data) {
         Some(vec![data])
@@ -181,17 +280,92 @@ pub fn load_objects(paths: &[PathBuf]) -> Option<(ObjectFormat, Vec<Vec<u8>>, Ve
     if paths.is_empty() {
         return None;
     }
+
     let mut all_objects: Vec<Vec<u8>> = Vec::new();
     let mut dylib_paths: Vec<PathBuf> = Vec::new();
+    let mut defined_symbols: HashSet<String> = HashSet::new();
+    let mut unresolved_symbols: HashSet<String> = HashSet::new();
+    let trace_archive = std::env::var("WELD_TRACE_ARCHIVE").ok().as_deref() == Some("1");
+
     for path in paths {
         let data = normalize_macho_container(std::fs::read(path).ok()?);
         if crate::macho::is_macho_dylib(&data) {
             dylib_paths.push(path.clone());
             continue;
         }
+
+        if is_ar(&data) {
+            let mut members = extract_ar_members(&data);
+            let mut selected_any = false;
+            if trace_archive {
+                eprintln!(
+                    "[weld] archive {} members={}",
+                    path.display(),
+                    members.len()
+                );
+            }
+
+            loop {
+                let mut changed = false;
+                for member in members.iter_mut() {
+                    if member.selected {
+                        continue;
+                    }
+                    if member.symbols.defined.is_disjoint(&unresolved_symbols) {
+                        continue;
+                    }
+                    member.selected = true;
+                    selected_any = true;
+                    if trace_archive {
+                        let mut hits: Vec<&str> = member
+                            .symbols
+                            .defined
+                            .intersection(&unresolved_symbols)
+                            .map(|s| s.as_str())
+                            .collect();
+                        hits.sort_unstable();
+                        let sample = hits.into_iter().take(4).collect::<Vec<_>>().join(",");
+                        eprintln!(
+                            "[weld]   select member defs={} undefs={} hits=[{}]",
+                            member.symbols.defined.len(),
+                            member.symbols.undefined.len(),
+                            sample
+                        );
+                    }
+                    apply_symbol_summary(
+                        &member.symbols,
+                        &mut defined_symbols,
+                        &mut unresolved_symbols,
+                    );
+                    all_objects.push(member.data.clone());
+                    changed = true;
+                }
+                if !changed {
+                    break;
+                }
+            }
+
+            if !selected_any && all_objects.is_empty() {
+                if let Some(first_member) = members.first() {
+                    apply_symbol_summary(
+                        &first_member.symbols,
+                        &mut defined_symbols,
+                        &mut unresolved_symbols,
+                    );
+                    all_objects.push(first_member.data.clone());
+                }
+            }
+            continue;
+        }
+
         let objs = expand_data_to_objects(data)?;
-        all_objects.extend(objs);
+        for obj in objs {
+            let symbols = collect_object_symbol_summary(&obj).unwrap_or_default();
+            apply_symbol_summary(&symbols, &mut defined_symbols, &mut unresolved_symbols);
+            all_objects.push(obj);
+        }
     }
+
     if all_objects.is_empty() {
         return None;
     }
