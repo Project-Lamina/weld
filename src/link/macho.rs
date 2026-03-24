@@ -20,6 +20,7 @@ const SECTION_TYPE_MASK: u32 = 0x0000_00ff;
 const S_ZEROFILL: u32 = 0x1;
 const S_GB_ZEROFILL: u32 = 0xc;
 const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
+const N_WEAK_DEF: u16 = 0x0080;
 const N_EXT: u8 = 0x01;
 
 fn macho_section_merge_order(sectname: &str) -> usize {
@@ -90,6 +91,10 @@ fn is_data_layout_section(name: &str) -> bool {
         return seg.starts_with("__DATA") || seg.starts_with("__AUTH");
     }
     false
+}
+
+fn is_thread_vars_section(name: &str) -> bool {
+    name == "__DATA.__thread_vars" || name == "__DATA_DIRTY.__thread_vars"
 }
 
 fn compute_runtime_shifts(layout: &MergedLayout) -> (u64, u64) {
@@ -345,6 +350,15 @@ fn encode_arm64_pageoff_immediate(insn: u32, pageoff: u32) -> Result<u32, String
     Ok((insn & 0xffc0_03ff) | (imm12 << 10))
 }
 
+fn encode_arm64_tlvp_local_add(insn: u32, pageoff: u32) -> Result<u32, String> {
+    if pageoff > 0x0fff {
+        return Err(format!("tlvp local pageoff {} out of range", pageoff));
+    }
+    let rd = insn & 0x1f;
+    let rn = (insn >> 5) & 0x1f;
+    Ok(0x9100_0000 | (pageoff << 10) | (rn << 5) | rd)
+}
+
 fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
     data.get(off..off + 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
@@ -395,8 +409,11 @@ fn apply_macho_relocations(
     _undefined: &[String],
     text_shift: u64,
     data_shift: u64,
+    mut rebase_addrs: Option<&mut HashSet<u64>>,
+    mut direct_binds: Option<&mut Vec<(u64, String, bool, i64)>>,
 ) -> Result<(), String> {
     let trace_relocs = std::env::var("WELD_TRACE_RELOCS").ok().as_deref() == Some("1");
+    let trace_tls = std::env::var("WELD_TRACE_TLS").ok().as_deref() == Some("1");
     let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
     for (i, sec) in obj.sections.iter().enumerate() {
         let sect_idx = (i + 1) as u8;
@@ -422,6 +439,24 @@ fn apply_macho_relocations(
         })
         .collect();
 
+    let tls_ranges: Vec<(u64, u64)> = layout
+        .sections
+        .iter()
+        .filter(|sec| sec.name == "__DATA.__thread_data" || sec.name == "__DATA.__thread_bss")
+        .map(|sec| (sec.vaddr, sec.vaddr + sec.data.len() as u64))
+        .collect();
+    let tls_base = tls_ranges.iter().map(|(start, _)| *start).min();
+    let tls_end = tls_ranges.iter().map(|(_, end)| *end).max();
+    let tls_size = match (tls_base, tls_end) {
+        (Some(base), Some(end)) if end >= base => end - base,
+        _ => 0,
+    };
+    if trace_tls {
+        eprintln!(
+            "tls-ranges={:?} tls_base={:?} tls_end={:?} tls_size=0x{:x}",
+            tls_ranges, tls_base, tls_end, tls_size
+        );
+    }
     for (i, sec) in obj.sections.iter().enumerate() {
         if sec.nreloc == 0 {
             continue;
@@ -459,42 +494,118 @@ fn apply_macho_relocations(
                 .get(merged_idx)
                 .map(|(_, _, shift)| *shift)
                 .unwrap_or(text_shift);
+            let mut should_record_rebase =
+                !r.r_pcrel && r.r_length == 3 && is_data_layout_section(&merged.name);
 
+            let mut direct_bind_symbol: Option<(String, bool, i64)> = None;
             let base = if r.r_extern {
                 let idx = r.r_symbolnum as usize;
-                let addr_opt = if (r.r_type == ARM64_RELOC_GOT_LOAD_PAGE21
-                    || r.r_type == ARM64_RELOC_GOT_LOAD_PAGEOFF12
-                    || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGE21
-                    || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12)
-                    && got_slot_by_symbol.is_some()
-                {
-                    obj.symbols
-                        .get(idx)
-                        .and_then(|s| got_slot_by_symbol.and_then(|m| m.get(&s.name).copied()))
+                let sym = obj.symbols.get(idx);
+                let resolved_sym_addr = symbol_addr_by_idx
+                    .get(idx)
+                    .and_then(|o| o.as_ref().copied());
+                let wants_direct_bind = sym
+                    .map(|s| {
+                        !s.is_defined
+                            && is_thread_vars_section(&merged.name)
+                            && r.r_type == GENERIC_RELOC_VANILLA
+                            && r.r_length == 3
+                            && !r.r_pcrel
+                    })
+                    .unwrap_or(false);
+
+                if wants_direct_bind {
+                    if let Some(s) = sym {
+                        let mut bind_addend = read_addend(&merged.data, off, r.r_length) as i64;
+                        if bind_addend == 0 && s.name == "__tlv_bootstrap" {
+                            bind_addend = 8;
+                        }
+                        direct_bind_symbol = Some((s.name.clone(), s.is_weak_ref, bind_addend));
+                    }
+                    0
                 } else {
-                    None
-                };
-                let addr_opt = addr_opt.or_else(|| {
-                    symbol_addr_by_idx
-                        .get(idx)
-                        .and_then(|o| o.as_ref().copied())
-                });
-                let Some(addr) = addr_opt else {
-                    let sym_name = obj.symbols.get(idx).map(|s| s.name.as_str()).unwrap_or("?");
-                    return Err(format!(
-                        "undefined symbol index {} ({}) for relocation",
-                        idx, sym_name
-                    ));
-                };
-                addr
+                    let is_got_reloc = r.r_type == ARM64_RELOC_GOT_LOAD_PAGE21
+                        || r.r_type == ARM64_RELOC_GOT_LOAD_PAGEOFF12;
+                    let is_tlvp_reloc = r.r_type == ARM64_RELOC_TLVP_LOAD_PAGE21
+                        || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12;
+                    let use_got_slot = sym
+                        .map(|s| {
+                            if is_tlvp_reloc {
+                                resolved_sym_addr.is_none()
+                            } else {
+                                !s.is_defined && is_got_reloc
+                            }
+                        })
+                        .unwrap_or(false);
+                    let addr_opt = if use_got_slot && got_slot_by_symbol.is_some() {
+                        obj.symbols
+                            .get(idx)
+                            .and_then(|s| got_slot_by_symbol.and_then(|m| m.get(&s.name).copied()))
+                    } else {
+                        None
+                    };
+                    let addr_opt = addr_opt.or_else(|| resolved_sym_addr);
+                    let Some(addr) = addr_opt else {
+                        let sym_name = obj.symbols.get(idx).map(|s| s.name.as_str()).unwrap_or("?");
+                        return Err(format!(
+                            "undefined symbol index {} ({}) for relocation",
+                            idx, sym_name
+                        ));
+                    };
+                    addr
+                }
             } else {
                 let sect_idx = r.r_symbolnum as u8;
                 let addr = vaddr_by_sect.get(&sect_idx).copied().unwrap_or(0);
                 addr
             };
-            let base_runtime = runtime_addr_for_layout_addr(&section_ranges, text_shift, base);
+            let base_runtime = if direct_bind_symbol.is_some() {
+                0
+            } else {
+                runtime_addr_for_layout_addr(&section_ranges, text_shift, base)
+            };
             let place_runtime = place_addr.wrapping_add(place_shift);
             let extra_addend = addend_by_address.remove(&r.r_address).unwrap_or(0);
+            if direct_bind_symbol.is_some() {
+                should_record_rebase = false;
+            }
+            if let Some((sym_name, weak, bind_addend)) = direct_bind_symbol {
+                if let Some(binds) = direct_binds.as_deref_mut() {
+                    binds.push((place_addr, sym_name, weak, bind_addend));
+                }
+            }
+
+            if trace_tls && is_thread_vars_section(&merged.name) && r.r_length == 3 {
+                let sym_name = if r.r_extern {
+                    obj.symbols
+                        .get(r.r_symbolnum as usize)
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("?")
+                } else {
+                    "<local-sect>"
+                };
+                let sym_defined = if r.r_extern {
+                    obj.symbols
+                        .get(r.r_symbolnum as usize)
+                        .map(|s| s.is_defined)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                eprintln!(
+                    "tls-reloc off=0x{:x} mod24={} type={} ext={} def={} pcrel={} sym={} base=0x{:x} addend={} sect={}",
+                    off,
+                    off % 24,
+                    r.r_type,
+                    r.r_extern,
+                    sym_defined,
+                    r.r_pcrel,
+                    sym_name,
+                    base,
+                    extra_addend,
+                    merged.name
+                );
+            }
 
             if trace_relocs && (0x100010000..0x100012000).contains(&place_runtime) {
                 let sym_name = if r.r_extern {
@@ -598,11 +709,36 @@ fn apply_macho_relocations(
                     }
                     3 => {
                         let addend = read_addend(&merged.data, off, r.r_length);
+                        let is_tls_target = is_thread_vars_section(&merged.name)
+                            && !r.r_pcrel
+                            && tls_ranges
+                                .iter()
+                                .any(|(start, end)| base >= *start && base < *end);
+                        if is_tls_target {
+                            if let Some(tls_start) = tls_base {
+                                let target = base.wrapping_add(addend);
+                                let tls_offset = target.wrapping_sub(tls_start) as u32;
+                                if (off % 24) == 16 && off >= 16 && off + 8 <= merged.data.len() {
+                                    let desc_base = off - 16;
+                                    write_u64_le(
+                                        &mut merged.data,
+                                        desc_base + 16,
+                                        tls_offset as u64,
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         let mut value = base_runtime.wrapping_add(addend);
                         if r.r_pcrel {
                             value = value.wrapping_sub(place_runtime);
                         }
                         write_u64_le(&mut merged.data, off, value);
+                        if should_record_rebase {
+                            if let Some(rebases) = rebase_addrs.as_deref_mut() {
+                                rebases.insert(place_addr);
+                            }
+                        }
                     }
                     _ => {}
                 },
@@ -664,7 +800,19 @@ fn apply_macho_relocations(
                     let addend = insn_addend + extra_addend;
                     let target = add_signed_u64(base_runtime, addend);
                     let pageoff = (target & 0x0fff) as u32;
-                    let patched = encode_arm64_pageoff_immediate(insn, pageoff).map_err(|e| {
+                    let patched = if r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+                        && r.r_extern
+                        && obj
+                            .symbols
+                            .get(r.r_symbolnum as usize)
+                            .map(|s| s.is_defined)
+                            .unwrap_or(false)
+                    {
+                        encode_arm64_tlvp_local_add(insn, pageoff)
+                    } else {
+                        encode_arm64_pageoff_immediate(insn, pageoff)
+                    }
+                    .map_err(|e| {
                         format!(
                             "{} (reloc_type={} insn=0x{:08x} base=0x{:x} addend=0x{:x} place=0x{:x})",
                             e, r.r_type, insn, base_runtime, addend, place_runtime
@@ -676,6 +824,19 @@ fn apply_macho_relocations(
                 _ => {
                     return Err(format!("unsupported Mach-O relocation type {}", r.r_type));
                 }
+            }
+        }
+
+        if is_thread_vars_section(&merged.name) {
+            let tv_size = merged.data.len() as u64;
+            let mut i = 0usize;
+            while i + 24 <= merged.data.len() {
+                let init_off = read_u64_le(&merged.data, i + 16).unwrap_or(0) & 0xffff_ffff;
+                let desc_off = i as u64;
+                let q2_low = tv_size.saturating_sub(16).saturating_sub(desc_off);
+                write_u64_le(&mut merged.data, i + 8, (init_off << 32) | 0x102);
+                write_u64_le(&mut merged.data, i + 16, ((0x58u64) << 32) | q2_low);
+                i += 24;
             }
         }
     }
@@ -701,6 +862,8 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
         &[],
         VM_ADDR_BIAS,
         VM_ADDR_BIAS,
+        None,
+        None,
     )?;
 
     let e_machine = arch.to_elf_machine();
@@ -711,40 +874,6 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
         symbol_addrs,
         dynamic: None,
     })
-}
-
-fn resolve_rust_std_dylib_from_paths(_dylib_paths: &[std::path::PathBuf]) -> Option<String> {
-    let sysroot = std::env::var("RUST_SYSROOT").ok().or_else(|| {
-        std::process::Command::new("rustc")
-            .args(["--print", "sysroot"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-    })?;
-    let host = std::process::Command::new("rustc")
-        .args(["-vV"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("host:"))
-                .map(|l| l.trim_start_matches("host:").trim().to_string())
-        })
-        .unwrap_or_else(|| format!("{}-apple-darwin", std::env::consts::ARCH));
-    let lib_dir = std::path::Path::new(&sysroot)
-        .join("lib/rustlib")
-        .join(&host)
-        .join("lib");
-    for e in std::fs::read_dir(&lib_dir).ok()?.flatten() {
-        let fname = e.file_name();
-        let name = fname.to_string_lossy();
-        if name.starts_with("libstd-") && name.ends_with(".dylib") {
-            return Some(e.path().to_string_lossy().to_string());
-        }
-    }
-    None
 }
 
 pub fn link_macho_multi_object(
@@ -771,6 +900,7 @@ pub fn link_macho_multi_object(
     let e_machine = arch.to_elf_machine();
 
     let mut global_symbols: HashMap<String, u64> = HashMap::new();
+    let mut global_symbol_weak: HashMap<String, bool> = HashMap::new();
     for (obj_idx, obj) in objects.iter().enumerate() {
         let contrib = &section_contribs[obj_idx];
         let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
@@ -790,7 +920,20 @@ pub fn link_macho_multi_object(
             }
             if let Some(&base) = vaddr_by_sect.get(&sym.sect) {
                 let addr = base + symbol_offset_in_section(obj, sym);
-                global_symbols.entry(sym.name.clone()).or_insert(addr);
+                let weak_def = (sym.n_desc & N_WEAK_DEF) != 0;
+                match global_symbols.get_mut(&sym.name) {
+                    Some(existing_addr) => {
+                        let existing_weak = *global_symbol_weak.get(&sym.name).unwrap_or(&false);
+                        if existing_weak && !weak_def {
+                            *existing_addr = addr;
+                            global_symbol_weak.insert(sym.name.clone(), false);
+                        }
+                    }
+                    None => {
+                        global_symbols.insert(sym.name.clone(), addr);
+                        global_symbol_weak.insert(sym.name.clone(), weak_def);
+                    }
+                }
             }
         }
     }
@@ -800,8 +943,12 @@ pub fn link_macho_multi_object(
         .unwrap_or(false);
 
     let mut undefined: Vec<String> = Vec::new();
+    let mut undefined_set: HashSet<String> = HashSet::new();
     let mut weak_undefined: HashSet<String> = HashSet::new();
     let mut got_symbols: Vec<String> = Vec::new();
+    let mut got_symbol_set: HashSet<String> = HashSet::new();
+    let mut rebase_addrs: HashSet<u64> = HashSet::new();
+    let mut direct_binds: Vec<(u64, String, bool, i64)> = Vec::new();
     if arch == TargetArch::AArch64 {
         for obj in &objects {
             for sym in &obj.symbols {
@@ -809,7 +956,9 @@ pub fn link_macho_multi_object(
                     if (sym.n_type & N_EXT) == 0 {
                         continue;
                     }
-                    if !global_symbols.contains_key(&sym.name) && !undefined.contains(&sym.name) {
+                    if !global_symbols.contains_key(&sym.name)
+                        && undefined_set.insert(sym.name.clone())
+                    {
                         undefined.push(sym.name.clone());
                     }
                     if sym.is_weak_ref {
@@ -839,18 +988,24 @@ pub fn link_macho_multi_object(
                     if (sym.n_type & N_EXT) == 0 {
                         continue;
                     }
-                    let needs_got = r.r_type == ARM64_RELOC_GOT_LOAD_PAGE21
-                        || r.r_type == ARM64_RELOC_GOT_LOAD_PAGEOFF12
-                        || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGE21
+                    let is_got_reloc = r.r_type == ARM64_RELOC_GOT_LOAD_PAGE21
+                        || r.r_type == ARM64_RELOC_GOT_LOAD_PAGEOFF12;
+                    let is_tlvp_reloc = r.r_type == ARM64_RELOC_TLVP_LOAD_PAGE21
                         || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12;
-                    if needs_got && !got_symbols.iter().any(|s| s == &sym.name) {
+                    let is_locally_resolved = global_symbols.contains_key(&sym.name);
+                    let needs_got = if is_tlvp_reloc {
+                        !is_locally_resolved
+                    } else {
+                        !sym.is_defined && is_got_reloc
+                    };
+                    if needs_got && got_symbol_set.insert(sym.name.clone()) {
                         got_symbols.push(sym.name.clone());
                     }
                     if sym.is_defined {
                         continue;
                     }
                     if !global_symbols.contains_key(&sym.name)
-                        && !undefined.iter().any(|u| u == &sym.name)
+                        && undefined_set.insert(sym.name.clone())
                     {
                         undefined.push(sym.name.clone());
                     }
@@ -861,13 +1016,14 @@ pub fn link_macho_multi_object(
             }
         }
 
-        let mut all_got_symbols = undefined.clone();
+        let mut ordered_got = undefined.clone();
+        let mut ordered_set: HashSet<String> = undefined.iter().cloned().collect();
         for sym in got_symbols {
-            if !all_got_symbols.iter().any(|s| s == &sym) {
-                all_got_symbols.push(sym);
+            if ordered_set.insert(sym.clone()) {
+                ordered_got.push(sym);
             }
         }
-        got_symbols = all_got_symbols;
+        got_symbols = ordered_got;
 
         if !undefined.is_empty() || !got_symbols.is_empty() {
             let last = layout.sections.last().ok_or("no sections")?;
@@ -959,6 +1115,9 @@ pub fn link_macho_multi_object(
         let trace_relocs = std::env::var("WELD_TRACE_RELOCS").ok().as_deref() == Some("1");
         let undefined_set: HashSet<&str> = undefined.iter().map(|s| s.as_str()).collect();
         let got_base = layout.sections[got_idx].vaddr;
+        for i in 0..got_symbols.len() {
+            rebase_addrs.insert(got_base + (i as u64) * 8);
+        }
         let got_data = &mut layout.sections[got_idx].data;
         for (i, sym) in got_symbols.iter().enumerate() {
             if undefined_set.contains(sym.as_str()) {
@@ -1009,26 +1168,46 @@ pub fn link_macho_multi_object(
             &undefined,
             text_shift,
             data_shift,
+            Some(&mut rebase_addrs),
+            Some(&mut direct_binds),
         )?;
     }
 
     let dynamic = if layout.section_by_name.contains_key("__got") {
-        let has_undefined = !undefined.is_empty();
         let plt_symbols = undefined;
+        if std::env::var("WELD_TRACE_UNDEF").ok().as_deref() == Some("1") {
+            let tlv_bootstrap_count = plt_symbols
+                .iter()
+                .filter(|s| s.as_str() == "__tlv_bootstrap")
+                .count();
+            eprintln!(
+                "weld undefined count={} tlv_bootstrap_count={}",
+                plt_symbols.len(),
+                tlv_bootstrap_count
+            );
+        }
         let weak_plt_symbols: Vec<String> = plt_symbols
             .iter()
             .filter(|s| weak_undefined.contains(*s))
             .cloned()
             .collect();
+        let mut macho_rebase_addrs: Vec<u64> = rebase_addrs.into_iter().collect();
+        macho_rebase_addrs.sort_unstable();
+        direct_binds.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        direct_binds.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3);
+        if std::env::var("WELD_TRACE_BINDS").ok().as_deref() == Some("1") {
+            eprintln!("weld direct_binds: {}", direct_binds.len());
+            for (addr, sym, weak, addend) in direct_binds.iter().take(32) {
+                eprintln!(
+                    "  bind addr=0x{:x} sym={} weak={} addend={}",
+                    addr, sym, weak, addend
+                );
+            }
+        }
         let mut needed = vec!["libSystem.B.dylib".into()];
         for p in dylib_paths {
             if let Some(s) = p.to_str() {
                 needed.push(s.to_string());
-            }
-        }
-        if needed.len() == 1 && has_undefined {
-            if let Some(std_path) = resolve_rust_std_dylib_from_paths(dylib_paths) {
-                needed.push(std_path);
             }
         }
         Some(crate::link::DynamicLinkInfo {
@@ -1036,6 +1215,8 @@ pub fn link_macho_multi_object(
             plt_symbols,
             weak_plt_symbols,
             interpreter: None,
+            macho_rebase_addrs,
+            macho_direct_binds: direct_binds,
         })
     } else {
         None
@@ -1191,8 +1372,17 @@ fn merge_macho_sections_multi(
         ("__TEXT", "__literals"),
         ("__TEXT", "__gcc_except_tab"),
         ("__DATA", "__const"),
+        ("__DATA_DIRTY", "__const"),
         ("__DATA", "__data"),
+        ("__DATA_DIRTY", "__data"),
+        ("__DATA", "__thread_vars"),
+        ("__DATA_DIRTY", "__thread_vars"),
+        ("__DATA", "__thread_data"),
+        ("__DATA_DIRTY", "__thread_data"),
+        ("__DATA", "__thread_bss"),
+        ("__DATA_DIRTY", "__thread_bss"),
         ("__DATA", "__bss"),
+        ("__DATA_DIRTY", "__bss"),
     ];
 
     let mut section_contribs: Vec<HashMap<u8, ObjectSectionContrib>> =
