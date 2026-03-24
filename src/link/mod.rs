@@ -9,8 +9,11 @@
 
 mod aarch64;
 pub mod macho;
+pub mod resolver;
 mod riscv;
 mod x86_64;
+
+pub use resolver::LibraryResolver;
 
 use crate::arch::TargetArch;
 use crate::elf::{Elf64Header, SectionHeader, Symbol, parse_elf64_slice, parse_symtab};
@@ -74,6 +77,8 @@ pub struct DynamicLinkInfo {
     pub plt_symbols: Vec<String>,
     pub weak_plt_symbols: Vec<String>,
     pub interpreter: Option<String>,
+    pub macho_rebase_addrs: Vec<u64>,
+    pub macho_direct_binds: Vec<(u64, String, bool, i64)>,
 }
 
 #[derive(Debug)]
@@ -521,11 +526,23 @@ fn link_multi_object_parsed(
     }
 
     let mut dynamic_info: Option<DynamicLinkInfo> = None;
-    let has_libc = libs
-        .map(|l| l.iter().any(|x| x == "c" || x == "System"))
+
+    // Resolve library names to sonames.  Any lib matching "c" or "System"
+    // (legacy names) as well as any library the resolver can locate as a
+    // shared object triggers PLT generation.
+    let resolver = LibraryResolver::new(arch, crate::platform::TargetPlatform::current());
+    let has_shared_lib = libs
+        .map(|l| {
+            l.iter().any(|x| {
+                if x == "c" || x == "System" {
+                    return true;
+                }
+                resolver.resolve(x).map(|r| !r.is_static).unwrap_or(false)
+            })
+        })
         .unwrap_or(false);
 
-    if has_libc && arch == TargetArch::X86_64 && e_machine == 62 {
+    if has_shared_lib && arch == TargetArch::X86_64 && e_machine == 62 {
         let mut undefined: Vec<String> = Vec::new();
         for (obj_idx, obj) in parsed.iter().enumerate() {
             let obj_by_index = &resolved_by_index_per_object[obj_idx];
@@ -645,20 +662,31 @@ fn link_multi_object_parsed(
             }
 
             let interpreter = "/lib64/ld-linux-x86-64.so.2".to_string();
-            let needed = if libs
-                .as_ref()
-                .map(|l| l.contains(&"System".into()))
-                .unwrap_or(false)
-            {
-                vec!["libSystem.B.dylib".into()]
-            } else {
-                vec!["libc.so.6".into()]
-            };
+            // Build DT_NEEDED entries from the requested libraries, resolving
+            // each name to its real soname via LibraryResolver.
+            let needed: Vec<String> = libs
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|name| {
+                    if name == "System" {
+                        // macOS compatibility alias — not meaningful for ELF.
+                        return None;
+                    }
+                    Some(
+                        resolver
+                            .resolve(name)
+                            .map(|r| r.soname)
+                            .unwrap_or_else(|| resolver.expected_soname(name)),
+                    )
+                })
+                .collect();
             dynamic_info = Some(DynamicLinkInfo {
                 needed,
                 plt_symbols: undefined,
                 weak_plt_symbols: Vec::new(),
                 interpreter: Some(interpreter),
+                macho_rebase_addrs: Vec::new(),
+                macho_direct_binds: Vec::new(),
             });
         }
     }

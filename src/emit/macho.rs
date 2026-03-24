@@ -293,22 +293,57 @@ fn push_uleb128(buf: &mut Vec<u8>, mut val: u64) {
     }
 }
 
-fn build_rebase_opcodes(data_segment_index: u32, got_offset: u64, got_slot_count: u64) -> Vec<u8> {
-    if got_slot_count == 0 {
+fn push_sleb128(buf: &mut Vec<u8>, mut val: i64) {
+    loop {
+        let byte = (val & 0x7f) as u8;
+        let sign = (byte & 0x40) != 0;
+        val >>= 7;
+        let done = (val == 0 && !sign) || (val == -1 && sign);
+        if done {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+fn build_rebase_opcodes(data_segment_index: u32, pointer_offsets: &[u64]) -> Vec<u8> {
+    if pointer_offsets.is_empty() {
         return Vec::new();
     }
     const REBASE_TYPE_POINTER: u8 = 1;
     const REBASE_OPCODE_SET_TYPE_IMM: u8 = 0x10;
     const REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x20;
+    const REBASE_OPCODE_DO_REBASE_IMM_TIMES: u8 = 0x50;
     const REBASE_OPCODE_DO_REBASE_ULEB_TIMES: u8 = 0x60;
     const REBASE_OPCODE_DONE: u8 = 0x00;
 
+    let mut offsets = pointer_offsets.to_vec();
+    offsets.sort_unstable();
+    offsets.dedup();
+
     let mut buf = Vec::new();
     buf.push(REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER);
-    buf.push(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | ((data_segment_index as u8) & 0x0F));
-    push_uleb128(&mut buf, got_offset);
-    buf.push(REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
-    push_uleb128(&mut buf, got_slot_count);
+
+    let mut i = 0usize;
+    while i < offsets.len() {
+        let start = offsets[i];
+        let mut count = 1usize;
+        while i + count < offsets.len() && offsets[i + count] == offsets[i + count - 1] + 8 {
+            count += 1;
+        }
+
+        buf.push(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | ((data_segment_index as u8) & 0x0F));
+        push_uleb128(&mut buf, start);
+        if count <= 15 {
+            buf.push(REBASE_OPCODE_DO_REBASE_IMM_TIMES | (count as u8));
+        } else {
+            buf.push(REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
+            push_uleb128(&mut buf, count as u64);
+        }
+        i += count;
+    }
+
     buf.push(REBASE_OPCODE_DONE);
     buf
 }
@@ -318,8 +353,9 @@ fn build_bind_opcodes(
     weak_symbols: &[String],
     data_segment_index: u32,
     got_offset_in_segment: u64,
+    direct_binds: &[(u64, String, bool, i64)],
 ) -> Vec<u8> {
-    if plt_symbols.is_empty() {
+    if plt_symbols.is_empty() && direct_binds.is_empty() {
         return Vec::new();
     }
     const BIND_OPCODE_SET_DYLIB_SPECIAL_IMM: u8 = 0x30;
@@ -327,6 +363,7 @@ fn build_bind_opcodes(
     const BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM: u8 = 0x40;
     const BIND_SYMBOL_FLAGS_WEAK_IMPORT: u8 = 0x01;
     const BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x70;
+    const BIND_OPCODE_SET_ADDEND_SLEB: u8 = 0x60;
     const BIND_TYPE_POINTER: u8 = 1;
     const BIND_OPCODE_SET_TYPE_IMM: u8 = 0x50;
     const BIND_OPCODE_DO_BIND: u8 = 0x90;
@@ -348,6 +385,24 @@ fn build_bind_opcodes(
         buf.push(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | ((data_segment_index as u8) & 0x0F));
         push_uleb128(&mut buf, got_offset_in_segment + (i as u64) * 8);
         buf.push(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+        buf.push(BIND_OPCODE_DO_BIND);
+    }
+    for (off, sym, is_weak, addend) in direct_binds {
+        let sym_flags = if *is_weak {
+            BIND_SYMBOL_FLAGS_WEAK_IMPORT
+        } else {
+            0
+        };
+        buf.push(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | sym_flags);
+        buf.extend_from_slice(sym.as_bytes());
+        buf.push(0);
+        buf.push(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | ((data_segment_index as u8) & 0x0F));
+        push_uleb128(&mut buf, *off);
+        buf.push(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+        if *addend != 0 {
+            buf.push(BIND_OPCODE_SET_ADDEND_SLEB);
+            push_sleb128(&mut buf, *addend);
+        }
         buf.push(BIND_OPCODE_DO_BIND);
     }
     buf.push(BIND_OPCODE_DONE);
@@ -695,16 +750,51 @@ pub fn emit_macho_executable_dynamic(
     let got_offset_in_segment = got_section
         .map(|s| (s.vaddr - data_base) as u64)
         .unwrap_or(0);
-    let got_slot_count = got_section.map(|s| s.data.len() / 8).unwrap_or(0) as u64;
 
     const DATA_SEGMENT_INDEX: u32 = 2;
-    let rebase_opcodes =
-        build_rebase_opcodes(DATA_SEGMENT_INDEX, got_offset_in_segment, got_slot_count);
+    let mut rebase_offsets: Vec<u64> = dyn_info
+        .macho_rebase_addrs
+        .iter()
+        .filter_map(|&addr| {
+            if addr < data_base {
+                return None;
+            }
+            let off = addr - data_base;
+            if off + 8 <= data_size as u64 {
+                Some(off)
+            } else {
+                None
+            }
+        })
+        .collect();
+    rebase_offsets.sort_unstable();
+    rebase_offsets.dedup();
+
+    let mut direct_bind_offsets: Vec<(u64, String, bool, i64)> = dyn_info
+        .macho_direct_binds
+        .iter()
+        .filter_map(|(addr, sym, weak, addend)| {
+            if *addr < data_base {
+                return None;
+            }
+            let off = *addr - data_base;
+            if off + 8 <= data_size as u64 {
+                Some((off, sym.clone(), *weak, *addend))
+            } else {
+                None
+            }
+        })
+        .collect();
+    direct_bind_offsets.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    direct_bind_offsets.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3);
+
+    let rebase_opcodes = build_rebase_opcodes(DATA_SEGMENT_INDEX, &rebase_offsets);
     let bind_opcodes = build_bind_opcodes(
         &dyn_info.plt_symbols,
         &dyn_info.weak_plt_symbols,
         DATA_SEGMENT_INDEX,
         got_offset_in_segment,
+        &direct_bind_offsets,
     );
 
     let cputype = arch.to_macho_cputype();
