@@ -55,11 +55,10 @@ fn ad_hoc_codesign(_path: &Path) -> std::io::Result<()> {
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn select_entry(args: &ParsedArgs, result: &link::LinkResult) -> Option<u64> {
-    if let Some(s) = args.entry.as_ref() {
-        if let Some(&addr) = result.symbol_addrs.get(s) {
+    if let Some(s) = args.entry.as_ref()
+        && let Some(&addr) = result.symbol_addrs.get(s) {
             return Some(addr);
         }
-    }
     result
         .symbol_addrs
         .get("main")
@@ -88,9 +87,7 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
     let entry = select_entry(args, &result)?;
     let out_path = args
-        .output_file
-        .as_ref()
-        .map(|p| p.as_path())
+        .output_file.as_deref()
         .unwrap_or(Path::new("a.out"));
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
@@ -120,9 +117,7 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
     let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
     let entry = select_entry(args, &result)?;
     let out_path = args
-        .output_file
-        .as_ref()
-        .map(|p| p.as_path())
+        .output_file.as_deref()
         .unwrap_or(Path::new("a.out"));
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
@@ -155,9 +150,7 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
     let result = link::link_multi_object(&obj_refs, libs).ok()?;
     let entry = select_entry(args, &result)?;
     let out_path = args
-        .output_file
-        .as_ref()
-        .map(|p| p.as_path())
+        .output_file.as_deref()
         .unwrap_or(Path::new("a.exe"));
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
@@ -191,6 +184,10 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
     match format {
         ObjectFormat::Elf => try_weld_link_elf(args),
         ObjectFormat::MachO => try_weld_link_macho(args),
+        ObjectFormat::Coff => {
+            eprintln!("weld: COFF/PE linking not yet implemented");
+            None
+        }
     }
 }
 
@@ -233,6 +230,9 @@ fn main() {
                                         &args.input_files,
                                     )
                                     .err()
+                                }
+                                crate::object::ObjectFormat::Coff => {
+                                    Some("COFF/PE linking not yet implemented".to_string())
                                 }
                             };
                             if let Some(e) = err {
