@@ -31,6 +31,8 @@ pub fn print_usage() {
     eprintln!("  -v, --verbose               Verbose output");
     eprintln!("  -h, --help                  This help");
     eprintln!("  --version                   Print version");
+    eprintln!();
+    eprintln!("GCC: link with weld using -fuse-ld=weld; assemble .s with ras by symlinking as -> ras and passing gcc -B<prefix> (see ras --help).");
 }
 
 fn take_required_arg(argv: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -85,8 +87,8 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "-demangle" | "-no_deduplicate" | "-dynamic" | "-dead_strip" => {}
             s if s == "-l" || s.starts_with("-l") && s.len() > 2 => {
                 let lib = if s == "-l" {
-                    let next = take_required_arg(argv, &mut i, "-l")?;
-                    next
+                    
+                    take_required_arg(argv, &mut i, "-l")?
                 } else {
                     s[2..].to_string()
                 };

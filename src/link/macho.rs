@@ -13,6 +13,10 @@ use crate::macho::{
 };
 use std::collections::{HashMap, HashSet};
 
+/// Three binary sections emitted when building stub trampolines:
+/// stubs, stub helper, and GOT slots.
+type StubTriple = (Vec<u8>, Vec<u8>, Vec<u8>);
+
 const PAGE_SIZE: u64 = 4096;
 const SEG_BASE: u64 = 0x100000000;
 const VM_ADDR_BIAS: u64 = 0x4000;
@@ -337,7 +341,7 @@ fn encode_arm64_pageoff_immediate(insn: u32, pageoff: u32) -> Result<u32, String
         (1u32, 0x0fff)
     };
 
-    if pageoff % unit != 0 {
+    if !pageoff.is_multiple_of(unit) {
         return Err(format!(
             "pageoff {} not aligned for instruction unit {}",
             pageoff, unit
@@ -395,10 +399,13 @@ fn reloc_size(r_length: u32) -> usize {
 fn section_offset_from_contrib(contrib: &HashMap<u8, ObjectSectionContrib>) -> HashMap<u8, u64> {
     contrib
         .iter()
-        .map(|(k, v)| (k.clone(), v.offset_in_merged))
+        .map(|(k, v)| (*k, v.offset_in_merged))
         .collect()
 }
 
+// Relocation application requires the full object context and all output-layout
+// references simultaneously. A builder struct would not reduce real complexity here.
+#[allow(clippy::too_many_arguments)]
 fn apply_macho_relocations(
     obj: &Macho64Object,
     layout: &mut MergedLayout,
@@ -544,7 +551,7 @@ fn apply_macho_relocations(
                     } else {
                         None
                     };
-                    let addr_opt = addr_opt.or_else(|| resolved_sym_addr);
+                    let addr_opt = addr_opt.or(resolved_sym_addr);
                     let Some(addr) = addr_opt else {
                         let sym_name = obj.symbols.get(idx).map(|s| s.name.as_str()).unwrap_or("?");
                         return Err(format!(
@@ -556,8 +563,8 @@ fn apply_macho_relocations(
                 }
             } else {
                 let sect_idx = r.r_symbolnum as u8;
-                let addr = vaddr_by_sect.get(&sect_idx).copied().unwrap_or(0);
-                addr
+                
+                vaddr_by_sect.get(&sect_idx).copied().unwrap_or(0)
             };
             let base_runtime = if direct_bind_symbol.is_some() {
                 0
@@ -569,11 +576,10 @@ fn apply_macho_relocations(
             if direct_bind_symbol.is_some() {
                 should_record_rebase = false;
             }
-            if let Some((sym_name, weak, bind_addend)) = direct_bind_symbol {
-                if let Some(binds) = direct_binds.as_deref_mut() {
+            if let Some((sym_name, weak, bind_addend)) = direct_bind_symbol
+                && let Some(binds) = direct_binds.as_deref_mut() {
                     binds.push((place_addr, sym_name, weak, bind_addend));
                 }
-            }
 
             if trace_tls && is_thread_vars_section(&merged.name) && r.r_length == 3 {
                 let sym_name = if r.r_extern {
@@ -628,8 +634,8 @@ fn apply_macho_relocations(
                     merged.name
                 );
 
-                if r.r_extern {
-                    if let Some(sym) = obj.symbols.get(r.r_symbolnum as usize) {
+                if r.r_extern
+                    && let Some(sym) = obj.symbols.get(r.r_symbolnum as usize) {
                         if r.r_type == ARM64_RELOC_TLVP_LOAD_PAGE21
                             || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12
                         {
@@ -677,7 +683,6 @@ fn apply_macho_relocations(
                             );
                         }
                     }
-                }
             }
 
             match r.r_type {
@@ -714,8 +719,8 @@ fn apply_macho_relocations(
                             && tls_ranges
                                 .iter()
                                 .any(|(start, end)| base >= *start && base < *end);
-                        if is_tls_target {
-                            if let Some(tls_start) = tls_base {
+                        if is_tls_target
+                            && let Some(tls_start) = tls_base {
                                 let target = base.wrapping_add(addend);
                                 let tls_offset = target.wrapping_sub(tls_start) as u32;
                                 if (off % 24) == 16 && off >= 16 && off + 8 <= merged.data.len() {
@@ -728,17 +733,15 @@ fn apply_macho_relocations(
                                     continue;
                                 }
                             }
-                        }
                         let mut value = base_runtime.wrapping_add(addend);
                         if r.r_pcrel {
                             value = value.wrapping_sub(place_runtime);
                         }
                         write_u64_le(&mut merged.data, off, value);
-                        if should_record_rebase {
-                            if let Some(rebases) = rebase_addrs.as_deref_mut() {
+                        if should_record_rebase
+                            && let Some(rebases) = rebase_addrs.as_deref_mut() {
                                 rebases.insert(place_addr);
                             }
-                        }
                     }
                     _ => {}
                 },
@@ -757,7 +760,7 @@ fn apply_macho_relocations(
                         ));
                     }
                     let imm26 = delta >> 2;
-                    if imm26 < -(1i128 << 25) || imm26 >= (1i128 << 25) {
+                    if !(-(1i128 << 25)..(1i128 << 25)).contains(&imm26) {
                         return Err(format!(
                             "branch reloc out of range: target=0x{:x} place=0x{:x}",
                             target, place_runtime
@@ -777,7 +780,7 @@ fn apply_macho_relocations(
                     let target_page = (target & !0xfff) as i128;
                     let place_page = (place_runtime & !0xfff) as i128;
                     let delta_pages = (target_page - place_page) >> 12;
-                    if delta_pages < -(1i128 << 20) || delta_pages >= (1i128 << 20) {
+                    if !(-(1i128 << 20)..(1i128 << 20)).contains(&delta_pages) {
                         return Err(format!(
                             "adrp reloc out of range: target=0x{:x} place=0x{:x}",
                             target, place_runtime
@@ -1236,7 +1239,7 @@ fn build_macho_stubs_arm64(
     stubs_start_vaddr: u64,
     text_shift: u64,
     data_shift: u64,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+) -> Result<StubTriple, String> {
     const STUB_SIZE: u64 = 12;
     let stub_helper_len = 36;
     let got_vaddr = align_up_bytes(
