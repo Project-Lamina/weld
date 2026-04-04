@@ -294,4 +294,51 @@ mod tests {
         r.add_path(extra.clone());
         assert_eq!(r.search_paths[0], extra);
     }
+
+    #[test]
+    fn test_candidates_windows() {
+        let r = LibraryResolver::new(TargetArch::X86_64, TargetPlatform::Windows);
+        let cands = r.candidates("kernel32");
+        // Primary candidate: kernel32.lib (import library)
+        assert!(
+            cands.iter().any(|(f, soname, _)| f == "kernel32.lib"
+                && soname == "kernel32.dll"),
+            "expected kernel32.lib -> kernel32.dll"
+        );
+        // libkernel32.lib alternative form
+        assert!(
+            cands.iter().any(|(f, _, _)| f == "libkernel32.lib"),
+            "expected libkernel32.lib candidate"
+        );
+        // Bare DLL fallback
+        assert!(
+            cands.iter().any(|(f, _, _)| f == "kernel32.dll"),
+            "expected kernel32.dll candidate"
+        );
+    }
+
+    #[test]
+    fn test_expected_soname_windows() {
+        let r = LibraryResolver::new(TargetArch::X86_64, TargetPlatform::Windows);
+        assert_eq!(r.expected_soname("kernel32"), "kernel32.dll");
+    }
+
+    #[test]
+    fn test_linux_search_paths_contain_standard_dirs() {
+        let r = LibraryResolver::new(TargetArch::X86_64, TargetPlatform::Linux);
+        let paths: Vec<String> = r.search_paths.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(paths.contains(&"/usr/lib".to_string()));
+        assert!(paths.contains(&"/usr/lib/x86_64-linux-gnu".to_string()));
+    }
+
+    #[test]
+    fn test_linux_aarch64_search_paths() {
+        let r = LibraryResolver::new(TargetArch::AArch64, TargetPlatform::Linux);
+        let paths: Vec<String> = r.search_paths.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(paths.contains(&"/lib/aarch64-linux-gnu".to_string()));
+    }
 }

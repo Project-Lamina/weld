@@ -223,7 +223,7 @@ pub fn apply_relocations(
                             auipc_pc
                         )
                     })?;
-                    let hi20 = ((diff + 0x800) >> 12) as i64;
+                    let hi20 = (diff + 0x800) >> 12;
                     let lo12 = (diff - (hi20 << 12)) as i32;
                     let merged = &mut layout.sections[merged_idx];
                     if merged.data.len() < off + 4 {
@@ -245,7 +245,7 @@ pub fn apply_relocations(
                             auipc_pc
                         )
                     })?;
-                    let hi20 = ((diff + 0x800) >> 12) as i64;
+                    let hi20 = (diff + 0x800) >> 12;
                     let lo12 = (diff - (hi20 << 12)) as i32;
                     let merged = &mut layout.sections[merged_idx];
                     if merged.data.len() < off + 4 {
@@ -275,7 +275,7 @@ pub fn apply_relocations(
                 reloc_type::R_RISCV_LO12_I => {
                     let s = require_sym(sym_addr)?;
                     let val = s.wrapping_add(a);
-                    let hi20 = ((val + 0x800) >> 12) as i64;
+                    let hi20 = (val + 0x800) >> 12;
                     let lo12 = (val - (hi20 << 12)) as i32;
                     let merged = &mut layout.sections[merged_idx];
                     if merged.data.len() < off + 4 {
@@ -289,7 +289,7 @@ pub fn apply_relocations(
                 reloc_type::R_RISCV_LO12_S => {
                     let s = require_sym(sym_addr)?;
                     let val = s.wrapping_add(a);
-                    let hi20 = ((val + 0x800) >> 12) as i64;
+                    let hi20 = (val + 0x800) >> 12;
                     let lo12 = (val - (hi20 << 12)) as i32;
                     let merged = &mut layout.sections[merged_idx];
                     if merged.data.len() < off + 4 {
