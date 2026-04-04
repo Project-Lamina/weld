@@ -21,6 +21,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::thread;
 
+/// Return type for symbol-table parsing: a list of symbols and the raw string table.
+type SymtabView<'a> = Option<(Vec<Symbol>, &'a [u8])>;
+
+/// Resolved symbol table paired with per-section virtual-address overrides.
+type ResolvedSymbols = (HashMap<String, ResolvedSymbol>, Vec<Option<u64>>);
+
+/// Three binary blobs produced when building ELF dynamic sections:
+/// `.dynamic`, `.dynsym`/`.dynstr`, and `.rela.plt`.
+type DynSectionTriple = (Vec<u8>, Vec<u8>, Vec<u8>);
+
 /// Pre-parsed object for reuse in multi-object linking.
 pub struct ParsedObject {
     pub data: Vec<u8>,
@@ -334,7 +344,7 @@ pub fn merge_sections_multi_object(
 fn parse_symtab_view<'a>(
     data: &'a [u8],
     sections: &'a [SectionHeader],
-) -> Result<Option<(Vec<Symbol>, &'a [u8])>, String> {
+) -> Result<SymtabView<'a>, String> {
     let Some(symtab_sh) = sections.iter().find(|sh| sh.sh_type == SHT_SYMTAB) else {
         return Ok(None);
     };
@@ -353,7 +363,7 @@ fn resolve_symbols_with_offsets<F>(
     sections: &[SectionHeader],
     names: &[String],
     mut section_offset: F,
-) -> Result<(HashMap<String, ResolvedSymbol>, Vec<Option<u64>>), String>
+) -> Result<ResolvedSymbols, String>
 where
     F: FnMut(&str) -> Option<u64>,
 {
@@ -418,7 +428,7 @@ pub fn resolve_symbols(
     layout: &MergedLayout,
     sections: &[SectionHeader],
     names: &[String],
-) -> Result<(HashMap<String, ResolvedSymbol>, Vec<Option<u64>>), String> {
+) -> Result<ResolvedSymbols, String> {
     resolve_symbols_with_offsets(data, layout, sections, names, |_| Some(0))
 }
 
@@ -428,7 +438,7 @@ fn resolve_symbols_for_object(
     sections: &[SectionHeader],
     names: &[String],
     obj_contribs: &HashMap<String, ObjectSectionContrib>,
-) -> Result<(HashMap<String, ResolvedSymbol>, Vec<Option<u64>>), String> {
+) -> Result<ResolvedSymbols, String> {
     resolve_symbols_with_offsets(data, layout, sections, names, |section_name| {
         obj_contribs
             .get(section_name)
@@ -548,15 +558,12 @@ fn link_multi_object_parsed(
             let obj_by_index = &resolved_by_index_per_object[obj_idx];
             let symbol_names = symbol_names_by_index(&obj.data, &obj.sections)?;
             for (i, addr) in obj_by_index.iter().enumerate() {
-                if addr.is_none() {
-                    if let Some(name) = symbol_names.get(i) {
-                        if !name.is_empty() && !global_symbols.contains_key(name) {
-                            if !undefined.contains(name) {
+                if addr.is_none()
+                    && let Some(name) = symbol_names.get(i)
+                        && !name.is_empty() && !global_symbols.contains_key(name)
+                            && !undefined.contains(name) {
                                 undefined.push(name.clone());
                             }
-                        }
-                    }
-                }
             }
         }
 
@@ -734,7 +741,7 @@ fn link_multi_object_parsed(
 fn build_dynamic_sections(
     plt_symbols: &[String],
     got_plt_vaddr: u64,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+) -> Result<DynSectionTriple, String> {
     let mut dynstr = vec![0u8];
     dynstr.extend_from_slice(b"libc.so.6\0");
 
@@ -882,7 +889,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         assert!(!layout.sections.is_empty());
-        assert!(layout.section_by_name.get(".text").is_some());
+        assert!(layout.section_by_name.contains_key(".text"));
     }
 
     #[test]
@@ -901,7 +908,7 @@ mod tests {
 
         let (layout, symbols) = merge_and_resolve(&data).expect("merge_and_resolve");
         assert!(!layout.sections.is_empty());
-        assert!(layout.section_by_name.get(".text").is_some());
+        assert!(layout.section_by_name.contains_key(".text"));
         assert!(symbols.is_empty() || symbols.contains_key("main"));
     }
 
@@ -921,7 +928,7 @@ mod tests {
 
         let result = link_single_object(&data).expect("link_single_object");
         assert!(!result.layout.sections.is_empty());
-        assert!(result.layout.section_by_name.get(".text").is_some());
+        assert!(result.layout.section_by_name.contains_key(".text"));
     }
 
     #[test]
@@ -946,7 +953,7 @@ mod tests {
         let objects: Vec<&[u8]> = vec![&d1, &d2];
         let result = link_multi_object(&objects, None).expect("link_multi_object");
         assert!(!result.layout.sections.is_empty());
-        assert!(result.layout.section_by_name.get(".text").is_some());
+        assert!(result.layout.section_by_name.contains_key(".text"));
         let text_idx = result
             .layout
             .section_by_name
@@ -973,7 +980,7 @@ mod tests {
 
         let result = link_single_object(&data).expect("link_single_object");
         assert!(!result.layout.sections.is_empty());
-        assert!(result.layout.section_by_name.get(".text").is_some());
+        assert!(result.layout.section_by_name.contains_key(".text"));
         assert_eq!(result.e_machine, 183);
     }
 }

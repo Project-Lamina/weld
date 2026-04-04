@@ -556,6 +556,9 @@ fn build_export_trie(exports: &[(String, u64)]) -> Vec<u8> {
     out
 }
 
+// Parameters mirror the dyld chained-fixups payload layout, which requires all
+// segment/import details simultaneously. Splitting further would hurt readability.
+#[allow(clippy::too_many_arguments)]
 fn build_chained_fixups_payload(
     seg_count: u32,
     data_seg_index: Option<u32>,
@@ -615,9 +618,9 @@ fn build_chained_fixups_payload(
     let starts_base = starts_offset as usize;
     payload[starts_base..starts_base + 4].copy_from_slice(&seg_count.to_le_bytes());
 
-    if import_count > 0 {
-        if let Some(seg_idx) = data_seg_index {
-            let page_count = ((data_seg_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64)
+    if import_count > 0
+        && let Some(seg_idx) = data_seg_index {
+            let page_count = data_seg_size.div_ceil(PAGE_SIZE as u64)
                 .max(page_first_starts.keys().last().copied().unwrap_or(0) as u64 + 1)
                 as usize;
             let seg_info_size_unaligned = 24 + page_count.saturating_sub(1) * 2;
@@ -658,14 +661,13 @@ fn build_chained_fixups_payload(
                 }
             }
         }
-    }
 
     let imports_offset = payload.len() as u32;
     let mut name_off = 0u32;
     for _ in 0..import_count {
         let entry = (BIND_SPECIAL_DYLIB_FLAT_LOOKUP as u32) | (name_off << 9);
         payload.extend_from_slice(&entry.to_le_bytes());
-        let name = &import_symbols[(name_off as usize) / 1];
+        let name = &import_symbols[name_off as usize];
         name_off += (name.len() + 1) as u32;
     }
 
@@ -748,7 +750,7 @@ pub fn emit_macho_executable_dynamic(
 
     let got_section = data_sections.iter().find(|s| s.name == "__got");
     let got_offset_in_segment = got_section
-        .map(|s| (s.vaddr - data_base) as u64)
+        .map(|s| s.vaddr - data_base)
         .unwrap_or(0);
 
     const DATA_SEGMENT_INDEX: u32 = 2;
@@ -836,7 +838,7 @@ pub fn emit_macho_executable_dynamic(
         let (segname, sectname) = section_name_fields(&sec.name);
         let (flags, reserved1, reserved2) = section_meta(sectname);
         let base = 72 + i * SECT64_SIZE;
-        let sec_offset_in_segment = (sec.vaddr - text_base) as u64;
+        let sec_offset_in_segment = sec.vaddr - text_base;
         let sec_file_offset = PAGE_SIZE as u64 + sec_offset_in_segment;
         text_seg[base..base + 16].copy_from_slice(&pad_segname(sectname));
         text_seg[base + 16..base + 32].copy_from_slice(&pad_segname(segname));
@@ -918,7 +920,7 @@ pub fn emit_macho_executable_dynamic(
             let (segname, sectname) = section_name_fields(&sec.name);
             let (flags, reserved1, reserved2) = section_meta(sectname);
             let base = 72 + i * SECT64_SIZE;
-            let sec_offset_in_segment = (sec.vaddr - data_base) as u64;
+            let sec_offset_in_segment = sec.vaddr - data_base;
             let sec_file_offset = data_file_off + sec_offset_in_segment;
             data_seg[base..base + 16].copy_from_slice(&pad_segname(sectname));
             data_seg[base + 16..base + 32].copy_from_slice(&pad_segname(segname));
