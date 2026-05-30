@@ -56,9 +56,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn select_entry(args: &ParsedArgs, result: &link::LinkResult) -> Option<u64> {
     if let Some(s) = args.entry.as_ref()
-        && let Some(&addr) = result.symbol_addrs.get(s) {
-            return Some(addr);
-        }
+        && let Some(&addr) = result.symbol_addrs.get(s)
+    {
+        return Some(addr);
+    }
     result
         .symbol_addrs
         .get("main")
@@ -86,9 +87,7 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     let result = link::link_multi_object(&obj_refs, libs).ok()?;
     let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
     let entry = select_entry(args, &result)?;
-    let out_path = args
-        .output_file.as_deref()
-        .unwrap_or(Path::new("a.out"));
+    let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
     if let Some(ref dyn_info) = result.dynamic {
@@ -116,9 +115,7 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
             .ok()?;
     let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
     let entry = select_entry(args, &result)?;
-    let out_path = args
-        .output_file.as_deref()
-        .unwrap_or(Path::new("a.out"));
+    let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
     let fallback_dyn = crate::link::DynamicLinkInfo {
@@ -149,9 +146,7 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
     };
     let result = link::link_multi_object(&obj_refs, libs).ok()?;
     let entry = select_entry(args, &result)?;
-    let out_path = args
-        .output_file.as_deref()
-        .unwrap_or(Path::new("a.exe"));
+    let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
     emit::pe::emit_pe_executable(&result.layout, entry, result.dynamic.as_ref(), &mut out).ok()?;

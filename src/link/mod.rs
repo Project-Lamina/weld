@@ -560,10 +560,12 @@ fn link_multi_object_parsed(
             for (i, addr) in obj_by_index.iter().enumerate() {
                 if addr.is_none()
                     && let Some(name) = symbol_names.get(i)
-                        && !name.is_empty() && !global_symbols.contains_key(name)
-                            && !undefined.contains(name) {
-                                undefined.push(name.clone());
-                            }
+                    && !name.is_empty()
+                    && !global_symbols.contains_key(name)
+                    && !undefined.contains(name)
+                {
+                    undefined.push(name.clone());
+                }
             }
         }
 

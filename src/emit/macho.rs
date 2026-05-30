@@ -619,48 +619,45 @@ fn build_chained_fixups_payload(
     payload[starts_base..starts_base + 4].copy_from_slice(&seg_count.to_le_bytes());
 
     if import_count > 0
-        && let Some(seg_idx) = data_seg_index {
-            let page_count = data_seg_size.div_ceil(PAGE_SIZE as u64)
-                .max(page_first_starts.keys().last().copied().unwrap_or(0) as u64 + 1)
-                as usize;
-            let seg_info_size_unaligned = 24 + page_count.saturating_sub(1) * 2;
-            let seg_info_size = align_up_usize(seg_info_size_unaligned, 8);
+        && let Some(seg_idx) = data_seg_index
+    {
+        let page_count = data_seg_size
+            .div_ceil(PAGE_SIZE as u64)
+            .max(page_first_starts.keys().last().copied().unwrap_or(0) as u64 + 1)
+            as usize;
+        let seg_info_size_unaligned = 24 + page_count.saturating_sub(1) * 2;
+        let seg_info_size = align_up_usize(seg_info_size_unaligned, 8);
 
-            let seg_info_rel = (payload.len() - starts_base) as u32;
-            let seg_off_entry = starts_base + 4 + seg_idx as usize * 4;
-            if seg_off_entry + 4 <= payload.len() {
-                payload[seg_off_entry..seg_off_entry + 4]
-                    .copy_from_slice(&seg_info_rel.to_le_bytes());
-            }
+        let seg_info_rel = (payload.len() - starts_base) as u32;
+        let seg_off_entry = starts_base + 4 + seg_idx as usize * 4;
+        if seg_off_entry + 4 <= payload.len() {
+            payload[seg_off_entry..seg_off_entry + 4].copy_from_slice(&seg_info_rel.to_le_bytes());
+        }
 
-            let seg_start = payload.len();
-            payload.resize(seg_start + seg_info_size, 0);
-            payload[seg_start..seg_start + 4]
-                .copy_from_slice(&(seg_info_size as u32).to_le_bytes());
-            payload[seg_start + 4..seg_start + 6]
-                .copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
-            payload[seg_start + 6..seg_start + 8]
-                .copy_from_slice(&DYLD_CHAINED_PTR_64.to_le_bytes());
-            payload[seg_start + 8..seg_start + 16].copy_from_slice(&data_seg_vmoff.to_le_bytes());
-            payload[seg_start + 16..seg_start + 20].copy_from_slice(&0u32.to_le_bytes());
-            payload[seg_start + 20..seg_start + 22]
-                .copy_from_slice(&(page_count as u16).to_le_bytes());
+        let seg_start = payload.len();
+        payload.resize(seg_start + seg_info_size, 0);
+        payload[seg_start..seg_start + 4].copy_from_slice(&(seg_info_size as u32).to_le_bytes());
+        payload[seg_start + 4..seg_start + 6].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+        payload[seg_start + 6..seg_start + 8].copy_from_slice(&DYLD_CHAINED_PTR_64.to_le_bytes());
+        payload[seg_start + 8..seg_start + 16].copy_from_slice(&data_seg_vmoff.to_le_bytes());
+        payload[seg_start + 16..seg_start + 20].copy_from_slice(&0u32.to_le_bytes());
+        payload[seg_start + 20..seg_start + 22].copy_from_slice(&(page_count as u16).to_le_bytes());
 
-            let mut page_starts = vec![DYLD_CHAINED_PTR_START_NONE; page_count];
-            for (page_idx, start_off) in &page_first_starts {
-                let idx = *page_idx as usize;
-                if idx < page_starts.len() {
-                    page_starts[idx] = *start_off;
-                }
-            }
-            let starts_off = seg_start + 22;
-            for (i, v) in page_starts.iter().enumerate() {
-                let o = starts_off + i * 2;
-                if o + 2 <= payload.len() {
-                    payload[o..o + 2].copy_from_slice(&v.to_le_bytes());
-                }
+        let mut page_starts = vec![DYLD_CHAINED_PTR_START_NONE; page_count];
+        for (page_idx, start_off) in &page_first_starts {
+            let idx = *page_idx as usize;
+            if idx < page_starts.len() {
+                page_starts[idx] = *start_off;
             }
         }
+        let starts_off = seg_start + 22;
+        for (i, v) in page_starts.iter().enumerate() {
+            let o = starts_off + i * 2;
+            if o + 2 <= payload.len() {
+                payload[o..o + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
 
     let imports_offset = payload.len() as u32;
     let mut name_off = 0u32;
@@ -749,9 +746,7 @@ pub fn emit_macho_executable_dynamic(
     };
 
     let got_section = data_sections.iter().find(|s| s.name == "__got");
-    let got_offset_in_segment = got_section
-        .map(|s| s.vaddr - data_base)
-        .unwrap_or(0);
+    let got_offset_in_segment = got_section.map(|s| s.vaddr - data_base).unwrap_or(0);
 
     const DATA_SEGMENT_INDEX: u32 = 2;
     let mut rebase_offsets: Vec<u64> = dyn_info
