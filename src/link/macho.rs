@@ -563,7 +563,7 @@ fn apply_macho_relocations(
                 }
             } else {
                 let sect_idx = r.r_symbolnum as u8;
-                
+
                 vaddr_by_sect.get(&sect_idx).copied().unwrap_or(0)
             };
             let base_runtime = if direct_bind_symbol.is_some() {
@@ -577,9 +577,10 @@ fn apply_macho_relocations(
                 should_record_rebase = false;
             }
             if let Some((sym_name, weak, bind_addend)) = direct_bind_symbol
-                && let Some(binds) = direct_binds.as_deref_mut() {
-                    binds.push((place_addr, sym_name, weak, bind_addend));
-                }
+                && let Some(binds) = direct_binds.as_deref_mut()
+            {
+                binds.push((place_addr, sym_name, weak, bind_addend));
+            }
 
             if trace_tls && is_thread_vars_section(&merged.name) && r.r_length == 3 {
                 let sym_name = if r.r_extern {
@@ -635,54 +636,55 @@ fn apply_macho_relocations(
                 );
 
                 if r.r_extern
-                    && let Some(sym) = obj.symbols.get(r.r_symbolnum as usize) {
-                        if r.r_type == ARM64_RELOC_TLVP_LOAD_PAGE21
-                            || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12
-                        {
-                            let sec_info = if sym.sect != 0 {
-                                obj.sections
-                                    .get((sym.sect - 1) as usize)
-                                    .map(|s| {
-                                        format!(
-                                            "{}:{} merged={} sec_addr=0x{:x}",
-                                            s.segname,
-                                            s.sectname,
-                                            merged_section_name_for_lookup(&s.segname, &s.sectname),
-                                            s.addr
-                                        )
-                                    })
-                                    .unwrap_or_else(|| "<bad-sect-idx>".to_string())
-                            } else {
-                                "<undef-sect>".to_string()
-                            };
-                            eprintln!(
-                                "  tlvp detail: sym={} sym_n_type=0x{:02x} sym_sect={} sym_value=0x{:x} sec_info={}",
-                                sym.name, sym.n_type, sym.sect, sym.value, sec_info
-                            );
-                        }
-                        if sym.name.starts_with("__MergedGlobals") {
-                            let sec_info = if sym.sect != 0 {
-                                obj.sections
-                                    .get((sym.sect - 1) as usize)
-                                    .map(|s| {
-                                        format!(
-                                            "{}:{} merged={} sec_addr=0x{:x}",
-                                            s.segname,
-                                            s.sectname,
-                                            merged_section_name_for_lookup(&s.segname, &s.sectname),
-                                            s.addr
-                                        )
-                                    })
-                                    .unwrap_or_else(|| "<bad-sect-idx>".to_string())
-                            } else {
-                                "<undef-sect>".to_string()
-                            };
-                            eprintln!(
-                                "  mergedglobals detail: sym_n_type=0x{:02x} sym_sect={} sym_value=0x{:x} sec_info={}",
-                                sym.n_type, sym.sect, sym.value, sec_info
-                            );
-                        }
+                    && let Some(sym) = obj.symbols.get(r.r_symbolnum as usize)
+                {
+                    if r.r_type == ARM64_RELOC_TLVP_LOAD_PAGE21
+                        || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+                    {
+                        let sec_info = if sym.sect != 0 {
+                            obj.sections
+                                .get((sym.sect - 1) as usize)
+                                .map(|s| {
+                                    format!(
+                                        "{}:{} merged={} sec_addr=0x{:x}",
+                                        s.segname,
+                                        s.sectname,
+                                        merged_section_name_for_lookup(&s.segname, &s.sectname),
+                                        s.addr
+                                    )
+                                })
+                                .unwrap_or_else(|| "<bad-sect-idx>".to_string())
+                        } else {
+                            "<undef-sect>".to_string()
+                        };
+                        eprintln!(
+                            "  tlvp detail: sym={} sym_n_type=0x{:02x} sym_sect={} sym_value=0x{:x} sec_info={}",
+                            sym.name, sym.n_type, sym.sect, sym.value, sec_info
+                        );
                     }
+                    if sym.name.starts_with("__MergedGlobals") {
+                        let sec_info = if sym.sect != 0 {
+                            obj.sections
+                                .get((sym.sect - 1) as usize)
+                                .map(|s| {
+                                    format!(
+                                        "{}:{} merged={} sec_addr=0x{:x}",
+                                        s.segname,
+                                        s.sectname,
+                                        merged_section_name_for_lookup(&s.segname, &s.sectname),
+                                        s.addr
+                                    )
+                                })
+                                .unwrap_or_else(|| "<bad-sect-idx>".to_string())
+                        } else {
+                            "<undef-sect>".to_string()
+                        };
+                        eprintln!(
+                            "  mergedglobals detail: sym_n_type=0x{:02x} sym_sect={} sym_value=0x{:x} sec_info={}",
+                            sym.n_type, sym.sect, sym.value, sec_info
+                        );
+                    }
+                }
             }
 
             match r.r_type {
@@ -719,29 +721,23 @@ fn apply_macho_relocations(
                             && tls_ranges
                                 .iter()
                                 .any(|(start, end)| base >= *start && base < *end);
-                        if is_tls_target
-                            && let Some(tls_start) = tls_base {
-                                let target = base.wrapping_add(addend);
-                                let tls_offset = target.wrapping_sub(tls_start) as u32;
-                                if (off % 24) == 16 && off >= 16 && off + 8 <= merged.data.len() {
-                                    let desc_base = off - 16;
-                                    write_u64_le(
-                                        &mut merged.data,
-                                        desc_base + 16,
-                                        tls_offset as u64,
-                                    );
-                                    continue;
-                                }
+                        if is_tls_target && let Some(tls_start) = tls_base {
+                            let target = base.wrapping_add(addend);
+                            let tls_offset = target.wrapping_sub(tls_start) as u32;
+                            if (off % 24) == 16 && off >= 16 && off + 8 <= merged.data.len() {
+                                let desc_base = off - 16;
+                                write_u64_le(&mut merged.data, desc_base + 16, tls_offset as u64);
+                                continue;
                             }
+                        }
                         let mut value = base_runtime.wrapping_add(addend);
                         if r.r_pcrel {
                             value = value.wrapping_sub(place_runtime);
                         }
                         write_u64_le(&mut merged.data, off, value);
-                        if should_record_rebase
-                            && let Some(rebases) = rebase_addrs.as_deref_mut() {
-                                rebases.insert(place_addr);
-                            }
+                        if should_record_rebase && let Some(rebases) = rebase_addrs.as_deref_mut() {
+                            rebases.insert(place_addr);
+                        }
                     }
                     _ => {}
                 },

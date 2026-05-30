@@ -301,8 +301,9 @@ mod tests {
         let cands = r.candidates("kernel32");
         // Primary candidate: kernel32.lib (import library)
         assert!(
-            cands.iter().any(|(f, soname, _)| f == "kernel32.lib"
-                && soname == "kernel32.dll"),
+            cands
+                .iter()
+                .any(|(f, soname, _)| f == "kernel32.lib" && soname == "kernel32.dll"),
             "expected kernel32.lib -> kernel32.dll"
         );
         // libkernel32.lib alternative form
@@ -326,7 +327,9 @@ mod tests {
     #[test]
     fn test_linux_search_paths_contain_standard_dirs() {
         let r = LibraryResolver::new(TargetArch::X86_64, TargetPlatform::Linux);
-        let paths: Vec<String> = r.search_paths.iter()
+        let paths: Vec<String> = r
+            .search_paths
+            .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         assert!(paths.contains(&"/usr/lib".to_string()));
@@ -336,7 +339,9 @@ mod tests {
     #[test]
     fn test_linux_aarch64_search_paths() {
         let r = LibraryResolver::new(TargetArch::AArch64, TargetPlatform::Linux);
-        let paths: Vec<String> = r.search_paths.iter()
+        let paths: Vec<String> = r
+            .search_paths
+            .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         assert!(paths.contains(&"/lib/aarch64-linux-gnu".to_string()));
