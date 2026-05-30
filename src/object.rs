@@ -231,10 +231,7 @@ fn coff_symbol_name(name_bytes: &[u8], strtab: &[u8]) -> String {
         }
         return String::new();
     }
-    let end = name_bytes[..8]
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(8);
+    let end = name_bytes[..8].iter().position(|&b| b == 0).unwrap_or(8);
     String::from_utf8_lossy(&name_bytes[..end]).into_owned()
 }
 
@@ -362,7 +359,11 @@ fn extract_ar_members(data: &[u8]) -> Vec<ArchiveMember> {
             let member = &data[off..off + member_size];
             let payload = if let Some(suffix) = name.strip_prefix("#1/") {
                 let n: usize = suffix.parse().unwrap_or(0);
-                if n < member.len() { &member[n..] } else { member }
+                if n < member.len() {
+                    &member[n..]
+                } else {
+                    member
+                }
             } else {
                 member
             };
@@ -371,7 +372,9 @@ fn extract_ar_members(data: &[u8]) -> Vec<ArchiveMember> {
             if !name.is_empty()
                 && name != "/"
                 && name != "//"
-                && (is_elf(&normalized) || crate::macho::is_macho64(&normalized) || is_coff(&normalized))
+                && (is_elf(&normalized)
+                    || crate::macho::is_macho64(&normalized)
+                    || is_coff(&normalized))
             {
                 let symbols = collect_object_symbol_summary(&normalized).unwrap_or_default();
                 out.push(ArchiveMember {
@@ -473,15 +476,17 @@ pub fn load_objects(paths: &[PathBuf]) -> Option<(ObjectFormat, Vec<Vec<u8>>, Ve
                 }
             }
 
-            if !selected_any && all_objects.is_empty()
-                && let Some(first_member) = members.first() {
-                    apply_symbol_summary(
-                        &first_member.symbols,
-                        &mut defined_symbols,
-                        &mut unresolved_symbols,
-                    );
-                    all_objects.push(first_member.data.clone());
-                }
+            if !selected_any
+                && all_objects.is_empty()
+                && let Some(first_member) = members.first()
+            {
+                apply_symbol_summary(
+                    &first_member.symbols,
+                    &mut defined_symbols,
+                    &mut unresolved_symbols,
+                );
+                all_objects.push(first_member.data.clone());
+            }
             continue;
         }
 
@@ -635,8 +640,14 @@ mod tests {
         assert!(is_coff(&coff));
         let summary = collect_coff_symbol_summary(&coff).expect("should parse");
         assert!(summary.defined.contains("_foo"), "expected _foo in defined");
-        assert!(summary.undefined.contains("_bar"), "expected _bar in undefined");
-        assert!(!summary.undefined.contains("_foo"), "_foo should not be in undefined");
+        assert!(
+            summary.undefined.contains("_bar"),
+            "expected _bar in undefined"
+        );
+        assert!(
+            !summary.undefined.contains("_foo"),
+            "_foo should not be in undefined"
+        );
     }
 
     #[test]
