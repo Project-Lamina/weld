@@ -15,7 +15,6 @@ mod segment;
 
 use crate::cli::{ParseAction, ParsedArgs, parse_args, print_usage};
 use crate::object::{ObjectFormat, load_objects};
-use crate::platform::TargetPlatform;
 use std::env;
 use std::io::Write;
 use std::path::Path;
@@ -76,6 +75,55 @@ fn select_entry(args: &ParsedArgs, result: &link::LinkResult) -> Option<u64> {
         })
 }
 
+/// True when no real `_start` is defined and we are linking a static (no
+/// interpreter) executable, so weld must provide program startup itself.
+fn needs_synthetic_start(result: &link::LinkResult) -> bool {
+    result.dynamic.is_none() && !result.symbol_addrs.contains_key("_start")
+}
+
+/// Append a freestanding `_start` to a static x86_64 ELF layout and return its
+/// entry address. The stub calls `main`, then performs the Linux `exit` syscall
+/// with `main`'s return value, so a program that ends in `ret` exits cleanly
+/// without a C runtime.
+fn synthesize_elf_start_x86_64(result: &mut link::LinkResult) -> Option<u64> {
+    if arch::TargetArch::from_elf_machine(result.e_machine) != Some(arch::TargetArch::X86_64) {
+        return None;
+    }
+
+    let main_addr = result
+        .symbol_addrs
+        .get("main")
+        .or_else(|| result.symbol_addrs.get("_main"))
+        .copied()?;
+
+    let last = result.layout.sections.last()?;
+    let start_vaddr = (last.vaddr + last.data.len() as u64 + 15) & !15;
+
+    let mut code = Vec::new();
+    code.push(0xe8); // call rel32 -> main
+    let call_next = start_vaddr + 5;
+    let rel = i32::try_from(main_addr as i64 - call_next as i64).ok()?;
+    code.extend_from_slice(&rel.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x89, 0xc7]); // movq %rax, %rdi
+    code.extend_from_slice(&[0xb8, 0x3c, 0x00, 0x00, 0x00]); // movl $60, %eax (SYS_exit)
+    code.extend_from_slice(&[0x0f, 0x05]); // syscall
+
+    let idx = result.layout.sections.len();
+    result
+        .layout
+        .section_by_name
+        .insert(".text.__weld_start".to_string(), idx);
+    result.layout.sections.push(link::MergedSection {
+        name: ".text.__weld_start".to_string(),
+        data: code,
+        vaddr: start_vaddr,
+        flags: 2 | 4, // SHF_ALLOC | SHF_EXECINSTR
+        align: 16,
+    });
+
+    Some(start_vaddr)
+}
+
 fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     let obj_data_list = crate::object::load_elf_objects(&args.input_files)?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
@@ -84,9 +132,13 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     } else {
         Some(args.libraries.as_slice())
     };
-    let result = link::link_multi_object(&obj_refs, libs).ok()?;
+    let mut result = link::link_multi_object(&obj_refs, libs).ok()?;
     let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
-    let entry = select_entry(args, &result)?;
+    let entry = if needs_synthetic_start(&result) {
+        synthesize_elf_start_x86_64(&mut result).or_else(|| select_entry(args, &result))?
+    } else {
+        select_entry(args, &result)?
+    };
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
@@ -192,13 +244,9 @@ fn main() {
 
     match parse_args(&link_args) {
         Ok(ParseAction::Run(args)) => {
-            let platform = TargetPlatform::current();
-
-            if !platform.supports_native_linking() {
-                eprintln!("weld: native linking not supported on this platform");
-                std::process::exit(1);
-            }
-
+            // Output format is chosen from the input objects, not the host OS, so
+            // ELF/Mach-O linking works even when cross-linking from another host.
+            // Unsupported output formats are reported per-format in `try_weld_link`.
             match try_weld_link(&args) {
                 Some(0) => {
                     if args.verbose {
@@ -256,5 +304,64 @@ fn main() {
             print_usage();
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::{LinkResult, MergedLayout, MergedSection};
+    use std::collections::HashMap;
+
+    fn static_main_result() -> LinkResult {
+        let mut section_by_name = HashMap::new();
+        section_by_name.insert(".text".to_string(), 0);
+        let mut symbol_addrs = HashMap::new();
+        symbol_addrs.insert("main".to_string(), 0x400000u64);
+        LinkResult {
+            layout: MergedLayout {
+                sections: vec![MergedSection {
+                    name: ".text".to_string(),
+                    data: vec![0xc3],
+                    vaddr: 0x400000,
+                    flags: 2 | 4,
+                    align: 16,
+                }],
+                section_by_name,
+            },
+            e_machine: 62,
+            symbol_addrs,
+            dynamic: None,
+        }
+    }
+
+    #[test]
+    fn synthesizes_start_for_static_main() {
+        let mut result = static_main_result();
+        assert!(needs_synthetic_start(&result));
+
+        let entry = synthesize_elf_start_x86_64(&mut result).expect("start synthesized");
+        assert!(entry >= 0x400000);
+        assert!(result.layout.section_by_name.contains_key(".text.__weld_start"));
+
+        let start = &result.layout.sections[result.layout.sections.len() - 1];
+        // call rel32 (5) + mov %rax,%rdi (3) + mov $60,%eax (5) + syscall (2).
+        assert_eq!(start.data.len(), 15);
+        assert_eq!(start.data[0], 0xe8);
+        assert_eq!(&start.data[13..15], &[0x0f, 0x05]);
+    }
+
+    #[test]
+    fn no_synthetic_start_when_start_is_defined() {
+        let mut result = static_main_result();
+        result.symbol_addrs.insert("_start".to_string(), 0x401000);
+        assert!(!needs_synthetic_start(&result));
+    }
+
+    #[test]
+    fn no_synthetic_start_for_dynamic_link() {
+        let mut result = static_main_result();
+        result.dynamic = Some(crate::link::DynamicLinkInfo::default());
+        assert!(!needs_synthetic_start(&result));
     }
 }
