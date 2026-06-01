@@ -12,6 +12,11 @@ fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
     buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
 }
 
+/// Apply all x86_64 `SHT_RELA` relocations from `data` into `layout`.
+///
+/// `symbol_addrs[i]` is the resolved virtual address of ELF symbol index `i`,
+/// or `None` for an undefined symbol. `section_offset` maps each section name
+/// to its byte offset within the merged section (used for multi-object links).
 pub fn apply_relocations(
     layout: &mut MergedLayout,
     data: &[u8],

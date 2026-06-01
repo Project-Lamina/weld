@@ -11,6 +11,8 @@ pub enum TargetArch {
 }
 
 impl TargetArch {
+    /// Convert an ELF `e_machine` value to the corresponding `TargetArch`, or
+    /// `None` for unrecognised machine types.
     pub fn from_elf_machine(machine: u16) -> Option<Self> {
         match machine {
             62 => Some(Self::X86_64),
@@ -20,6 +22,7 @@ impl TargetArch {
         }
     }
 
+    /// Return the ELF `e_machine` value for this architecture.
     pub fn to_elf_machine(self) -> u16 {
         match self {
             Self::X86_64 => 62,
@@ -28,6 +31,7 @@ impl TargetArch {
         }
     }
 
+    /// Default virtual load address for static ELF executables.
     pub fn default_load_base(self) -> u64 {
         match self {
             Self::X86_64 => 0x400000,
@@ -36,10 +40,12 @@ impl TargetArch {
         }
     }
 
+    /// Page alignment used for ELF PT_LOAD segments (always 4 KiB).
     pub fn page_align(self) -> u64 {
         0x1000
     }
 
+    /// Return the Mach-O `cpu_type_t` value, or 0 for unsupported architectures.
     pub fn to_macho_cputype(self) -> u32 {
         match self {
             Self::X86_64 => 0x01000007,
@@ -48,6 +54,8 @@ impl TargetArch {
         }
     }
 
+    /// Convert a Mach-O `cpu_type_t` to the corresponding `TargetArch`, or
+    /// `None` for unrecognised CPU types.
     pub fn from_macho_cputype(cputype: u32) -> Option<Self> {
         match cputype {
             0x01000007 => Some(Self::X86_64),

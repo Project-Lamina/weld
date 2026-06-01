@@ -23,6 +23,11 @@ fn page4k(x: u64) -> u64 {
     x & !0xFFF
 }
 
+/// Apply all AArch64 `SHT_RELA` relocations from `data` into `layout`.
+///
+/// `symbol_addrs[i]` is the resolved virtual address of ELF symbol index `i`,
+/// or `None` for an undefined symbol. `section_offset` maps each section name
+/// to its byte offset within the merged section (used for multi-object links).
 pub fn apply_relocations(
     layout: &mut MergedLayout,
     data: &[u8],
@@ -135,7 +140,6 @@ pub fn apply_relocations(
                     };
                     let diff = (*s_addr as i64).wrapping_add(a).wrapping_sub(p);
                     let val = (diff / 4) & 0x3FFFFFF;
-                    let off = rel.r_offset as usize;
                     if merged.data.len() < off + 4 {
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }
