@@ -765,8 +765,8 @@ pub fn link_and_emit_pe_from_coff(
         dll_sym_counts: &[usize],
     ) -> u64 {
         let mut base_entry = 0usize;
-        for i in 0..dll_idx {
-            base_entry += dll_sym_counts[i] + 1; // +1 for null terminator
+        for count in dll_sym_counts.iter().take(dll_idx) {
+            base_entry += count + 1; // +1 for null terminator
         }
         base_entry += sym_idx_in_dll;
         rdata_vaddr + iat_rel_off as u64 + base_entry as u64 * 8
@@ -879,6 +879,7 @@ pub fn link_and_emit_pe_from_coff(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_pe_raw(
     out: &mut impl Write,
     sections: &[PeSection],
@@ -940,8 +941,8 @@ fn emit_pe_raw(
     write_u32_at_off(&mut opt, 108, NUM_DATA_DIRS); // NumberOfRvaAndSizes
     // Data directories start at offset 112. Each entry is 8 bytes (RVA + Size).
     // Index 1 = Import Directory Table, index 12 = Import Address Table.
-    write_u32_at_off(&mut opt, 112 + 1 * 8,     import_dir_rva); // [1].VirtualAddress
-    write_u32_at_off(&mut opt, 112 + 1 * 8 + 4, idt_size);       // [1].Size
+    write_u32_at_off(&mut opt, 112 + 8,     import_dir_rva); // [1].VirtualAddress
+    write_u32_at_off(&mut opt, 112 + 8 + 4, idt_size);       // [1].Size
     write_u32_at_off(&mut opt, 112 + 12 * 8,    iat_rva);         // [12].VirtualAddress
     write_u32_at_off(&mut opt, 112 + 12 * 8 + 4, iat_size);      // [12].Size
     out.write_all(&opt)?;

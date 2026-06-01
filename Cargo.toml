@@ -1,6 +1,6 @@
 [package]
 name = "lamina-weld"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Eira <eira@nornity.com>"]
 description = "weld - Cross-platform linker. Fast, minimal, drop-in for ld/lld/mold. Links ELF (Linux), PE (Windows), Mach-O (macOS)."
@@ -14,5 +14,5 @@ name = "weld"
 path = "src/main.rs"
 
 [dev-dependencies]
-lamina-platform = { path = "../lamina-platform", version = "0.1.0" }
-ras = { package = "lamina-ras", path = "../ras", version = "0.1.0", features = ["encoder"] }
+lamina-platform = { version = "0.1.0" }
+ras = { package = "lamina-ras", version = "0.1.1", features = ["encoder"] }
