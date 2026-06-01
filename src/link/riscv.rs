@@ -73,6 +73,15 @@ fn patch_j_type(instr: u32, offset: i32) -> u32 {
 // Main relocation handler
 // ---------------------------------------------------------------------------
 
+/// Apply all RISC-V `SHT_RELA` relocations from `data` into `layout`.
+///
+/// `symbol_addrs[i]` is the resolved virtual address of ELF symbol index `i`,
+/// or `None` for an undefined symbol. `section_offset` maps each section name
+/// to its byte offset within the merged section (used for multi-object links).
+///
+/// `R_RISCV_PCREL_HI20`/`LO12` pairs are handled via an internal cache keyed
+/// by the PC of the `AUIPC` instruction; the `HI20` relocation must appear
+/// before its corresponding `LO12` entries in the section's relocation table.
 pub fn apply_relocations(
     layout: &mut MergedLayout,
     data: &[u8],

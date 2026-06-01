@@ -27,10 +27,8 @@ type SymtabView<'a> = Option<(Vec<Symbol>, &'a [u8])>;
 /// Resolved symbol table paired with per-section virtual-address overrides.
 type ResolvedSymbols = (HashMap<String, ResolvedSymbol>, Vec<Option<u64>>);
 
-/// Three binary blobs produced when building ELF dynamic sections:
-/// `.dynamic`, `.dynsym`/`.dynstr`, and `.rela.plt`.
-type DynSectionTriple = (Vec<u8>, Vec<u8>, Vec<u8>);
-// (dynsym, dynstr, rela_plt, hash)
+/// Four binary blobs produced when building ELF dynamic sections:
+/// `.dynsym`, `.dynstr`, `.rela.plt`, and `.hash` (SysV DT_HASH).
 type DynSectionQuad = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// Standard SysV ELF hash function (used by DT_HASH).
@@ -84,6 +82,7 @@ pub struct ParsedObject {
     pub names: Vec<String>,
 }
 
+/// Parse an ELF64 object's header, section headers, and section names.
 fn parse_object(data: Vec<u8>) -> Result<ParsedObject, String> {
     let (header, sections, names) = parse_elf64_slice(&data)?;
     Ok(ParsedObject {
@@ -235,6 +234,8 @@ fn append_merged_section(
     *vaddr += total_size;
 }
 
+/// Merge allocatable sections from a single ELF64 object into a linear layout
+/// starting at the architecture-conventional load base (`0x400000`).
 pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String> {
     let (_header, sections, names) = parse_elf64_slice(data)?;
     let to_merge = collect_mergeable_sections(&sections, &names);
@@ -270,6 +271,7 @@ pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String>
     Ok(layout)
 }
 
+/// Read an ELF64 object file from `path` and merge its allocatable sections.
 pub fn merge_object_file(path: &Path) -> Result<MergedLayout, String> {
     let data = std::fs::read(path).map_err(|e| format!("read failed: {}", e))?;
     merge_sections_single_object(&data)
@@ -491,6 +493,7 @@ fn resolve_symbols_for_object(
     })
 }
 
+/// Merge sections and resolve symbols for a single ELF64 object in one step.
 pub fn merge_and_resolve(
     data: &[u8],
 ) -> Result<(MergedLayout, HashMap<String, ResolvedSymbol>), String> {
@@ -500,6 +503,8 @@ pub fn merge_and_resolve(
     Ok((layout, symbols))
 }
 
+/// Fully link a single ELF64 object: merge sections, resolve symbols, and
+/// apply relocations.
 pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let (header, sections, names) = parse_elf64_slice(data)?;
     let mut layout = merge_sections_single_object(data)?;
@@ -800,6 +805,11 @@ fn link_multi_object_parsed(
     })
 }
 
+/// Build the raw bytes for `.dynsym`, `.dynstr`, `.rela.plt`, and `.hash`
+/// (SysV `DT_HASH`) from the list of symbols that require PLT entries.
+///
+/// `got_plt_vaddr` is the virtual address of `.got.plt`; it is used to compute
+/// each `R_X86_64_JUMP_SLOT` relocation's `r_offset` (GOT slot address).
 fn build_dynamic_sections(
     plt_symbols: &[String],
     got_plt_vaddr: u64,
@@ -843,6 +853,12 @@ fn build_dynamic_sections(
     Ok((dynsym, dynstr, rela_plt, hash))
 }
 
+/// Build the raw bytes for the `.dynamic` section (`Elf64_Dyn` array).
+///
+/// Emits `DT_HASH`, `DT_NEEDED` (offset 1 in dynstr = "libc.so.6"), `DT_STRTAB`,
+/// `DT_SYMTAB`, `DT_STRSZ`, `DT_SYMENT`, `DT_PLTGOT`, `DT_PLTRELSZ`,
+/// `DT_PLTREL`, `DT_JMPREL`, `DT_BIND_NOW`, `DT_FLAGS` (`DF_BIND_NOW`),
+/// `DT_FLAGS_1` (`DF_1_NOW`), and a `DT_NULL` terminator.
 fn build_dynamic_section_content(
     got_plt_vaddr: u64,
     dynsym_vaddr: u64,
@@ -877,6 +893,10 @@ fn build_dynamic_section_content(
     Ok(content)
 }
 
+/// Build the `.plt` and `.got.plt` byte vectors for x86_64 dynamic linking.
+///
+/// Returns `(plt_bytes, got_plt_bytes)`. The GOT is initialised to all-zeros;
+/// the dynamic linker fills in the final symbol addresses at load time.
 fn build_plt_got_x86_64(
     plt_symbols: &[String],
     layout: &MergedLayout,
@@ -917,6 +937,7 @@ fn build_plt_got_x86_64(
     Ok((plt, got))
 }
 
+/// Dispatch relocation application to the appropriate architecture handler.
 pub fn apply_relocations(
     arch: TargetArch,
     layout: &mut MergedLayout,
