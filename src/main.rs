@@ -189,6 +189,23 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
 }
 
 fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
+    // Accept both COFF object files and (legacy) ELF objects. For COFF, use the
+    // direct COFF→PE linker. For ELF (rare on Windows), fall through to the
+    // original path.
+    if let Some(first) = args.input_files.first() {
+        let data = std::fs::read(first).ok()?;
+        let is_coff = crate::object::is_coff_object(&data);
+        if is_coff {
+            let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
+            let out_file = std::fs::File::create(out_path).ok()?;
+            let mut out = std::io::BufWriter::new(out_file);
+            emit::pe::link_and_emit_pe_from_coff(&data, &mut out).ok()?;
+            out.flush().ok()?;
+            return Some(0);
+        }
+    }
+
+    // Legacy ELF-based path (kept for compatibility).
     let obj_data_list = crate::object::load_elf_objects(&args.input_files)?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
@@ -231,10 +248,7 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
     match format {
         ObjectFormat::Elf => try_weld_link_elf(args),
         ObjectFormat::MachO => try_weld_link_macho(args),
-        ObjectFormat::Coff => {
-            eprintln!("weld: COFF/PE linking not yet implemented");
-            None
-        }
+        ObjectFormat::Coff => try_weld_link_pe(args),
     }
 }
 
