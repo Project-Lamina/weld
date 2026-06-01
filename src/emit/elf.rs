@@ -18,6 +18,7 @@ const ELFDATA2LSB: u8 = 1;
 const EV_CURRENT: u8 = 1;
 const ET_EXEC: u16 = 2;
 const EV_CURRENT_U32: u32 = 1;
+const PT_PHDR: u32 = 6;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
@@ -138,14 +139,16 @@ pub fn emit_elf_executable_dynamic(
     let seg_align = arch.page_align();
 
     let phoff = 64u64;
-    let phnum = 4u16;
+    let phnum = 5u16; // PHDR, LOAD, DYNAMIC, INTERP, GNU_STACK
     let ph_size = (phnum as usize) * ELF64_PHDR_SIZE;
     let seg_start = align_up_u64(phoff + ph_size as u64, seg_align);
-    let mut full_seg = Vec::with_capacity(interp_len_aligned + seg_buffer.len());
-    full_seg.extend_from_slice(interp_bytes.as_bytes());
-    full_seg.resize(interp_len_aligned, 0);
-    full_seg.extend_from_slice(&seg_buffer);
-    let seg_size = full_seg.len() as u64;
+
+    // Place the interpreter path string in the padding between program headers
+    // and the first LOAD segment. The kernel reads PT_INTERP from file offset
+    // (not from a mapped VA), so it doesn't need to be in any LOAD segment.
+    let interp_file_off = phoff + ph_size as u64; // right after phdrs
+
+    let seg_size = seg_buffer.len() as u64;
 
     let dynamic_vaddr = layout
         .section_by_name
@@ -153,7 +156,7 @@ pub fn emit_elf_executable_dynamic(
         .and_then(|&i| layout.sections.get(i))
         .map(|s| s.vaddr)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no .dynamic"))?;
-    let dynamic_offset = seg_start + interp_len_aligned as u64 + (dynamic_vaddr - base);
+    let dynamic_offset = seg_start + (dynamic_vaddr - base);
 
     let mut ehdr = [0u8; 64];
     ehdr[0..4].copy_from_slice(&[EI_MAG0, EI_MAG1, EI_MAG2, EI_MAG3]);
@@ -172,14 +175,37 @@ pub fn emit_elf_executable_dynamic(
 
     out.write_all(&ehdr)?;
 
+    // PT_PHDR: glibc's dl_main scans the main executable's program headers and
+    // uses PT_PHDR to compute the load bias (l_addr = AT_PHDR - PT_PHDR.p_vaddr).
+    // It must be the first program header and lie within a PT_LOAD. The phdrs are
+    // at file offset `phoff`, which maps to vaddr (load_vaddr_below + phoff).
+    let load_vaddr = base - seg_start;
+    let mut phdr_phdr = [0u8; ELF64_PHDR_SIZE];
+    phdr_phdr[0..4].copy_from_slice(&PT_PHDR.to_le_bytes());
+    phdr_phdr[4..8].copy_from_slice(&PF_R.to_le_bytes());
+    phdr_phdr[8..16].copy_from_slice(&phoff.to_le_bytes());
+    phdr_phdr[16..24].copy_from_slice(&(load_vaddr + phoff).to_le_bytes());
+    phdr_phdr[24..32].copy_from_slice(&(load_vaddr + phoff).to_le_bytes());
+    phdr_phdr[32..40].copy_from_slice(&(ph_size as u64).to_le_bytes());
+    phdr_phdr[40..48].copy_from_slice(&(ph_size as u64).to_le_bytes());
+    phdr_phdr[48..56].copy_from_slice(&8u64.to_le_bytes());
+    out.write_all(&phdr_phdr)?;
+
+    // The PT_LOAD must cover file offset 0 so the ELF header and program headers
+    // are mapped. The kernel computes AT_PHDR = p_vaddr + (e_phoff - p_offset)
+    // for the segment containing e_phoff; if the phdrs aren't mapped, the dynamic
+    // linker dereferences a bad AT_PHDR and segfaults before it can run.
+    // Map file offset 0 at (base - seg_start) so the actual sections (placed at
+    // file offset seg_start) still land at their assigned vaddr `base`.
+    let load_filesz = seg_start + seg_size;
     let mut phdr_load = [0u8; ELF64_PHDR_SIZE];
     phdr_load[0..4].copy_from_slice(&PT_LOAD.to_le_bytes());
     phdr_load[4..8].copy_from_slice(&(PF_R | PF_W | PF_X).to_le_bytes());
-    phdr_load[8..16].copy_from_slice(&seg_start.to_le_bytes());
-    phdr_load[16..24].copy_from_slice(&base.to_le_bytes());
-    phdr_load[24..32].copy_from_slice(&base.to_le_bytes());
-    phdr_load[32..40].copy_from_slice(&seg_size.to_le_bytes());
-    phdr_load[40..48].copy_from_slice(&seg_size.to_le_bytes());
+    phdr_load[8..16].copy_from_slice(&0u64.to_le_bytes());
+    phdr_load[16..24].copy_from_slice(&load_vaddr.to_le_bytes());
+    phdr_load[24..32].copy_from_slice(&load_vaddr.to_le_bytes());
+    phdr_load[32..40].copy_from_slice(&load_filesz.to_le_bytes());
+    phdr_load[40..48].copy_from_slice(&load_filesz.to_le_bytes());
     phdr_load[48..56].copy_from_slice(&seg_align.to_le_bytes());
     out.write_all(&phdr_load)?;
 
@@ -198,12 +224,17 @@ pub fn emit_elf_executable_dynamic(
     phdr_dynamic[40..48].copy_from_slice(&dyn_sz.to_le_bytes());
     out.write_all(&phdr_dynamic)?;
 
+    // PT_INTERP: the kernel reads the path from p_offset, but glibc's dl_main
+    // ALSO reads it in memory via p_vaddr to set _dl_rtld_libname.name. The
+    // interp string lives in the header padding gap which is inside the first
+    // PT_LOAD (it covers file offset 0), so it is mapped at this vaddr.
+    let interp_vaddr = load_vaddr + interp_file_off;
     let mut phdr_interp = [0u8; ELF64_PHDR_SIZE];
     phdr_interp[0..4].copy_from_slice(&PT_INTERP.to_le_bytes());
-    phdr_interp[4..8].copy_from_slice(&(PF_R).to_le_bytes());
-    phdr_interp[8..16].copy_from_slice(&seg_start.to_le_bytes());
-    phdr_interp[16..24].copy_from_slice(&base.to_le_bytes());
-    phdr_interp[24..32].copy_from_slice(&base.to_le_bytes());
+    phdr_interp[4..8].copy_from_slice(&PF_R.to_le_bytes());
+    phdr_interp[8..16].copy_from_slice(&interp_file_off.to_le_bytes()); // file offset
+    phdr_interp[16..24].copy_from_slice(&interp_vaddr.to_le_bytes());   // p_vaddr (mapped)
+    phdr_interp[24..32].copy_from_slice(&interp_vaddr.to_le_bytes());   // p_paddr
     phdr_interp[32..40].copy_from_slice(&(interp_len as u64).to_le_bytes());
     phdr_interp[40..48].copy_from_slice(&(interp_len as u64).to_le_bytes());
     out.write_all(&phdr_interp)?;
@@ -213,11 +244,15 @@ pub fn emit_elf_executable_dynamic(
     phdr_stack[4..8].copy_from_slice(&(PF_R | PF_W).to_le_bytes());
     out.write_all(&phdr_stack)?;
 
-    let pad = (seg_start - phoff - ph_size as u64) as usize;
-    if pad > 0 {
-        out.write_all(&vec![0u8; pad])?;
+    // Write interpreter string in the padding gap, then pad to seg_start.
+    out.write_all(interp_bytes.as_bytes())?;
+    let used = ph_size + interp_len;
+    let pad_to_seg = (seg_start as usize) - (phoff as usize) - used;
+    if pad_to_seg > 0 {
+        out.write_all(&vec![0u8; pad_to_seg])?;
     }
-    out.write_all(&full_seg)?;
+    // Write code segment (no INTERP prefix — sections map to correct VAs).
+    out.write_all(&seg_buffer)?;
 
     Ok(())
 }

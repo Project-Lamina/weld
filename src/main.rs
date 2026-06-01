@@ -75,10 +75,14 @@ fn select_entry(args: &ParsedArgs, result: &link::LinkResult) -> Option<u64> {
         })
 }
 
-/// True when no real `_start` is defined and we are linking a static (no
-/// interpreter) executable, so weld must provide program startup itself.
+/// True when no real `_start` is defined, so weld must provide program startup
+/// itself. This applies to both static and dynamic links: when we don't link a
+/// C runtime (crt1.o), nothing defines `_start`, and entering directly at `main`
+/// would `ret` into `argc` on the initial stack. The synthetic stub calls `main`
+/// and then issues the `exit` syscall. For dynamic links the PLT/GOT are already
+/// resolved by the interpreter (BIND_NOW) before `_start` runs.
 fn needs_synthetic_start(result: &link::LinkResult) -> bool {
-    result.dynamic.is_none() && !result.symbol_addrs.contains_key("_start")
+    !result.symbol_addrs.contains_key("_start")
 }
 
 /// Append a freestanding `_start` to a static x86_64 ELF layout and return its
@@ -373,9 +377,19 @@ mod tests {
     }
 
     #[test]
-    fn no_synthetic_start_for_dynamic_link() {
+    fn synthesizes_start_for_dynamic_link_without_start() {
+        // A dynamic link (libc) with no crt-provided `_start` still needs the
+        // synthetic stub, otherwise entering at `main` returns into `argc`.
         let mut result = static_main_result();
         result.dynamic = Some(crate::link::DynamicLinkInfo::default());
+        assert!(needs_synthetic_start(&result));
+    }
+
+    #[test]
+    fn no_synthetic_start_for_dynamic_link_with_start() {
+        let mut result = static_main_result();
+        result.dynamic = Some(crate::link::DynamicLinkInfo::default());
+        result.symbol_addrs.insert("_start".to_string(), 0x401000);
         assert!(!needs_synthetic_start(&result));
     }
 }
