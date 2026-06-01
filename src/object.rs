@@ -132,6 +132,10 @@ fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
 
 /// Returns true for bare COFF object files (.obj). PE executables are excluded
 /// because they begin with the MZ DOS stub (0x4D5A), not a COFF machine type.
+pub fn is_coff_object(data: &[u8]) -> bool {
+    is_coff(data)
+}
+
 fn is_coff(data: &[u8]) -> bool {
     if data.len() < 20 {
         return false;
