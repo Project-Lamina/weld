@@ -37,6 +37,8 @@ pub fn print_usage() {
     );
 }
 
+/// Consume the next element of `argv` as the required argument for `flag`.
+/// Returns `Err` if there is no next element.
 fn take_required_arg(argv: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     let next = argv
         .get(*i)
@@ -46,11 +48,17 @@ fn take_required_arg(argv: &[String], i: &mut usize, flag: &str) -> Result<Strin
     Ok(next)
 }
 
+/// Advance `i` by up to `count` positions, clamped to the end of `argv`.
 fn skip_args(argv: &[String], i: &mut usize, count: usize) {
     let remaining = argv.len().saturating_sub(*i);
     *i += remaining.min(count);
 }
 
+/// Parse a weld command-line argument vector into a `ParseAction`.
+///
+/// Handles the GCC/Clang linker driver flags that weld may receive when invoked
+/// via `-fuse-ld=weld`. Unknown flags starting with `-` are silently ignored;
+/// non-flag arguments are collected as input files.
 pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
     let mut args = ParsedArgs::default();
     let mut i = 0;

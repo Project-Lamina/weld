@@ -307,8 +307,6 @@ pub fn emit_pe_executable(
         ) as u32
     };
 
-    let rdata_vaddr = IMAGE_BASE + rdata_rva as u64;
-
     let sym_refs: Vec<(u16, &str)> = import_symbols
         .iter()
         .map(|(h, n)| (*h, n.as_str()))
@@ -418,8 +416,6 @@ pub fn emit_pe_executable(
     write_u32_at(&mut opt, &mut o, NUM_DATA_DIRS); // NumberOfRvaAndSizes
 
     // Data directories (16 entries × 8 bytes = 128 bytes)
-    let data_dir_start = o;
-    let _ = data_dir_start;
 
     // Index 0: Export table — unused
     write_u32_at(&mut opt, &mut o, 0);
@@ -619,7 +615,7 @@ pub fn link_and_emit_pe_from_coff(
                 continue;
             }
             let section_num = coff_read_i16(coff, rec + 12).unwrap_or(0);
-            let storage_class = coff[rec + 16];
+            let storage_class = coff[rec + 17]; // byte 17: StorageClass (byte 16 is NumberOfAuxSymbols)
             if section_num == IMAGE_SYM_UNDEFINED_SECTION
                 && storage_class == IMAGE_SYM_CLASS_EXTERNAL
                 && seen.insert(name.clone())
@@ -707,7 +703,6 @@ pub fn link_and_emit_pe_from_coff(
         text_rva as u64 + align_up(total_text_bytes as u64, SECTION_ALIGN),
         SECTION_ALIGN,
     ) as u32;
-    let rdata_vaddr = IMAGE_BASE + rdata_rva as u64;
 
     // Compute IAT offset within rdata.
     // Import section layout: IDT + ILT + IAT + hint/name + dll_names
@@ -754,16 +749,8 @@ pub fn link_and_emit_pe_from_coff(
             },
         ]
     };
-    let sym_refs: Vec<Vec<(u16, &str)>> = entries.iter()
-        .map(|e| e.symbols.clone())
-        .collect();
-    let entry_refs: Vec<ImportEntry> = entries.iter().enumerate().map(|(i, e)| ImportEntry {
-        dll_name: e.dll_name,
-        symbols: sym_refs[i].clone(),
-    }).collect();
-
-    let (rdata_bytes, _idt_off, iat_rel_off, _idt_sz, _iat_sz) =
-        build_import_section(rdata_rva as u64, &entry_refs);
+    let (rdata_bytes, idt_off, iat_rel_off, idt_sz, iat_sz) =
+        build_import_section(rdata_rva as u64, &entries);
 
     // IAT layout within rdata: for each DLL, IAT entries are at sequential positions.
     // We need the VA of each symbol's IAT entry.
@@ -852,14 +839,12 @@ pub fn link_and_emit_pe_from_coff(
 
     // Bypass emit_pe_executable's import building (it only does KERNEL32.DLL).
     // Write PE manually using the pre-built rdata_bytes from build_import_section above.
-    let import_dir_rva = rdata_rva + _idt_off;
+    let import_dir_rva = rdata_rva + idt_off;
     let iat_rva = rdata_rva + iat_rel_off;
 
     let text_vsize = patched_text.len() as u32;
     let text_raw_size = align_up(text_vsize as u64, FILE_ALIGN) as u32;
     let rdata_vsize = rdata_bytes.len() as u32;
-    let rdata_raw_size = align_up(rdata_vsize as u64, FILE_ALIGN) as u32;
-
     let last_section_end = rdata_rva as u64 + align_up(rdata_vsize as u64, SECTION_ALIGN);
     let size_of_image = align_up(last_section_end, SECTION_ALIGN) as u32;
 
@@ -889,9 +874,8 @@ pub fn link_and_emit_pe_from_coff(
         entry_va,
         import_dir_rva,
         iat_rva,
-        rdata_vsize,
-        _idt_sz,
-        _iat_sz,
+        idt_sz,
+        iat_sz,
     )
 }
 
@@ -905,7 +889,6 @@ fn emit_pe_raw(
     entry_va: u64,
     import_dir_rva: u32,
     iat_rva: u32,
-    rdata_vsize: u32,
     idt_size: u32,
     iat_size: u32,
 ) -> std::io::Result<()> {
@@ -955,18 +938,12 @@ fn emit_pe_raw(
     write_u64_at_off(&mut opt, 88, 0x100000); // SizeOfHeapReserve
     write_u64_at_off(&mut opt, 96, 0x1000);   // SizeOfHeapCommit
     write_u32_at_off(&mut opt, 108, NUM_DATA_DIRS); // NumberOfRvaAndSizes
-    // Data directory 1: Import directory
-    let dd_off = 112;
-    write_u32_at_off(&mut opt, dd_off + 8, import_dir_rva);  // [1].VirtualAddress
-    write_u32_at_off(&mut opt, dd_off + 12, idt_size);       // [1].Size
-    // Data directory 12: IAT
-    write_u32_at_off(&mut opt, dd_off + 8 * 11, iat_rva);    // [12].VirtualAddress -- note: dd index 12 but array index 11 with rva/size pairs
-    write_u32_at_off(&mut opt, dd_off + 8 * 11 + 4, iat_size); // [12].Size
-    // Fix: data dir 12 is at offset 112 + 12*8 = 208
-    write_u32_at_off(&mut opt, 112 + 12 * 8, iat_rva);
-    write_u32_at_off(&mut opt, 112 + 12 * 8 + 4, iat_size);
-    write_u32_at_off(&mut opt, 112 + 1 * 8, import_dir_rva);
-    write_u32_at_off(&mut opt, 112 + 1 * 8 + 4, idt_size);
+    // Data directories start at offset 112. Each entry is 8 bytes (RVA + Size).
+    // Index 1 = Import Directory Table, index 12 = Import Address Table.
+    write_u32_at_off(&mut opt, 112 + 1 * 8,     import_dir_rva); // [1].VirtualAddress
+    write_u32_at_off(&mut opt, 112 + 1 * 8 + 4, idt_size);       // [1].Size
+    write_u32_at_off(&mut opt, 112 + 12 * 8,    iat_rva);         // [12].VirtualAddress
+    write_u32_at_off(&mut opt, 112 + 12 * 8 + 4, iat_size);      // [12].Size
     out.write_all(&opt)?;
 
     // Section headers

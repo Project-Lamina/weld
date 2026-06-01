@@ -62,6 +62,10 @@ const SHN_UNDEF: u16 = 0;
 #[allow(dead_code)]
 const R_X86_64_JUMP_SLOT: u32 = 7;
 
+/// Emit a statically-linked ELF64 `ET_EXEC` executable.
+///
+/// Writes an ELF header, one `PT_LOAD` segment covering all sections, and a
+/// `PT_GNU_STACK` segment with `RW` permissions (non-executable stack).
 pub fn emit_elf_executable(
     layout: &MergedLayout,
     arch: TargetArch,
@@ -120,6 +124,15 @@ pub fn emit_elf_executable(
     Ok(())
 }
 
+/// Emit a dynamically-linked ELF64 `ET_EXEC` executable.
+///
+/// Writes five program headers in order: `PT_PHDR`, `PT_LOAD` (covers file
+/// offset 0 so the ELF header and phdrs are mapped), `PT_DYNAMIC`, `PT_INTERP`,
+/// and `PT_GNU_STACK`. The interpreter path string is written in the padding gap
+/// between the phdrs and the first page-aligned segment.
+///
+/// Returns `Err` if `dynamic.interpreter` is `None` or if the layout contains
+/// no `.dynamic` section.
 pub fn emit_elf_executable_dynamic(
     layout: &MergedLayout,
     arch: TargetArch,
@@ -133,7 +146,6 @@ pub fn emit_elf_executable_dynamic(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no interpreter"))?;
     let interp_bytes = format!("{}\0", interpreter);
     let interp_len = interp_bytes.len();
-    let interp_len_aligned = (interp_len + 7) & !7;
 
     let (base, seg_buffer) = build_segment_buffer(layout, arch.default_load_base());
     let seg_align = arch.page_align();

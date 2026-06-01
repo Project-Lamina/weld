@@ -2,7 +2,12 @@
 name = "lamina-weld"
 version = "0.1.0"
 edition = "2024"
-description = "Cross-platform linker for Lamina. Fast, minimal, drop-in for ld/lld/mold."
+authors = ["Eira <eira@nornity.com>"]
+description = "weld - Cross-platform linker. Fast, minimal, drop-in for ld/lld/mold. Links ELF (Linux), PE (Windows), Mach-O (macOS)."
+license = "Apache-2.0"
+keywords = ["linker", "elf", "pe", "macho", "compiler"]
+categories = ["compilers", "development-tools"]
+repository = "https://github.com/Project-Lamina/weld"
 
 [[bin]]
 name = "weld"

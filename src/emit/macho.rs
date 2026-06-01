@@ -871,8 +871,6 @@ pub fn emit_macho_executable_dynamic(
     let bind_off = align_up_usize(dyld_info_off + rebase_opcodes.len(), 8);
     let bind_pad_len = bind_off.saturating_sub(dyld_info_off + rebase_opcodes.len());
     let dyld_info_size = rebase_opcodes.len() + bind_pad_len + bind_opcodes.len();
-    let has_dyld_info = true;
-    let has_linkedit = true;
 
     let mut symtab_bytes = Vec::with_capacity(32);
     let write_nlist = |buf: &mut Vec<u8>, strx: u32, value: u64| {
@@ -886,18 +884,14 @@ pub fn emit_macho_executable_dynamic(
     write_nlist(&mut symtab_bytes, 21, entry + PAGE_SIZE as u64);
     let strtab_bytes = b"\0__mh_execute_header\0_main\0".to_vec();
 
-    let symoff_unaligned =
-        linkedit_file_off as usize + if has_dyld_info { dyld_info_size } else { 0 };
+    let symoff_unaligned = linkedit_file_off as usize + dyld_info_size;
     let symoff = align_up_usize(symoff_unaligned, 8) as u32;
     let symtab_pad_len = (symoff as usize).saturating_sub(symoff_unaligned);
     let stroff = symoff + symtab_bytes.len() as u32;
     let strsize = strtab_bytes.len() as u32;
 
-    let linkedit_size = if has_dyld_info {
-        (dyld_info_size + symtab_pad_len + symtab_bytes.len() + strtab_bytes.len()) as u64
-    } else {
-        (symtab_pad_len + symtab_bytes.len() + strtab_bytes.len()) as u64
-    };
+    let linkedit_size =
+        (dyld_info_size + symtab_pad_len + symtab_bytes.len() + strtab_bytes.len()) as u64;
     if has_data {
         let data_seg_size = 72 + SECT64_SIZE * data_sections.len();
         let mut data_seg = vec![0u8; data_seg_size];
@@ -936,7 +930,7 @@ pub fn emit_macho_executable_dynamic(
         sizeofcmds += data_seg_size as u32;
     }
 
-    if has_linkedit {
+    {
         let mut linkedit_seg = [0u8; 72];
         linkedit_seg[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
         linkedit_seg[4..8].copy_from_slice(&72u32.to_le_bytes());
@@ -1064,7 +1058,7 @@ pub fn emit_macho_executable_dynamic(
         }
     }
 
-    if has_dyld_info {
+    {
         let mut lc_dyld_info = vec![0u8; 48];
         lc_dyld_info[0..4].copy_from_slice(&LC_DYLD_INFO_ONLY.to_le_bytes());
         lc_dyld_info[4..8].copy_from_slice(&48u32.to_le_bytes());
@@ -1114,7 +1108,7 @@ pub fn emit_macho_executable_dynamic(
         out.write_all(&vec![0u8; data_trailing])?;
     }
 
-    if has_dyld_info {
+    {
         out.write_all(&rebase_opcodes)?;
         if bind_pad_len > 0 {
             out.write_all(&vec![0u8; bind_pad_len])?;
