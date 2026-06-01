@@ -129,7 +129,7 @@ fn synthesize_elf_start_x86_64(result: &mut link::LinkResult) -> Option<u64> {
 }
 
 fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
-    let obj_data_list = crate::object::load_elf_objects(&args.input_files)?;
+    let obj_data_list = object::load_elf_objects(&args.input_files)?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
         None
@@ -159,7 +159,7 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
 }
 
 fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
-    let (obj_data_list, dylib_paths) = crate::object::load_macho_objects(&args.input_files)?;
+    let (obj_data_list, dylib_paths) = object::load_macho_objects(&args.input_files)?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
         None
@@ -174,7 +174,7 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
-    let fallback_dyn = crate::link::DynamicLinkInfo {
+    let fallback_dyn = link::DynamicLinkInfo {
         needed: vec!["/usr/lib/libSystem.B.dylib".to_string()],
         plt_symbols: Vec::new(),
         weak_plt_symbols: Vec::new(),
@@ -198,7 +198,7 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
     // original path.
     if let Some(first) = args.input_files.first() {
         let data = std::fs::read(first).ok()?;
-        let is_coff = crate::object::is_coff_object(&data);
+        let is_coff = object::is_coff_object(&data);
         if is_coff {
             let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
             let out_file = std::fs::File::create(out_path).ok()?;
@@ -210,7 +210,7 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
     }
 
     // Legacy ELF-based path (kept for compatibility).
-    let obj_data_list = crate::object::load_elf_objects(&args.input_files)?;
+    let obj_data_list = object::load_elf_objects(&args.input_files)?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
         None
@@ -275,16 +275,16 @@ fn main() {
                 None => {
                     if args.verbose {
                         if let Some((format, data, dylib_paths)) =
-                            crate::object::load_objects(&args.input_files)
+                            load_objects(&args.input_files)
                         {
                             let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
                             let err = match format {
-                                crate::object::ObjectFormat::Elf => {
-                                    crate::link::link_multi_object(&refs, Some(&args.libraries))
+                                ObjectFormat::Elf => {
+                                    link::link_multi_object(&refs, Some(&args.libraries))
                                         .err()
                                 }
-                                crate::object::ObjectFormat::MachO => {
-                                    crate::link::macho::link_macho_multi_object(
+                                ObjectFormat::MachO => {
+                                    link::macho::link_macho_multi_object(
                                         &refs,
                                         Some(&args.libraries),
                                         &dylib_paths,
@@ -292,7 +292,7 @@ fn main() {
                                     )
                                     .err()
                                 }
-                                crate::object::ObjectFormat::Coff => {
+                                ObjectFormat::Coff => {
                                     Some("COFF/PE linking not yet implemented".to_string())
                                 }
                             };
@@ -381,14 +381,14 @@ mod tests {
         // A dynamic link (libc) with no crt-provided `_start` still needs the
         // synthetic stub, otherwise entering at `main` returns into `argc`.
         let mut result = static_main_result();
-        result.dynamic = Some(crate::link::DynamicLinkInfo::default());
+        result.dynamic = Some(link::DynamicLinkInfo::default());
         assert!(needs_synthetic_start(&result));
     }
 
     #[test]
     fn no_synthetic_start_for_dynamic_link_with_start() {
         let mut result = static_main_result();
-        result.dynamic = Some(crate::link::DynamicLinkInfo::default());
+        result.dynamic = Some(link::DynamicLinkInfo::default());
         result.symbol_addrs.insert("_start".to_string(), 0x401000);
         assert!(!needs_synthetic_start(&result));
     }

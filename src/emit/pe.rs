@@ -337,7 +337,7 @@ pub fn emit_pe_executable(
     };
 
     // --- Entry point RVA (relative to image base) ---
-    let entry_rva = (entry.saturating_sub(IMAGE_BASE)) as u32;
+    let entry_rva = entry.saturating_sub(IMAGE_BASE) as u32;
 
     // =========================================================================
     // Assemble the file
