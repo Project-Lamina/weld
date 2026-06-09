@@ -15,14 +15,16 @@ fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
 /// Apply all x86_64 `SHT_RELA` relocations from `data` into `layout`.
 ///
 /// `symbol_addrs[i]` is the resolved virtual address of ELF symbol index `i`,
-/// or `None` for an undefined symbol. `section_offset` maps each section name
-/// to its byte offset within the merged section (used for multi-object links).
+/// or `None` for an undefined symbol. `got_entries[i]` is the vaddr of the
+/// `.got` slot for symbol `i`, used for `R_X86_64_GOTPCREL`. `section_offset`
+/// maps each section name to its byte offset within the merged section.
 pub fn apply_relocations(
     layout: &mut MergedLayout,
     data: &[u8],
     sections: &[SectionHeader],
     names: &[String],
     symbol_addrs: &[Option<u64>],
+    got_entries: &[Option<u64>],
     section_offset: Option<&std::collections::HashMap<String, u64>>,
 ) -> Result<(), String> {
     const SHT_RELA: u32 = 4;
@@ -87,6 +89,28 @@ pub fn apply_relocations(
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }
                     write_u32_le(&mut merged.data, off, val);
+                }
+                reloc_type::R_X86_64_GOTPCREL => {
+                    let got_entry_vaddr = got_entries
+                        .get(rel.r_sym as usize)
+                        .copied()
+                        .flatten()
+                        .ok_or_else(|| {
+                            format!("no GOT entry for symbol index {} (GOTPCREL)", rel.r_sym)
+                        })?;
+                    let val = (got_entry_vaddr as i64).wrapping_add(a).wrapping_sub(p) as u32;
+                    if merged.data.len() < off + 4 {
+                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                    }
+                    write_u32_le(&mut merged.data, off, val);
+                }
+                reloc_type::R_X86_64_TLSGD
+                | reloc_type::R_X86_64_TLSLD
+                | reloc_type::R_X86_64_DTPOFF32
+                | reloc_type::R_X86_64_GOTTPOFF => {
+                    // TLS relocations: requires dynamic TLS support (not yet
+                    // implemented). Skip without patching; binary will crash on
+                    // TLS access.
                 }
                 _ => {
                     return Err(format!("unsupported x86_64 relocation type {}", rel.r_type));
