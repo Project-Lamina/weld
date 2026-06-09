@@ -7,7 +7,7 @@
 use crate::arch::TargetArch;
 use crate::link::{DynamicLinkInfo, MergedLayout};
 use crate::segment::{align_up_u64, build_segment_buffer};
-use std::io::Write;
+use std::io::{Error, ErrorKind, Result, Write};
 
 const EI_MAG0: u8 = 0x7f;
 const EI_MAG1: u8 = b'E';
@@ -72,7 +72,7 @@ pub fn emit_elf_executable(
     entry: u64,
     os_abi: u8,
     out: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     let (base, seg_buffer) = build_segment_buffer(layout, arch.default_load_base());
     let seg_size = seg_buffer.len() as u64;
     let seg_align = arch.page_align();
@@ -142,11 +142,11 @@ pub fn emit_elf_executable_dynamic(
     os_abi: u8,
     dynamic: &DynamicLinkInfo,
     out: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     let interpreter = dynamic
         .interpreter
         .as_ref()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no interpreter"))?;
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no interpreter"))?;
     let interp_bytes = format!("{}\0", interpreter);
     let interp_len = interp_bytes.len();
 
@@ -170,7 +170,7 @@ pub fn emit_elf_executable_dynamic(
         .get(".dynamic")
         .and_then(|&i| layout.sections.get(i))
         .map(|s| s.vaddr)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no .dynamic"))?;
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no .dynamic"))?;
     let dynamic_offset = seg_start + (dynamic_vaddr - base);
 
     let mut ehdr = [0u8; 64];

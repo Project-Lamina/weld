@@ -7,8 +7,8 @@
 use crate::arch::TargetArch;
 use crate::link::{DynamicLinkInfo, MergedLayout, MergedSection};
 use crate::segment::{align_up_u64, align_up_usize, build_segment_buffer};
-use std::collections::HashMap;
-use std::io::Write;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{Error, ErrorKind, Result, Write};
 
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
 const MH_EXECUTABLE: u32 = 2;
@@ -37,11 +37,11 @@ const VM_PROT_EXECUTE: u32 = 4;
 const PAGE_SIZE: usize = 16384;
 const SEG_BASE: u64 = 0x100000000;
 
-fn write_u32(w: &mut impl Write, val: u32) -> std::io::Result<()> {
+fn write_u32(w: &mut impl Write, val: u32) -> Result<()> {
     w.write_all(&val.to_le_bytes())
 }
 
-fn write_u64(w: &mut impl Write, val: u64) -> std::io::Result<()> {
+fn write_u64(w: &mut impl Write, val: u64) -> Result<()> {
     w.write_all(&val.to_le_bytes())
 }
 
@@ -130,15 +130,15 @@ pub fn emit_macho_executable(
     arch: TargetArch,
     entry: u64,
     out: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     let (_base, seg_buffer) = build_segment_buffer(layout, 0x100000000);
     let text_size = seg_buffer.len();
     let text_size_aligned = align_up_usize(text_size, PAGE_SIZE);
 
     let cputype = arch.to_macho_cputype();
     if cputype == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
             "RISC-V not supported for Mach-O",
         ));
     }
@@ -369,7 +369,7 @@ fn build_bind_opcodes(
     const BIND_OPCODE_DO_BIND: u8 = 0x90;
     const BIND_OPCODE_DONE: u8 = 0x00;
 
-    let weak: std::collections::HashSet<&str> = weak_symbols.iter().map(|s| s.as_str()).collect();
+    let weak: HashSet<&str> = weak_symbols.iter().map(|s| s.as_str()).collect();
 
     let mut buf = Vec::new();
     buf.push(BIND_OPCODE_SET_DYLIB_SPECIAL_IMM | BIND_SPECIAL_DYLIB_FLAT_LOOKUP_IMM);
@@ -421,7 +421,7 @@ fn uleb128_size(mut v: u64) -> usize {
 #[derive(Default, Clone)]
 struct ExportRawNode {
     terminal: Option<(u64, u64)>,
-    children: std::collections::BTreeMap<u8, usize>,
+    children: BTreeMap<u8, usize>,
 }
 
 #[derive(Default, Clone)]
@@ -575,8 +575,7 @@ fn build_chained_fixups_payload(
     const BIND_SPECIAL_DYLIB_FLAT_LOOKUP: u8 = 0xFE;
 
     let import_count = std::cmp::min(got_slot_count as usize, import_symbols.len());
-    let mut page_first_starts: std::collections::BTreeMap<u32, u16> =
-        std::collections::BTreeMap::new();
+    let mut page_first_starts: BTreeMap<u32, u16> = BTreeMap::new();
 
     for i in 0..import_count {
         let off = got_offset + (i as u64) * 8;
@@ -691,7 +690,7 @@ pub fn emit_macho_executable_dynamic(
     entry: u64,
     dyn_info: &DynamicLinkInfo,
     out: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     let text_sections_owned: Vec<MergedSection> = layout
         .sections
         .iter()
@@ -796,8 +795,8 @@ pub fn emit_macho_executable_dynamic(
 
     let cputype = arch.to_macho_cputype();
     if cputype == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
             "RISC-V not supported for Mach-O",
         ));
     }
@@ -1127,8 +1126,6 @@ pub fn emit_macho_executable_dynamic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::MergedSection;
-    use std::collections::HashMap;
 
     #[test]
     fn test_emit_macho_header() {

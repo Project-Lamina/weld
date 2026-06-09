@@ -16,7 +16,10 @@ mod x86_64;
 pub use resolver::LibraryResolver;
 
 use crate::arch::TargetArch;
-use crate::elf::{Elf64Header, SectionHeader, Symbol, parse_elf64_slice, parse_symtab};
+use crate::elf::{
+    Elf64Header, SectionHeader, Symbol, get_strtab_from_section, get_strtab_string,
+    parse_elf64_slice, parse_rela_section, parse_symtab,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::thread;
@@ -398,7 +401,7 @@ fn parse_symtab_view<'a>(
 
     let strtab_idx = symtab_sh.sh_link as usize;
     let strtab_sh = sections.get(strtab_idx).ok_or("symtab sh_link invalid")?;
-    let strtab = crate::elf::get_strtab_from_section(data, strtab_sh);
+    let strtab = get_strtab_from_section(data, strtab_sh);
     let symbols = parse_symtab(data, symtab_sh)?;
 
     Ok(Some((symbols, strtab)))
@@ -422,7 +425,7 @@ where
     let mut by_index: Vec<Option<u64>> = Vec::with_capacity(symbols.len());
 
     for sym in &symbols {
-        let name = crate::elf::get_strtab_string(strtab, sym.name_offset)
+        let name = get_strtab_string(strtab, sym.name_offset)
             .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset));
 
         let (address, is_defined) = match sym.st_shndx {
@@ -466,7 +469,7 @@ fn collect_gotpcrel_symbol_names(data: &[u8], sections: &[SectionHeader], out: &
         None => return,
     };
     for rela_sh in sections.iter().filter(|s| s.sh_type == SHT_RELA) {
-        let Ok(relas) = crate::elf::parse_rela_section(data, rela_sh) else {
+        let Ok(relas) = parse_rela_section(data, rela_sh) else {
             continue;
         };
         for rel in relas {
@@ -490,7 +493,7 @@ fn symbol_names_by_index_raw(data: &[u8], sections: &[SectionHeader]) -> Option<
         symbols
             .iter()
             .map(|sym| {
-                crate::elf::get_strtab_string(strtab, sym.name_offset)
+                get_strtab_string(strtab, sym.name_offset)
                     .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset))
             })
             .collect(),
@@ -505,7 +508,7 @@ fn symbol_names_by_index(data: &[u8], sections: &[SectionHeader]) -> Result<Vec<
     Ok(symbols
         .iter()
         .map(|sym| {
-            crate::elf::get_strtab_string(strtab, sym.name_offset)
+            get_strtab_string(strtab, sym.name_offset)
                 .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset))
         })
         .collect())
