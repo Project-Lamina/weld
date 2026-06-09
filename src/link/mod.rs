@@ -459,11 +459,7 @@ where
 /// Collect the names of all symbols referenced by `R_X86_64_GOTPCREL`
 /// relocations in `data`. New names are appended to `out`; duplicates are
 /// skipped.
-fn collect_gotpcrel_symbol_names(
-    data: &[u8],
-    sections: &[SectionHeader],
-    out: &mut Vec<String>,
-) {
+fn collect_gotpcrel_symbol_names(data: &[u8], sections: &[SectionHeader], out: &mut Vec<String>) {
     const SHT_RELA: u32 = 4;
     let sym_names = match symbol_names_by_index_raw(data, sections) {
         Some(v) => v,
@@ -556,7 +552,16 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let (resolved, by_index) = resolve_symbols(data, &layout, &sections, &names)?;
     let arch = TargetArch::from_elf_machine(header.e_machine)
         .ok_or_else(|| format!("unsupported machine {}", header.e_machine))?;
-    apply_relocations(arch, &mut layout, data, &sections, &names, &by_index, &[], None)?;
+    apply_relocations(
+        arch,
+        &mut layout,
+        data,
+        &sections,
+        &names,
+        &by_index,
+        &[],
+        None,
+    )?;
     let symbol_addrs: HashMap<String, u64> = resolved
         .into_iter()
         .filter_map(|(name, r)| r.address.map(|a| (name, a)))
@@ -833,7 +838,9 @@ fn link_multi_object_parsed(
                 flags: SHF_ALLOC | SHF_WRITE,
                 align: 8,
             });
-            layout.section_by_name.insert(".got".into(), layout.sections.len() - 1);
+            layout
+                .section_by_name
+                .insert(".got".into(), layout.sections.len() - 1);
             for (i, name) in unique_syms.iter().enumerate() {
                 got_symbol_map.insert(name.clone(), got_base + i as u64 * 8);
             }
@@ -1045,9 +1052,15 @@ pub fn apply_relocations(
     section_offset: Option<&HashMap<String, u64>>,
 ) -> Result<(), String> {
     match arch {
-        TargetArch::X86_64 => {
-            x86_64::apply_relocations(layout, data, sections, names, symbol_addrs, got_entries, section_offset)
-        }
+        TargetArch::X86_64 => x86_64::apply_relocations(
+            layout,
+            data,
+            sections,
+            names,
+            symbol_addrs,
+            got_entries,
+            section_offset,
+        ),
         TargetArch::AArch64 => {
             aarch64::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset)
         }
