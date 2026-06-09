@@ -249,8 +249,8 @@ pub fn emit_elf_executable_dynamic(
     phdr_interp[0..4].copy_from_slice(&PT_INTERP.to_le_bytes());
     phdr_interp[4..8].copy_from_slice(&PF_R.to_le_bytes());
     phdr_interp[8..16].copy_from_slice(&interp_file_off.to_le_bytes()); // file offset
-    phdr_interp[16..24].copy_from_slice(&interp_vaddr.to_le_bytes());   // p_vaddr (mapped)
-    phdr_interp[24..32].copy_from_slice(&interp_vaddr.to_le_bytes());   // p_paddr
+    phdr_interp[16..24].copy_from_slice(&interp_vaddr.to_le_bytes()); // p_vaddr (mapped)
+    phdr_interp[24..32].copy_from_slice(&interp_vaddr.to_le_bytes()); // p_paddr
     phdr_interp[32..40].copy_from_slice(&(interp_len as u64).to_le_bytes());
     phdr_interp[40..48].copy_from_slice(&(interp_len as u64).to_le_bytes());
     out.write_all(&phdr_interp)?;
