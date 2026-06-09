@@ -1060,6 +1060,7 @@ pub fn apply_relocations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
     #[test]
     fn test_align_up() {
@@ -1072,8 +1073,6 @@ mod tests {
 
     #[test]
     fn test_merge_ras_object() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_merge_test.o");
 
@@ -1090,8 +1089,6 @@ mod tests {
 
     #[test]
     fn test_merge_and_resolve() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_resolve_test.o");
 
@@ -1110,8 +1107,6 @@ mod tests {
 
     #[test]
     fn test_link_single_object() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_link_test.o");
 
@@ -1129,8 +1124,6 @@ mod tests {
 
     #[test]
     fn test_link_multi_object() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm1 = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let asm2 = ".text\n.globl foo\nfoo:\n  movq $1, %rax\n  ret\n";
         let tmp1 = std::env::temp_dir().join("weld_multi_1.o");
@@ -1162,8 +1155,6 @@ mod tests {
 
     #[test]
     fn test_link_aarch64_object() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm = ".text\n.globl main\nmain:\n  mov x0, #42\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_link_aarch64_test.o");
 

@@ -277,6 +277,7 @@ pub fn emit_elf_executable_dynamic(
 mod tests {
     use super::*;
     use crate::link::{MergedSection, link_single_object};
+    use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
     use std::collections::HashMap;
 
     #[test]
@@ -332,8 +333,6 @@ mod tests {
 
     #[test]
     fn test_link_and_emit() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_emit_test.o");
 
