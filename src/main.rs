@@ -13,10 +13,13 @@ mod object;
 mod platform;
 mod segment;
 
+use crate::arch::TargetArch;
 use crate::cli::{ParseAction, ParsedArgs, parse_args, print_usage};
+use crate::link::macho::link_macho_multi_object;
+use crate::link::{DynamicLinkInfo, LinkResult, MergedSection, link_multi_object};
 use crate::object::{ObjectFormat, load_objects};
 use std::env;
-use std::io::Write;
+use std::io::{Result, Write};
 use std::path::Path;
 
 const ELFOSABI_NONE: u8 = 0;
@@ -59,13 +62,13 @@ fn ad_hoc_codesign(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn ad_hoc_codesign(_path: &Path) -> std::io::Result<()> {
+fn ad_hoc_codesign(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn select_entry(args: &ParsedArgs, result: &link::LinkResult) -> Option<u64> {
+fn select_entry(args: &ParsedArgs, result: &LinkResult) -> Option<u64> {
     if let Some(s) = args.entry.as_ref()
         && let Some(&addr) = result.symbol_addrs.get(s)
     {
@@ -93,7 +96,7 @@ fn select_entry(args: &ParsedArgs, result: &link::LinkResult) -> Option<u64> {
 /// would `ret` into `argc` on the initial stack. The synthetic stub calls `main`
 /// and then issues the `exit` syscall. For dynamic links the PLT/GOT are already
 /// resolved by the interpreter (BIND_NOW) before `_start` runs.
-fn needs_synthetic_start(result: &link::LinkResult) -> bool {
+fn needs_synthetic_start(result: &LinkResult) -> bool {
     !result.symbol_addrs.contains_key("_start")
 }
 
@@ -101,8 +104,8 @@ fn needs_synthetic_start(result: &link::LinkResult) -> bool {
 /// entry address. The stub calls `main`, then issues the `exit` syscall with
 /// `main`'s return value. `freebsd_abi` selects SYS_exit=1 (FreeBSD/Orbis/Prospero)
 /// vs SYS_exit=60 (Linux).
-fn synthesize_elf_start_x86_64(result: &mut link::LinkResult, freebsd_abi: bool) -> Option<u64> {
-    if arch::TargetArch::from_elf_machine(result.e_machine) != Some(arch::TargetArch::X86_64) {
+fn synthesize_elf_start_x86_64(result: &mut LinkResult, freebsd_abi: bool) -> Option<u64> {
+    if TargetArch::from_elf_machine(result.e_machine) != Some(TargetArch::X86_64) {
         return None;
     }
 
@@ -132,7 +135,7 @@ fn synthesize_elf_start_x86_64(result: &mut link::LinkResult, freebsd_abi: bool)
         .layout
         .section_by_name
         .insert(".text.__weld_start".to_string(), idx);
-    result.layout.sections.push(link::MergedSection {
+    result.layout.sections.push(MergedSection {
         name: ".text.__weld_start".to_string(),
         data: code,
         vaddr: start_vaddr,
@@ -154,8 +157,8 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     let target_os = args.target_os.as_deref();
     let os_abi = os_abi_for_target(target_os);
     let freebsd_abi = os_abi == ELFOSABI_FREEBSD;
-    let mut result = link::link_multi_object(&obj_refs, libs).ok()?;
-    let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
+    let mut result = link_multi_object(&obj_refs, libs).ok()?;
+    let arch = TargetArch::from_elf_machine(result.e_machine)?;
     let entry = if needs_synthetic_start(&result) {
         synthesize_elf_start_x86_64(&mut result, freebsd_abi)
             .or_else(|| select_entry(args, &result))?
@@ -192,15 +195,13 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
     } else {
         Some(args.libraries.as_slice())
     };
-    let result =
-        link::macho::link_macho_multi_object(&obj_refs, libs, &dylib_paths, &args.input_files)
-            .ok()?;
-    let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
+    let result = link_macho_multi_object(&obj_refs, libs, &dylib_paths, &args.input_files).ok()?;
+    let arch = TargetArch::from_elf_machine(result.e_machine)?;
     let entry = select_entry(args, &result)?;
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
-    let fallback_dyn = link::DynamicLinkInfo {
+    let fallback_dyn = DynamicLinkInfo {
         needed: vec!["/usr/lib/libSystem.B.dylib".to_string()],
         plt_symbols: Vec::new(),
         weak_plt_symbols: Vec::new(),
@@ -243,7 +244,7 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
     } else {
         Some(args.libraries.as_slice())
     };
-    let result = link::link_multi_object(&obj_refs, libs).ok()?;
+    let result = link_multi_object(&obj_refs, libs).ok()?;
     let entry = select_entry(args, &result)?;
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
     let out_file = std::fs::File::create(out_path).ok()?;
@@ -304,9 +305,9 @@ fn main() {
                             let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
                             let err = match format {
                                 ObjectFormat::Elf => {
-                                    link::link_multi_object(&refs, Some(&args.libraries)).err()
+                                    link_multi_object(&refs, Some(&args.libraries)).err()
                                 }
-                                ObjectFormat::MachO => link::macho::link_macho_multi_object(
+                                ObjectFormat::MachO => link_macho_multi_object(
                                     &refs,
                                     Some(&args.libraries),
                                     &dylib_paths,
@@ -349,7 +350,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::{LinkResult, MergedLayout, MergedSection};
+    use crate::link::MergedLayout;
     use std::collections::HashMap;
 
     fn static_main_result() -> LinkResult {
@@ -407,14 +408,14 @@ mod tests {
         // A dynamic link (libc) with no crt-provided `_start` still needs the
         // synthetic stub, otherwise entering at `main` returns into `argc`.
         let mut result = static_main_result();
-        result.dynamic = Some(link::DynamicLinkInfo::default());
+        result.dynamic = Some(DynamicLinkInfo::default());
         assert!(needs_synthetic_start(&result));
     }
 
     #[test]
     fn no_synthetic_start_for_dynamic_link_with_start() {
         let mut result = static_main_result();
-        result.dynamic = Some(link::DynamicLinkInfo::default());
+        result.dynamic = Some(DynamicLinkInfo::default());
         result.symbol_addrs.insert("_start".to_string(), 0x401000);
         assert!(!needs_synthetic_start(&result));
     }

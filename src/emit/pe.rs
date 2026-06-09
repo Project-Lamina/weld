@@ -8,7 +8,8 @@
 //! - Proper section/file alignment and correct RVA fixups
 
 use crate::link::{DynamicLinkInfo, MergedLayout};
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::io::{Result, Write};
 
 // ---------------------------------------------------------------------------
 // PE constants
@@ -236,7 +237,7 @@ pub fn emit_pe_executable(
     entry: u64,
     dyn_info: Option<&DynamicLinkInfo>,
     out: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     // --- Collect .text and .data bytes from merged layout ---
     let text_data = layout
         .sections
@@ -577,7 +578,7 @@ fn coff_symbol_name(name_bytes: &[u8; 8], strtab: &[u8]) -> String {
 /// Handles `IMAGE_REL_AMD64_REL32` relocations for external symbols by inserting
 /// 6-byte JMP thunks. CRT functions (printf, etc.) are imported from `ucrt.dll`;
 /// Windows API functions are imported from `KERNEL32.DLL`.
-pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> std::io::Result<()> {
+pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<()> {
     // --- Parse COFF file header ---
     let n_sections = coff_read_u16(coff, 2).unwrap_or(0) as usize;
     let sym_table_off = coff_read_u32(coff, 8).unwrap_or(0) as usize;
@@ -615,7 +616,7 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> std::io:
 
     // Build map: symbol_name → index for undefined external symbols
     let undefined_syms: Vec<String> = {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut out_v = Vec::new();
         for (i, name) in sym_names.iter().enumerate() {
             if name.is_empty() {
@@ -638,7 +639,7 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> std::io:
     };
 
     // Map each undefined symbol name to its thunk index
-    let sym_to_thunk: std::collections::HashMap<String, usize> = undefined_syms
+    let sym_to_thunk: HashMap<String, usize> = undefined_syms
         .iter()
         .enumerate()
         .map(|(i, n)| (n.clone(), i))
@@ -789,7 +790,7 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> std::io:
     let dll_sym_counts = vec![k32_syms.len(), ucrt_syms.len()];
 
     // Build a lookup: undefined_sym_name → IAT entry VA (IMAGE_BASE + rdata_rva + offset)
-    let mut sym_iat_va: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut sym_iat_va: HashMap<String, u64> = HashMap::new();
     for (i, name) in k32_syms.iter().enumerate() {
         sym_iat_va.insert(
             name.to_string(),
@@ -921,7 +922,7 @@ fn emit_pe_raw(
     iat_rva: u32,
     idt_size: u32,
     iat_size: u32,
-) -> std::io::Result<()> {
+) -> Result<()> {
     // DOS stub
     let mut dos = [0u8; SIZEOF_DOS_STUB];
     dos[0] = b'M';
@@ -1055,8 +1056,7 @@ fn write_u64_at(buf: &mut [u8], cursor: &mut usize, v: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::{MergedLayout, MergedSection};
-    use std::collections::HashMap;
+    use crate::link::MergedSection;
 
     fn minimal_layout() -> (MergedLayout, u64) {
         // Emit a one-byte .text section.  The entry is the image base + .text RVA.

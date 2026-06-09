@@ -4,7 +4,7 @@
 //! Supports single-object no-libc (ret42-style) initially.
 
 use crate::arch::TargetArch;
-use crate::link::{LinkResult, MergedLayout, MergedSection, ObjectSectionContrib};
+use crate::link::{DynamicLinkInfo, LinkResult, MergedLayout, MergedSection, ObjectSectionContrib};
 use crate::macho::{
     ARM64_RELOC_ADDEND, ARM64_RELOC_BRANCH26, ARM64_RELOC_GOT_LOAD_PAGE21,
     ARM64_RELOC_GOT_LOAD_PAGEOFF12, ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12,
@@ -12,6 +12,7 @@ use crate::macho::{
     Macho64Object, MachoSection, MachoSymbol, parse_macho_relocs, parse_macho64_object,
 };
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 /// Three binary sections emitted when building stub trampolines:
 /// stubs, stub helper, and GOT slots.
@@ -878,8 +879,8 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
 pub fn link_macho_multi_object(
     datas: &[&[u8]],
     libs: Option<&[String]>,
-    dylib_paths: &[std::path::PathBuf],
-    _input_paths: &[std::path::PathBuf],
+    dylib_paths: &[PathBuf],
+    _input_paths: &[PathBuf],
 ) -> Result<LinkResult, String> {
     if datas.is_empty() {
         return Err("no objects to link".to_string());
@@ -1209,7 +1210,7 @@ pub fn link_macho_multi_object(
                 needed.push(s.to_string());
             }
         }
-        Some(crate::link::DynamicLinkInfo {
+        Some(DynamicLinkInfo {
             needed,
             plt_symbols,
             weak_plt_symbols,
