@@ -7,6 +7,7 @@ pub struct ParsedArgs {
     pub libraries: Vec<String>,
     pub emulation: Option<String>,
     pub dynamic_linker: Option<String>,
+    pub target_os: Option<String>,
     pub verbose: bool,
     pub input_files: Vec<PathBuf>,
 }
@@ -28,6 +29,7 @@ pub fn print_usage() {
     eprintln!("  -l <lib>                    Link library (e.g. -lc)");
     eprintln!("  -m <emulation>               Target emulation (e.g. elf_x86_64)");
     eprintln!("  --dynamic-linker <path>     Dynamic linker path");
+    eprintln!("  --target <os>               Target OS (e.g. linux, orbis, prospero, freebsd)");
     eprintln!("  -v, --verbose               Verbose output");
     eprintln!("  -h, --help                  This help");
     eprintln!("  --version                   Print version");
@@ -110,6 +112,10 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "--dynamic-linker" => {
                 let next = take_required_arg(argv, &mut i, "--dynamic-linker")?;
                 args.dynamic_linker = Some(next);
+            }
+            "--target" => {
+                let next = take_required_arg(argv, &mut i, "--target")?;
+                args.target_os = Some(next);
             }
             "-v" | "--verbose" => args.verbose = true,
             "-h" | "--help" => return Ok(ParseAction::Help),

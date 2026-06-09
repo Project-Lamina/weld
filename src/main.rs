@@ -19,6 +19,18 @@ use std::env;
 use std::io::Write;
 use std::path::Path;
 
+const ELFOSABI_NONE: u8 = 0;
+const ELFOSABI_FREEBSD: u8 = 9;
+
+fn os_abi_for_target(target_os: Option<&str>) -> u8 {
+    match target_os {
+        Some("orbis") | Some("ps4") | Some("prospero") | Some("ps5") | Some("freebsd") => {
+            ELFOSABI_FREEBSD
+        }
+        _ => ELFOSABI_NONE,
+    }
+}
+
 #[cfg(unix)]
 fn set_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -86,10 +98,13 @@ fn needs_synthetic_start(result: &link::LinkResult) -> bool {
 }
 
 /// Append a freestanding `_start` to a static x86_64 ELF layout and return its
-/// entry address. The stub calls `main`, then performs the Linux `exit` syscall
-/// with `main`'s return value, so a program that ends in `ret` exits cleanly
-/// without a C runtime.
-fn synthesize_elf_start_x86_64(result: &mut link::LinkResult) -> Option<u64> {
+/// entry address. The stub calls `main`, then issues the `exit` syscall with
+/// `main`'s return value. `freebsd_abi` selects SYS_exit=1 (FreeBSD/Orbis/Prospero)
+/// vs SYS_exit=60 (Linux).
+fn synthesize_elf_start_x86_64(
+    result: &mut link::LinkResult,
+    freebsd_abi: bool,
+) -> Option<u64> {
     if arch::TargetArch::from_elf_machine(result.e_machine) != Some(arch::TargetArch::X86_64) {
         return None;
     }
@@ -103,13 +118,16 @@ fn synthesize_elf_start_x86_64(result: &mut link::LinkResult) -> Option<u64> {
     let last = result.layout.sections.last()?;
     let start_vaddr = (last.vaddr + last.data.len() as u64 + 15) & !15;
 
+    let sys_exit: u32 = if freebsd_abi { 1 } else { 60 };
+
     let mut code = Vec::new();
     code.push(0xe8); // call rel32 -> main
     let call_next = start_vaddr + 5;
     let rel = i32::try_from(main_addr as i64 - call_next as i64).ok()?;
     code.extend_from_slice(&rel.to_le_bytes());
     code.extend_from_slice(&[0x48, 0x89, 0xc7]); // movq %rax, %rdi
-    code.extend_from_slice(&[0xb8, 0x3c, 0x00, 0x00, 0x00]); // movl $60, %eax (SYS_exit)
+    code.push(0xb8); // movl $SYS_exit, %eax
+    code.extend_from_slice(&sys_exit.to_le_bytes());
     code.extend_from_slice(&[0x0f, 0x05]); // syscall
 
     let idx = result.layout.sections.len();
@@ -136,10 +154,14 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     } else {
         Some(args.libraries.as_slice())
     };
+    let target_os = args.target_os.as_deref();
+    let os_abi = os_abi_for_target(target_os);
+    let freebsd_abi = os_abi == ELFOSABI_FREEBSD;
     let mut result = link::link_multi_object(&obj_refs, libs).ok()?;
     let arch = arch::TargetArch::from_elf_machine(result.e_machine)?;
     let entry = if needs_synthetic_start(&result) {
-        synthesize_elf_start_x86_64(&mut result).or_else(|| select_entry(args, &result))?
+        synthesize_elf_start_x86_64(&mut result, freebsd_abi)
+            .or_else(|| select_entry(args, &result))?
     } else {
         select_entry(args, &result)?
     };
@@ -147,10 +169,17 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
     if let Some(ref dyn_info) = result.dynamic {
-        emit::elf::emit_elf_executable_dynamic(&result.layout, arch, entry, dyn_info, &mut out)
-            .ok()?;
+        emit::elf::emit_elf_executable_dynamic(
+            &result.layout,
+            arch,
+            entry,
+            os_abi,
+            dyn_info,
+            &mut out,
+        )
+        .ok()?;
     } else {
-        emit::elf::emit_elf_executable(&result.layout, arch, entry, &mut out).ok()?;
+        emit::elf::emit_elf_executable(&result.layout, arch, entry, os_abi, &mut out).ok()?;
     }
     out.flush().ok()?;
     drop(out);
@@ -358,7 +387,7 @@ mod tests {
         let mut result = static_main_result();
         assert!(needs_synthetic_start(&result));
 
-        let entry = synthesize_elf_start_x86_64(&mut result).expect("start synthesized");
+        let entry = synthesize_elf_start_x86_64(&mut result, false).expect("start synthesized");
         assert!(entry >= 0x400000);
         assert!(result.layout.section_by_name.contains_key(".text.__weld_start"));
 

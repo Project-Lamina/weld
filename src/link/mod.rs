@@ -456,6 +456,51 @@ where
     Ok((resolved, by_index))
 }
 
+/// Collect the names of all symbols referenced by `R_X86_64_GOTPCREL`
+/// relocations in `data`. New names are appended to `out`; duplicates are
+/// skipped.
+fn collect_gotpcrel_symbol_names(
+    data: &[u8],
+    sections: &[SectionHeader],
+    out: &mut Vec<String>,
+) {
+    const SHT_RELA: u32 = 4;
+    let sym_names = match symbol_names_by_index_raw(data, sections) {
+        Some(v) => v,
+        None => return,
+    };
+    for rela_sh in sections.iter().filter(|s| s.sh_type == SHT_RELA) {
+        let Ok(relas) = crate::elf::parse_rela_section(data, rela_sh) else {
+            continue;
+        };
+        for rel in relas {
+            if rel.r_type != crate::elf::reloc_type::R_X86_64_GOTPCREL {
+                continue;
+            }
+            if let Some(name) = sym_names.get(rel.r_sym as usize) {
+                if !name.is_empty() && !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Like `symbol_names_by_index` but returns `None` on parse failure instead
+/// of `Err`, for use in best-effort pre-scans.
+fn symbol_names_by_index_raw(data: &[u8], sections: &[SectionHeader]) -> Option<Vec<String>> {
+    let (symbols, strtab) = parse_symtab_view(data, sections).ok()??;
+    Some(
+        symbols
+            .iter()
+            .map(|sym| {
+                crate::elf::get_strtab_string(strtab, sym.name_offset)
+                    .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset))
+            })
+            .collect(),
+    )
+}
+
 fn symbol_names_by_index(data: &[u8], sections: &[SectionHeader]) -> Result<Vec<String>, String> {
     let Some((symbols, strtab)) = parse_symtab_view(data, sections)? else {
         return Ok(Vec::new());
@@ -511,7 +556,7 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let (resolved, by_index) = resolve_symbols(data, &layout, &sections, &names)?;
     let arch = TargetArch::from_elf_machine(header.e_machine)
         .ok_or_else(|| format!("unsupported machine {}", header.e_machine))?;
-    apply_relocations(arch, &mut layout, data, &sections, &names, &by_index, None)?;
+    apply_relocations(arch, &mut layout, data, &sections, &names, &by_index, &[], None)?;
     let symbol_addrs: HashMap<String, u64> = resolved
         .into_iter()
         .filter_map(|(name, r)| r.address.map(|a| (name, a)))
@@ -765,6 +810,51 @@ fn link_multi_object_parsed(
         }
     }
 
+    // Build .got section for R_X86_64_GOTPCREL relocations.
+    // Pre-scan all objects to find referenced symbol names, assign a GOT slot per
+    // unique name, then fill each slot once global_symbols is final (PLT entries
+    // included). For external symbols without a definition, the slot stays 0.
+    let mut got_symbol_map: HashMap<String, u64> = HashMap::new();
+    if arch == TargetArch::X86_64 {
+        let mut unique_syms: Vec<String> = Vec::new();
+        for obj in parsed.iter() {
+            collect_gotpcrel_symbol_names(&obj.data, &obj.sections, &mut unique_syms);
+        }
+        if !unique_syms.is_empty() {
+            let got_base = {
+                let last = layout.sections.last().ok_or("no sections")?;
+                align_up(last.vaddr + last.data.len() as u64, 8)
+            };
+            let got_data = vec![0u8; unique_syms.len() * 8];
+            layout.sections.push(MergedSection {
+                name: ".got".into(),
+                data: got_data,
+                vaddr: got_base,
+                flags: SHF_ALLOC | SHF_WRITE,
+                align: 8,
+            });
+            layout.section_by_name.insert(".got".into(), layout.sections.len() - 1);
+            for (i, name) in unique_syms.iter().enumerate() {
+                got_symbol_map.insert(name.clone(), got_base + i as u64 * 8);
+            }
+        }
+    }
+
+    // Fill .got entries with resolved addresses (local symbols + PLT stubs for
+    // external functions).
+    if let Some(&got_idx) = layout.section_by_name.get(".got") {
+        let got_base = layout.sections[got_idx].vaddr;
+        for (name, &got_entry_vaddr) in &got_symbol_map {
+            if let Some(&sym_addr) = global_symbols.get(name) {
+                let off = (got_entry_vaddr - got_base) as usize;
+                if off + 8 <= layout.sections[got_idx].data.len() {
+                    layout.sections[got_idx].data[off..off + 8]
+                        .copy_from_slice(&sym_addr.to_le_bytes());
+                }
+            }
+        }
+    }
+
     for (obj_idx, obj) in parsed.iter().enumerate() {
         let obj_contribs = &section_contribs[obj_idx];
         let obj_by_index = &resolved_by_index_per_object[obj_idx];
@@ -781,6 +871,11 @@ fn link_multi_object_parsed(
             by_index.push(resolved_addr);
         }
 
+        let got_by_index: Vec<Option<u64>> = symbol_names
+            .iter()
+            .map(|name| got_symbol_map.get(name).copied())
+            .collect();
+
         let section_off: HashMap<String, u64> = obj_contribs
             .iter()
             .map(|(k, v)| (k.clone(), v.offset_in_merged))
@@ -793,6 +888,7 @@ fn link_multi_object_parsed(
             &obj.sections,
             &obj.names,
             &by_index,
+            &got_by_index,
             Some(&section_off),
         )?;
     }
@@ -945,11 +1041,12 @@ pub fn apply_relocations(
     sections: &[SectionHeader],
     names: &[String],
     symbol_addrs: &[Option<u64>],
+    got_entries: &[Option<u64>],
     section_offset: Option<&HashMap<String, u64>>,
 ) -> Result<(), String> {
     match arch {
         TargetArch::X86_64 => {
-            x86_64::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset)
+            x86_64::apply_relocations(layout, data, sections, names, symbol_addrs, got_entries, section_offset)
         }
         TargetArch::AArch64 => {
             aarch64::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset)

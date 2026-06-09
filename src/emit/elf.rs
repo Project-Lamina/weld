@@ -70,6 +70,7 @@ pub fn emit_elf_executable(
     layout: &MergedLayout,
     arch: TargetArch,
     entry: u64,
+    os_abi: u8,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
     let (base, seg_buffer) = build_segment_buffer(layout, arch.default_load_base());
@@ -86,6 +87,7 @@ pub fn emit_elf_executable(
     ehdr[4] = ELFCLASS64;
     ehdr[5] = ELFDATA2LSB;
     ehdr[6] = EV_CURRENT;
+    ehdr[7] = os_abi;
     ehdr[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
     ehdr[18..20].copy_from_slice(&arch.to_elf_machine().to_le_bytes());
     ehdr[20..24].copy_from_slice(&EV_CURRENT_U32.to_le_bytes());
@@ -137,6 +139,7 @@ pub fn emit_elf_executable_dynamic(
     layout: &MergedLayout,
     arch: TargetArch,
     entry: u64,
+    os_abi: u8,
     dynamic: &DynamicLinkInfo,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
@@ -175,6 +178,7 @@ pub fn emit_elf_executable_dynamic(
     ehdr[4] = ELFCLASS64;
     ehdr[5] = ELFDATA2LSB;
     ehdr[6] = EV_CURRENT;
+    ehdr[7] = os_abi;
     ehdr[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
     ehdr[18..20].copy_from_slice(&arch.to_elf_machine().to_le_bytes());
     ehdr[20..24].copy_from_slice(&EV_CURRENT_U32.to_le_bytes());
@@ -293,7 +297,7 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        emit_elf_executable(&layout, TargetArch::X86_64, 0x400000, &mut out).expect("emit");
+        emit_elf_executable(&layout, TargetArch::X86_64, 0x400000, 0, &mut out).expect("emit");
 
         assert!(out.len() >= 64);
         assert_eq!(&out[0..4], &[0x7f, b'E', b'L', b'F']);
@@ -320,7 +324,7 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        emit_elf_executable(&layout, TargetArch::AArch64, 0x400000, &mut out).expect("emit");
+        emit_elf_executable(&layout, TargetArch::AArch64, 0x400000, 0, &mut out).expect("emit");
         assert!(out.len() >= 64);
         assert_eq!(&out[0..4], &[0x7f, b'E', b'L', b'F']);
         assert_eq!(out[18..20], 183u16.to_le_bytes());
@@ -349,7 +353,7 @@ mod tests {
             .unwrap_or_else(|| result.layout.sections.first().map(|s| s.vaddr).unwrap());
 
         let mut out = Vec::new();
-        emit_elf_executable(&result.layout, arch, entry, &mut out).expect("emit");
+        emit_elf_executable(&result.layout, arch, entry, 0, &mut out).expect("emit");
 
         assert!(out.len() >= 64);
         assert_eq!(&out[0..4], &[0x7f, b'E', b'L', b'F']);
