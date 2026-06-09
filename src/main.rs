@@ -101,10 +101,7 @@ fn needs_synthetic_start(result: &link::LinkResult) -> bool {
 /// entry address. The stub calls `main`, then issues the `exit` syscall with
 /// `main`'s return value. `freebsd_abi` selects SYS_exit=1 (FreeBSD/Orbis/Prospero)
 /// vs SYS_exit=60 (Linux).
-fn synthesize_elf_start_x86_64(
-    result: &mut link::LinkResult,
-    freebsd_abi: bool,
-) -> Option<u64> {
+fn synthesize_elf_start_x86_64(result: &mut link::LinkResult, freebsd_abi: bool) -> Option<u64> {
     if arch::TargetArch::from_elf_machine(result.e_machine) != Some(arch::TargetArch::X86_64) {
         return None;
     }
@@ -303,24 +300,19 @@ fn main() {
                 }
                 None => {
                     if args.verbose {
-                        if let Some((format, data, dylib_paths)) =
-                            load_objects(&args.input_files)
-                        {
+                        if let Some((format, data, dylib_paths)) = load_objects(&args.input_files) {
                             let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
                             let err = match format {
                                 ObjectFormat::Elf => {
-                                    link::link_multi_object(&refs, Some(&args.libraries))
-                                        .err()
+                                    link::link_multi_object(&refs, Some(&args.libraries)).err()
                                 }
-                                ObjectFormat::MachO => {
-                                    link::macho::link_macho_multi_object(
-                                        &refs,
-                                        Some(&args.libraries),
-                                        &dylib_paths,
-                                        &args.input_files,
-                                    )
-                                    .err()
-                                }
+                                ObjectFormat::MachO => link::macho::link_macho_multi_object(
+                                    &refs,
+                                    Some(&args.libraries),
+                                    &dylib_paths,
+                                    &args.input_files,
+                                )
+                                .err(),
                                 ObjectFormat::Coff => {
                                     Some("COFF/PE linking not yet implemented".to_string())
                                 }
@@ -389,7 +381,12 @@ mod tests {
 
         let entry = synthesize_elf_start_x86_64(&mut result, false).expect("start synthesized");
         assert!(entry >= 0x400000);
-        assert!(result.layout.section_by_name.contains_key(".text.__weld_start"));
+        assert!(
+            result
+                .layout
+                .section_by_name
+                .contains_key(".text.__weld_start")
+        );
 
         let start = &result.layout.sections[result.layout.sections.len() - 1];
         // call rel32 (5) + mov %rax,%rdi (3) + mov $60,%eax (5) + syscall (2).
