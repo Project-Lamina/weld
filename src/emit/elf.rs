@@ -7,7 +7,7 @@
 use crate::arch::TargetArch;
 use crate::link::{DynamicLinkInfo, MergedLayout};
 use crate::segment::{align_up_u64, build_segment_buffer};
-use std::io::Write;
+use std::io::{Error, ErrorKind, Result, Write};
 
 const EI_MAG0: u8 = 0x7f;
 const EI_MAG1: u8 = b'E';
@@ -72,7 +72,7 @@ pub fn emit_elf_executable(
     entry: u64,
     os_abi: u8,
     out: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     let (base, seg_buffer) = build_segment_buffer(layout, arch.default_load_base());
     let seg_size = seg_buffer.len() as u64;
     let seg_align = arch.page_align();
@@ -142,11 +142,11 @@ pub fn emit_elf_executable_dynamic(
     os_abi: u8,
     dynamic: &DynamicLinkInfo,
     out: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     let interpreter = dynamic
         .interpreter
         .as_ref()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no interpreter"))?;
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no interpreter"))?;
     let interp_bytes = format!("{}\0", interpreter);
     let interp_len = interp_bytes.len();
 
@@ -170,7 +170,7 @@ pub fn emit_elf_executable_dynamic(
         .get(".dynamic")
         .and_then(|&i| layout.sections.get(i))
         .map(|s| s.vaddr)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no .dynamic"))?;
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no .dynamic"))?;
     let dynamic_offset = seg_start + (dynamic_vaddr - base);
 
     let mut ehdr = [0u8; 64];
@@ -249,8 +249,8 @@ pub fn emit_elf_executable_dynamic(
     phdr_interp[0..4].copy_from_slice(&PT_INTERP.to_le_bytes());
     phdr_interp[4..8].copy_from_slice(&PF_R.to_le_bytes());
     phdr_interp[8..16].copy_from_slice(&interp_file_off.to_le_bytes()); // file offset
-    phdr_interp[16..24].copy_from_slice(&interp_vaddr.to_le_bytes());   // p_vaddr (mapped)
-    phdr_interp[24..32].copy_from_slice(&interp_vaddr.to_le_bytes());   // p_paddr
+    phdr_interp[16..24].copy_from_slice(&interp_vaddr.to_le_bytes()); // p_vaddr (mapped)
+    phdr_interp[24..32].copy_from_slice(&interp_vaddr.to_le_bytes()); // p_paddr
     phdr_interp[32..40].copy_from_slice(&(interp_len as u64).to_le_bytes());
     phdr_interp[40..48].copy_from_slice(&(interp_len as u64).to_le_bytes());
     out.write_all(&phdr_interp)?;
@@ -277,6 +277,7 @@ pub fn emit_elf_executable_dynamic(
 mod tests {
     use super::*;
     use crate::link::{MergedSection, link_single_object};
+    use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
     use std::collections::HashMap;
 
     #[test]
@@ -332,8 +333,6 @@ mod tests {
 
     #[test]
     fn test_link_and_emit() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_emit_test.o");
 

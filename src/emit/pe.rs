@@ -8,7 +8,8 @@
 //! - Proper section/file alignment and correct RVA fixups
 
 use crate::link::{DynamicLinkInfo, MergedLayout};
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::io::{Result, Write};
 
 // ---------------------------------------------------------------------------
 // PE constants
@@ -236,7 +237,7 @@ pub fn emit_pe_executable(
     entry: u64,
     dyn_info: Option<&DynamicLinkInfo>,
     out: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     // --- Collect .text and .data bytes from merged layout ---
     let text_data = layout
         .sections
@@ -522,11 +523,25 @@ const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
 fn is_kernel32_symbol(name: &str) -> bool {
     matches!(
         name,
-        "ExitProcess" | "GetStdHandle" | "WriteFile" | "WriteConsoleA" | "WriteConsoleW"
-            | "ReadFile" | "CloseHandle" | "CreateFileA" | "CreateFileW"
-            | "VirtualAlloc" | "VirtualFree" | "GetLastError" | "SetLastError"
-            | "LoadLibraryA" | "GetProcAddress" | "FreeLibrary"
-            | "HeapAlloc" | "HeapFree" | "GetProcessHeap"
+        "ExitProcess"
+            | "GetStdHandle"
+            | "WriteFile"
+            | "WriteConsoleA"
+            | "WriteConsoleW"
+            | "ReadFile"
+            | "CloseHandle"
+            | "CreateFileA"
+            | "CreateFileW"
+            | "VirtualAlloc"
+            | "VirtualFree"
+            | "GetLastError"
+            | "SetLastError"
+            | "LoadLibraryA"
+            | "GetProcAddress"
+            | "FreeLibrary"
+            | "HeapAlloc"
+            | "HeapFree"
+            | "GetProcessHeap"
     )
 }
 
@@ -563,10 +578,7 @@ fn coff_symbol_name(name_bytes: &[u8; 8], strtab: &[u8]) -> String {
 /// Handles `IMAGE_REL_AMD64_REL32` relocations for external symbols by inserting
 /// 6-byte JMP thunks. CRT functions (printf, etc.) are imported from `ucrt.dll`;
 /// Windows API functions are imported from `KERNEL32.DLL`.
-pub fn link_and_emit_pe_from_coff(
-    coff: &[u8],
-    out: &mut impl Write,
-) -> std::io::Result<()> {
+pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<()> {
     // --- Parse COFF file header ---
     let n_sections = coff_read_u16(coff, 2).unwrap_or(0) as usize;
     let sym_table_off = coff_read_u32(coff, 8).unwrap_or(0) as usize;
@@ -604,7 +616,7 @@ pub fn link_and_emit_pe_from_coff(
 
     // Build map: symbol_name → index for undefined external symbols
     let undefined_syms: Vec<String> = {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut out_v = Vec::new();
         for (i, name) in sym_names.iter().enumerate() {
             if name.is_empty() {
@@ -627,7 +639,7 @@ pub fn link_and_emit_pe_from_coff(
     };
 
     // Map each undefined symbol name to its thunk index
-    let sym_to_thunk: std::collections::HashMap<String, usize> = undefined_syms
+    let sym_to_thunk: HashMap<String, usize> = undefined_syms
         .iter()
         .enumerate()
         .map(|(i, n)| (n.clone(), i))
@@ -707,7 +719,8 @@ pub fn link_and_emit_pe_from_coff(
     // Compute IAT offset within rdata.
     // Import section layout: IDT + ILT + IAT + hint/name + dll_names
     // For 1 or 2 DLLs (kernel32 + ucrt), we need to know the counts.
-    let kernel32_syms: Vec<&str> = undefined_syms.iter()
+    let kernel32_syms: Vec<&str> = undefined_syms
+        .iter()
         .filter(|n| is_kernel32_symbol(n))
         .map(|n| n.as_str())
         .collect();
@@ -722,7 +735,8 @@ pub fn link_and_emit_pe_from_coff(
     };
     k32_syms.dedup();
 
-    let ucrt_syms: Vec<&str> = undefined_syms.iter()
+    let ucrt_syms: Vec<&str> = undefined_syms
+        .iter()
         .filter(|n| !is_kernel32_symbol(n))
         .map(|n| n.as_str())
         .collect();
@@ -759,7 +773,8 @@ pub fn link_and_emit_pe_from_coff(
     // For simplicity, recompute using the iat_rel_off we have.
     // Within the IAT region, entries are ordered: k32_syms (with null), then ucrt_syms (with null).
     fn iat_entry_va(
-        rdata_vaddr: u64, iat_rel_off: u32,
+        rdata_vaddr: u64,
+        iat_rel_off: u32,
         dll_idx: usize,
         sym_idx_in_dll: usize,
         dll_sym_counts: &[usize],
@@ -775,17 +790,29 @@ pub fn link_and_emit_pe_from_coff(
     let dll_sym_counts = vec![k32_syms.len(), ucrt_syms.len()];
 
     // Build a lookup: undefined_sym_name → IAT entry VA (IMAGE_BASE + rdata_rva + offset)
-    let mut sym_iat_va: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut sym_iat_va: HashMap<String, u64> = HashMap::new();
     for (i, name) in k32_syms.iter().enumerate() {
         sym_iat_va.insert(
             name.to_string(),
-            iat_entry_va(IMAGE_BASE + rdata_rva as u64, iat_rel_off, 0, i, &dll_sym_counts),
+            iat_entry_va(
+                IMAGE_BASE + rdata_rva as u64,
+                iat_rel_off,
+                0,
+                i,
+                &dll_sym_counts,
+            ),
         );
     }
     for (i, name) in ucrt_syms.iter().enumerate() {
         sym_iat_va.insert(
             name.to_string(),
-            iat_entry_va(IMAGE_BASE + rdata_rva as u64, iat_rel_off, 1, i, &dll_sym_counts),
+            iat_entry_va(
+                IMAGE_BASE + rdata_rva as u64,
+                iat_rel_off,
+                1,
+                i,
+                &dll_sym_counts,
+            ),
         );
     }
 
@@ -807,7 +834,10 @@ pub fn link_and_emit_pe_from_coff(
         if *rel_type != IMAGE_REL_AMD64_REL32 {
             continue;
         }
-        let sym_name = sym_names.get(*sym_idx as usize).map(|s| s.as_str()).unwrap_or("");
+        let sym_name = sym_names
+            .get(*sym_idx as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         if sym_name.is_empty() {
             continue;
         }
@@ -892,7 +922,7 @@ fn emit_pe_raw(
     iat_rva: u32,
     idt_size: u32,
     iat_size: u32,
-) -> std::io::Result<()> {
+) -> Result<()> {
     // DOS stub
     let mut dos = [0u8; SIZEOF_DOS_STUB];
     dos[0] = b'M';
@@ -920,7 +950,7 @@ fn emit_pe_raw(
     let text_rva = sec_rvas[0];
     write_u16(&mut opt, 0, IMAGE_OPTIONAL_HDR64_MAGIC);
     write_u32_at_off(&mut opt, 16, entry_rva); // AddressOfEntryPoint
-    write_u32_at_off(&mut opt, 20, text_rva);  // BaseOfCode
+    write_u32_at_off(&mut opt, 20, text_rva); // BaseOfCode
     write_u64_at_off(&mut opt, 24, IMAGE_BASE);
     write_u32_at_off(&mut opt, 32, SECTION_ALIGN as u32);
     write_u32_at_off(&mut opt, 36, FILE_ALIGN as u32);
@@ -935,16 +965,16 @@ fn emit_pe_raw(
         | IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE;
     write_u16_at_off(&mut opt, 70, dll_chars);
     write_u64_at_off(&mut opt, 72, 0x100000); // SizeOfStackReserve
-    write_u64_at_off(&mut opt, 80, 0x1000);   // SizeOfStackCommit
+    write_u64_at_off(&mut opt, 80, 0x1000); // SizeOfStackCommit
     write_u64_at_off(&mut opt, 88, 0x100000); // SizeOfHeapReserve
-    write_u64_at_off(&mut opt, 96, 0x1000);   // SizeOfHeapCommit
+    write_u64_at_off(&mut opt, 96, 0x1000); // SizeOfHeapCommit
     write_u32_at_off(&mut opt, 108, NUM_DATA_DIRS); // NumberOfRvaAndSizes
     // Data directories start at offset 112. Each entry is 8 bytes (RVA + Size).
     // Index 1 = Import Directory Table, index 12 = Import Address Table.
-    write_u32_at_off(&mut opt, 112 + 8,     import_dir_rva); // [1].VirtualAddress
-    write_u32_at_off(&mut opt, 112 + 8 + 4, idt_size);       // [1].Size
-    write_u32_at_off(&mut opt, 112 + 12 * 8,    iat_rva);         // [12].VirtualAddress
-    write_u32_at_off(&mut opt, 112 + 12 * 8 + 4, iat_size);      // [12].Size
+    write_u32_at_off(&mut opt, 112 + 8, import_dir_rva); // [1].VirtualAddress
+    write_u32_at_off(&mut opt, 112 + 8 + 4, idt_size); // [1].Size
+    write_u32_at_off(&mut opt, 112 + 12 * 8, iat_rva); // [12].VirtualAddress
+    write_u32_at_off(&mut opt, 112 + 12 * 8 + 4, iat_size); // [12].Size
     out.write_all(&opt)?;
 
     // Section headers
@@ -1026,8 +1056,7 @@ fn write_u64_at(buf: &mut [u8], cursor: &mut usize, v: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::{MergedLayout, MergedSection};
-    use std::collections::HashMap;
+    use crate::link::MergedSection;
 
     fn minimal_layout() -> (MergedLayout, u64) {
         // Emit a one-byte .text section.  The entry is the image base + .text RVA.

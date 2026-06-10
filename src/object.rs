@@ -1,3 +1,6 @@
+use crate::elf::{get_strtab_from_section, get_strtab_string, parse_elf64_slice, parse_symtab};
+use crate::macho::{is_macho_dylib, is_macho64, parse_macho64_object};
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::thread;
@@ -251,26 +254,22 @@ fn read_elf(path: &PathBuf) -> Option<Vec<u8>> {
 #[allow(dead_code)]
 fn read_macho(path: &PathBuf) -> Option<Vec<u8>> {
     let data = normalize_macho_container(std::fs::read(path).ok()?);
-    if crate::macho::is_macho64(&data) {
-        Some(data)
-    } else {
-        None
-    }
+    if is_macho64(&data) { Some(data) } else { None }
 }
 
 fn collect_elf_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
-    let (_header, sections, _names) = crate::elf::parse_elf64_slice(data).ok()?;
+    let (_header, sections, _names) = parse_elf64_slice(data).ok()?;
     let mut summary = ObjectSymbolSummary::default();
 
     for symtab_sh in sections.iter().filter(|sh| sh.sh_type == SHT_SYMTAB) {
         let strtab_sh = sections.get(symtab_sh.sh_link as usize)?;
-        let strtab = crate::elf::get_strtab_from_section(data, strtab_sh);
-        let symbols = crate::elf::parse_symtab(data, symtab_sh).ok()?;
+        let strtab = get_strtab_from_section(data, strtab_sh);
+        let symbols = parse_symtab(data, symtab_sh).ok()?;
         for sym in symbols {
             if sym.bind != STB_GLOBAL && sym.bind != STB_WEAK {
                 continue;
             }
-            let name = crate::elf::get_strtab_string(strtab, sym.name_offset)?;
+            let name = get_strtab_string(strtab, sym.name_offset)?;
             if name.is_empty() {
                 continue;
             }
@@ -292,7 +291,7 @@ fn collect_elf_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
 }
 
 fn collect_macho_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
-    let obj = crate::macho::parse_macho64_object(data).ok()?;
+    let obj = parse_macho64_object(data).ok()?;
     let mut summary = ObjectSymbolSummary::default();
 
     for sym in obj.symbols {
@@ -318,7 +317,7 @@ fn collect_macho_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
 fn collect_object_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
     if is_elf(data) {
         collect_elf_symbol_summary(data)
-    } else if crate::macho::is_macho64(data) {
+    } else if is_macho64(data) {
         collect_macho_symbol_summary(data)
     } else if is_coff(data) {
         collect_coff_symbol_summary(data)
@@ -376,9 +375,7 @@ fn extract_ar_members(data: &[u8]) -> Vec<ArchiveMember> {
             if !name.is_empty()
                 && name != "/"
                 && name != "//"
-                && (is_elf(&normalized)
-                    || crate::macho::is_macho64(&normalized)
-                    || is_coff(&normalized))
+                && (is_elf(&normalized) || is_macho64(&normalized) || is_coff(&normalized))
             {
                 let symbols = collect_object_symbol_summary(&normalized).unwrap_or_default();
                 out.push(ArchiveMember {
@@ -404,7 +401,7 @@ pub enum ObjectFormat {
 }
 
 fn expand_data_to_objects(data: Vec<u8>) -> Option<Vec<Vec<u8>>> {
-    if is_elf(&data) || crate::macho::is_macho64(&data) || is_coff(&data) {
+    if is_elf(&data) || is_macho64(&data) || is_coff(&data) {
         Some(vec![data])
     } else {
         None
@@ -424,7 +421,7 @@ pub fn load_objects(paths: &[PathBuf]) -> Option<(ObjectFormat, Vec<Vec<u8>>, Ve
 
     for path in paths {
         let data = normalize_macho_container(std::fs::read(path).ok()?);
-        if crate::macho::is_macho_dylib(&data) {
+        if is_macho_dylib(&data) {
             dylib_paths.push(path.clone());
             continue;
         }
@@ -508,7 +505,7 @@ pub fn load_objects(paths: &[PathBuf]) -> Option<(ObjectFormat, Vec<Vec<u8>>, Ve
     let first = all_objects.first()?;
     let format = if is_elf(first) {
         ObjectFormat::Elf
-    } else if crate::macho::is_macho64(first) {
+    } else if is_macho64(first) {
         ObjectFormat::MachO
     } else if is_coff(first) {
         ObjectFormat::Coff
@@ -518,7 +515,7 @@ pub fn load_objects(paths: &[PathBuf]) -> Option<(ObjectFormat, Vec<Vec<u8>>, Ve
     for obj in &all_objects {
         let ok = match format {
             ObjectFormat::Elf => is_elf(obj),
-            ObjectFormat::MachO => crate::macho::is_macho64(obj),
+            ObjectFormat::MachO => is_macho64(obj),
             ObjectFormat::Coff => is_coff(obj),
         };
         if !ok {
