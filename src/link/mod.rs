@@ -477,10 +477,11 @@ fn collect_gotpcrel_symbol_names(
             if rel.r_type != crate::elf::reloc_type::R_X86_64_GOTPCREL {
                 continue;
             }
-            if let Some(name) = sym_names.get(rel.r_sym as usize) {
-                if !name.is_empty() && !out.contains(name) {
-                    out.push(name.clone());
-                }
+            if let Some(name) = sym_names.get(rel.r_sym as usize)
+                && !name.is_empty()
+                && !out.contains(name)
+            {
+                out.push(name.clone());
             }
         }
     }
