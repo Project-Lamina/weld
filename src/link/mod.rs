@@ -16,7 +16,10 @@ mod x86_64;
 pub use resolver::LibraryResolver;
 
 use crate::arch::TargetArch;
-use crate::elf::{Elf64Header, SectionHeader, Symbol, parse_elf64_slice, parse_symtab};
+use crate::elf::{
+    Elf64Header, SectionHeader, Symbol, get_strtab_from_section, get_strtab_string,
+    parse_elf64_slice, parse_rela_section, parse_symtab,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::thread;
@@ -398,7 +401,7 @@ fn parse_symtab_view<'a>(
 
     let strtab_idx = symtab_sh.sh_link as usize;
     let strtab_sh = sections.get(strtab_idx).ok_or("symtab sh_link invalid")?;
-    let strtab = crate::elf::get_strtab_from_section(data, strtab_sh);
+    let strtab = get_strtab_from_section(data, strtab_sh);
     let symbols = parse_symtab(data, symtab_sh)?;
 
     Ok(Some((symbols, strtab)))
@@ -422,7 +425,7 @@ where
     let mut by_index: Vec<Option<u64>> = Vec::with_capacity(symbols.len());
 
     for sym in &symbols {
-        let name = crate::elf::get_strtab_string(strtab, sym.name_offset)
+        let name = get_strtab_string(strtab, sym.name_offset)
             .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset));
 
         let (address, is_defined) = match sym.st_shndx {
@@ -459,29 +462,24 @@ where
 /// Collect the names of all symbols referenced by `R_X86_64_GOTPCREL`
 /// relocations in `data`. New names are appended to `out`; duplicates are
 /// skipped.
-fn collect_gotpcrel_symbol_names(
-    data: &[u8],
-    sections: &[SectionHeader],
-    out: &mut Vec<String>,
-) {
+fn collect_gotpcrel_symbol_names(data: &[u8], sections: &[SectionHeader], out: &mut Vec<String>) {
     const SHT_RELA: u32 = 4;
     let sym_names = match symbol_names_by_index_raw(data, sections) {
         Some(v) => v,
         None => return,
     };
     for rela_sh in sections.iter().filter(|s| s.sh_type == SHT_RELA) {
-        let Ok(relas) = crate::elf::parse_rela_section(data, rela_sh) else {
+        let Ok(relas) = parse_rela_section(data, rela_sh) else {
             continue;
         };
         for rel in relas {
             if rel.r_type != crate::elf::reloc_type::R_X86_64_GOTPCREL {
                 continue;
             }
-            if let Some(name) = sym_names.get(rel.r_sym as usize)
-                && !name.is_empty()
-                && !out.contains(name)
-            {
-                out.push(name.clone());
+            if let Some(name) = sym_names.get(rel.r_sym as usize) {
+                if !name.is_empty() && !out.contains(name) {
+                    out.push(name.clone());
+                }
             }
         }
     }
@@ -495,7 +493,7 @@ fn symbol_names_by_index_raw(data: &[u8], sections: &[SectionHeader]) -> Option<
         symbols
             .iter()
             .map(|sym| {
-                crate::elf::get_strtab_string(strtab, sym.name_offset)
+                get_strtab_string(strtab, sym.name_offset)
                     .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset))
             })
             .collect(),
@@ -510,7 +508,7 @@ fn symbol_names_by_index(data: &[u8], sections: &[SectionHeader]) -> Result<Vec<
     Ok(symbols
         .iter()
         .map(|sym| {
-            crate::elf::get_strtab_string(strtab, sym.name_offset)
+            get_strtab_string(strtab, sym.name_offset)
                 .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset))
         })
         .collect())
@@ -557,7 +555,16 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let (resolved, by_index) = resolve_symbols(data, &layout, &sections, &names)?;
     let arch = TargetArch::from_elf_machine(header.e_machine)
         .ok_or_else(|| format!("unsupported machine {}", header.e_machine))?;
-    apply_relocations(arch, &mut layout, data, &sections, &names, &by_index, &[], None)?;
+    apply_relocations(
+        arch,
+        &mut layout,
+        data,
+        &sections,
+        &names,
+        &by_index,
+        &[],
+        None,
+    )?;
     let symbol_addrs: HashMap<String, u64> = resolved
         .into_iter()
         .filter_map(|(name, r)| r.address.map(|a| (name, a)))
@@ -834,7 +841,9 @@ fn link_multi_object_parsed(
                 flags: SHF_ALLOC | SHF_WRITE,
                 align: 8,
             });
-            layout.section_by_name.insert(".got".into(), layout.sections.len() - 1);
+            layout
+                .section_by_name
+                .insert(".got".into(), layout.sections.len() - 1);
             for (i, name) in unique_syms.iter().enumerate() {
                 got_symbol_map.insert(name.clone(), got_base + i as u64 * 8);
             }
@@ -1046,9 +1055,15 @@ pub fn apply_relocations(
     section_offset: Option<&HashMap<String, u64>>,
 ) -> Result<(), String> {
     match arch {
-        TargetArch::X86_64 => {
-            x86_64::apply_relocations(layout, data, sections, names, symbol_addrs, got_entries, section_offset)
-        }
+        TargetArch::X86_64 => x86_64::apply_relocations(
+            layout,
+            data,
+            sections,
+            names,
+            symbol_addrs,
+            got_entries,
+            section_offset,
+        ),
         TargetArch::AArch64 => {
             aarch64::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset)
         }
@@ -1061,6 +1076,7 @@ pub fn apply_relocations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
     #[test]
     fn test_align_up() {
@@ -1073,8 +1089,6 @@ mod tests {
 
     #[test]
     fn test_merge_ras_object() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_merge_test.o");
 
@@ -1091,8 +1105,6 @@ mod tests {
 
     #[test]
     fn test_merge_and_resolve() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_resolve_test.o");
 
@@ -1111,8 +1123,6 @@ mod tests {
 
     #[test]
     fn test_link_single_object() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_link_test.o");
 
@@ -1130,8 +1140,6 @@ mod tests {
 
     #[test]
     fn test_link_multi_object() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm1 = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
         let asm2 = ".text\n.globl foo\nfoo:\n  movq $1, %rax\n  ret\n";
         let tmp1 = std::env::temp_dir().join("weld_multi_1.o");
@@ -1163,8 +1171,6 @@ mod tests {
 
     #[test]
     fn test_link_aarch64_object() {
-        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-
         let asm = ".text\n.globl main\nmain:\n  mov x0, #42\n  ret\n";
         let tmp = std::env::temp_dir().join("weld_link_aarch64_test.o");
 
