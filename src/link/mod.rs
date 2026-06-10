@@ -20,6 +20,8 @@ use crate::elf::{
     Elf64Header, SectionHeader, Symbol, get_strtab_from_section, get_strtab_string,
     parse_elf64_slice, parse_rela_section, parse_symtab,
 };
+use crate::elf::reloc_type::R_X86_64_GOTPCREL;
+use crate::platform::TargetPlatform;
 use std::collections::HashMap;
 use std::path::Path;
 use std::thread;
@@ -473,7 +475,7 @@ fn collect_gotpcrel_symbol_names(data: &[u8], sections: &[SectionHeader], out: &
             continue;
         };
         for rel in relas {
-            if rel.r_type != crate::elf::reloc_type::R_X86_64_GOTPCREL {
+            if rel.r_type != R_X86_64_GOTPCREL {
                 continue;
             }
             if let Some(name) = sym_names.get(rel.r_sym as usize) {
@@ -643,7 +645,7 @@ fn link_multi_object_parsed(
     // Resolve library names to sonames.  Any lib matching "c" or "System"
     // (legacy names) as well as any library the resolver can locate as a
     // shared object triggers PLT generation.
-    let resolver = LibraryResolver::new(arch, crate::platform::TargetPlatform::current());
+    let resolver = LibraryResolver::new(arch, TargetPlatform::current());
     let has_shared_lib = libs
         .map(|l| {
             l.iter().any(|x| {
