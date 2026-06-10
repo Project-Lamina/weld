@@ -139,7 +139,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParseAction, parse_args};
+    use super::*;
 
     #[test]
     fn parses_clang_macos_linker_flags_without_treating_versions_as_inputs() {
