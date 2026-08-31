@@ -37,7 +37,7 @@ type ResolvedSymbols = (HashMap<String, ResolvedSymbol>, Vec<Option<u64>>);
 
 /// Four binary blobs produced when building ELF dynamic sections:
 /// `.dynsym`, `.dynstr`, `.rela.plt`, and `.hash` (SysV DT_HASH).
-type DynSectionQuad = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+type DynSections = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u32>);
 
 /// Standard SysV ELF hash function (used by DT_HASH).
 fn elf_hash(name: &[u8]) -> u32 {
@@ -752,8 +752,25 @@ fn link_multi_object_parsed(
             let got_plt_size = 24 + (undefined.len() as u64) * 8;
             vaddr = align_up(got_plt_vaddr + got_plt_size, 8);
 
-            let (dynsym_data, dynstr_data, rela_plt_data, hash_data) =
-                build_dynamic_sections(&undefined, got_plt_vaddr)?;
+            let needed: Vec<String> = libs
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|name| {
+                    if name == "System" {
+                        // macOS compatibility alias — not meaningful for ELF.
+                        return None;
+                    }
+                    Some(
+                        resolver
+                            .resolve(name)
+                            .map(|r| r.soname)
+                            .unwrap_or_else(|| resolver.expected_soname(name)),
+                    )
+                })
+                .collect();
+
+            let (dynsym_data, dynstr_data, rela_plt_data, hash_data, needed_offsets) =
+                build_dynamic_sections(&undefined, got_plt_vaddr, &needed)?;
             let dynsym_vaddr = vaddr;
             let dynsym_size = dynsym_data.len() as u64;
             layout.sections.push(MergedSection {
@@ -811,13 +828,16 @@ fn link_multi_object_parsed(
             vaddr = align_up(vaddr + hash_size, 8);
 
             let dynamic_data = build_dynamic_section_content(
-                got_plt_vaddr,
-                dynsym_vaddr,
-                dynstr_vaddr,
-                dynstr_size,
-                rela_plt_vaddr,
-                rela_plt_size,
-                hash_vaddr,
+                &DynamicAddrs {
+                    got_plt_vaddr,
+                    dynsym_vaddr,
+                    dynstr_vaddr,
+                    dynstr_size,
+                    rela_plt_vaddr,
+                    rela_plt_size,
+                    hash_vaddr,
+                },
+                &needed_offsets,
             )?;
             let dynamic_vaddr = vaddr;
             layout.sections.push(MergedSection {
@@ -844,24 +864,8 @@ fn link_multi_object_parsed(
                 .unwrap_or_else(|| "/lib64/ld-linux-x86-64.so.2".to_string());
             // Build DT_NEEDED entries from the requested libraries, resolving
             // each name to its real soname via LibraryResolver.
-            let needed: Vec<String> = libs
-                .unwrap_or(&[])
-                .iter()
-                .filter_map(|name| {
-                    if name == "System" {
-                        // macOS compatibility alias — not meaningful for ELF.
-                        return None;
-                    }
-                    Some(
-                        resolver
-                            .resolve(name)
-                            .map(|r| r.soname)
-                            .unwrap_or_else(|| resolver.expected_soname(name)),
-                    )
-                })
-                .collect();
             dynamic_info = Some(DynamicLinkInfo {
-                needed,
+                needed: needed.clone(),
                 plt_symbols: undefined,
                 weak_plt_symbols: Vec::new(),
                 interpreter: Some(interpreter),
@@ -972,9 +976,15 @@ fn link_multi_object_parsed(
 fn build_dynamic_sections(
     plt_symbols: &[String],
     got_plt_vaddr: u64,
-) -> Result<DynSectionQuad, String> {
+    needed: &[String],
+) -> Result<DynSections, String> {
     let mut dynstr = vec![0u8];
-    dynstr.extend_from_slice(b"libc.so.6\0");
+    let mut needed_offsets: Vec<u32> = Vec::with_capacity(needed.len());
+    for soname in needed {
+        needed_offsets.push(dynstr.len() as u32);
+        dynstr.extend_from_slice(soname.as_bytes());
+        dynstr.push(0);
+    }
 
     let mut str_offsets: Vec<u32> = Vec::with_capacity(plt_symbols.len());
     for sym in plt_symbols {
@@ -1009,16 +1019,17 @@ fn build_dynamic_sections(
     let name_refs: Vec<&str> = plt_symbols.iter().map(|s| s.as_str()).collect();
     let hash = build_sysv_hash(&name_refs);
 
-    Ok((dynsym, dynstr, rela_plt, hash))
+    Ok((dynsym, dynstr, rela_plt, hash, needed_offsets))
 }
 
 /// Build the raw bytes for the `.dynamic` section (`Elf64_Dyn` array).
 ///
-/// Emits `DT_HASH`, `DT_NEEDED` (offset 1 in dynstr = "libc.so.6"), `DT_STRTAB`,
+/// Emits `DT_HASH`, one `DT_NEEDED` per requested library, `DT_STRTAB`,
 /// `DT_SYMTAB`, `DT_STRSZ`, `DT_SYMENT`, `DT_PLTGOT`, `DT_PLTRELSZ`,
 /// `DT_PLTREL`, `DT_JMPREL`, `DT_BIND_NOW`, `DT_FLAGS` (`DF_BIND_NOW`),
 /// `DT_FLAGS_1` (`DF_1_NOW`), and a `DT_NULL` terminator.
-fn build_dynamic_section_content(
+/// Addresses and sizes the `.dynamic` entries point at.
+struct DynamicAddrs {
     got_plt_vaddr: u64,
     dynsym_vaddr: u64,
     dynstr_vaddr: u64,
@@ -1026,14 +1037,31 @@ fn build_dynamic_section_content(
     rela_plt_vaddr: u64,
     rela_plt_size: u64,
     hash_vaddr: u64,
+}
+
+fn build_dynamic_section_content(
+    addrs: &DynamicAddrs,
+    needed_offsets: &[u32],
 ) -> Result<Vec<u8>, String> {
+    let DynamicAddrs {
+        got_plt_vaddr,
+        dynsym_vaddr,
+        dynstr_vaddr,
+        dynstr_size,
+        rela_plt_vaddr,
+        rela_plt_size,
+        hash_vaddr,
+    } = *addrs;
     let mut content = Vec::new();
     fn push_dyn(content: &mut Vec<u8>, tag: u64, val: u64) {
         content.extend_from_slice(&tag.to_le_bytes());
         content.extend_from_slice(&val.to_le_bytes());
     }
     push_dyn(&mut content, 4, hash_vaddr); // DT_HASH
-    push_dyn(&mut content, 1, 1); // DT_NEEDED, "libc.so.6" at offset 1 in dynstr
+    // One DT_NEEDED per -l, in command-line order, as ld does.
+    for &off in needed_offsets {
+        push_dyn(&mut content, 1, off as u64);
+    }
     push_dyn(&mut content, 5, dynstr_vaddr);
     push_dyn(&mut content, 6, dynsym_vaddr);
     push_dyn(&mut content, 10, dynstr_size);
