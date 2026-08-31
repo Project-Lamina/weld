@@ -62,7 +62,83 @@ fn skip_args(argv: &[String], i: &mut usize, count: usize) {
 /// Handles the GCC/Clang linker driver flags that weld may receive when invoked
 /// via `-fuse-ld=weld`. Unknown flags starting with `-` are silently ignored;
 /// non-flag arguments are collected as input files.
+/// Expand `@file` response files and split `-Wl,a,b` into separate arguments.
+///
+/// Compiler drivers pass both forms, and response files are how Windows gets
+/// around the command-line length limit. Nested `@file` is followed to
+/// `MAX_RESPONSE_DEPTH` so a self-referencing file cannot loop forever.
+fn expand_argv(argv: &[String], depth: usize) -> Result<Vec<String>, String> {
+    const MAX_RESPONSE_DEPTH: usize = 8;
+    let mut out = Vec::with_capacity(argv.len());
+    for a in argv {
+        if let Some(rest) = a.strip_prefix("-Wl,") {
+            out.extend(rest.split(',').filter(|s| !s.is_empty()).map(String::from));
+        } else if let Some(path) = a.strip_prefix('@') {
+            if depth >= MAX_RESPONSE_DEPTH {
+                return Err(format!("response file nesting too deep at @{path}"));
+            }
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read response file {path}: {e}"))?;
+            let inner: Vec<String> = split_response_file(&text);
+            out.extend(expand_argv(&inner, depth + 1)?);
+        } else {
+            out.push(a.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Split response-file text on whitespace, honouring single and double quotes
+/// and backslash escapes, as GNU ld does.
+fn split_response_file(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut has = false;
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                has = true;
+            }
+            None if c == '\\' => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                    has = true;
+                }
+            }
+            None if c.is_whitespace() => {
+                if has || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    has = false;
+                }
+            }
+            None => {
+                cur.push(c);
+                has = true;
+            }
+        }
+    }
+    if has || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
+    let argv = &expand_argv(argv, 0)?;
     let mut args = ParsedArgs::default();
     let mut i = 0;
 
@@ -131,7 +207,6 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             }
             s if s.starts_with("-B") && s.len() > 2 => {}
             s if s.starts_with("-F") && s.len() > 2 => {}
-            s if s.starts_with("-Wl,") => {}
             _ => {
                 if !a.starts_with('-') {
                     args.input_files.push(PathBuf::from(a.clone()));
@@ -205,5 +280,41 @@ mod tests {
                 .any(|p| p.to_string_lossy() == "26.2")
         );
         assert!(parsed.libraries.iter().any(|l| l == "System"));
+    }
+
+    #[test]
+    fn wl_prefix_splits_into_separate_args() {
+        let out = expand_argv(&["-Wl,-L,libdir".into(), "a.o".into()], 0).unwrap();
+        assert_eq!(out, vec!["-L", "libdir", "a.o"]);
+    }
+
+    #[test]
+    fn dash_l_collects_both_joined_and_separated_forms() {
+        let argv: Vec<String> = ["-Ljoined", "-L", "sep", "a.o"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ParseAction::Run(parsed) = parse_args(&argv).unwrap() else {
+            panic!("expected a link action");
+        };
+        let paths: Vec<String> = parsed
+            .search_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, vec!["joined", "sep"]);
+    }
+
+    #[test]
+    fn response_file_splitting_honours_quotes_and_escapes() {
+        assert_eq!(
+            split_response_file("-La b\n\"two words\" 'sq' a\\ b"),
+            vec!["-La", "b", "two words", "sq", "a b"]
+        );
+    }
+
+    #[test]
+    fn empty_quoted_argument_survives_splitting() {
+        assert_eq!(split_response_file("a \"\" b"), vec!["a", "", "b"]);
     }
 }
