@@ -610,9 +610,9 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
 pub struct LinkOptions {
     /// `ld --dynamic-linker`.
     pub interpreter: Option<String>,
-    /// `ld -L`, searched before the platform defaults.
+    /// `ld -L`.
     pub search_paths: Vec<PathBuf>,
-    /// `ld -rpath`, emitted as a single colon-joined `DT_RUNPATH`.
+    /// `ld -rpath`, joined into one `DT_RUNPATH`.
     pub rpaths: Vec<String>,
 }
 
@@ -690,7 +690,6 @@ fn link_multi_object_parsed(
     // (legacy names) as well as any library the resolver can locate as a
     // shared object triggers PLT generation.
     let mut resolver = LibraryResolver::new(arch, TargetPlatform::current());
-    // -L is searched before the platform defaults, so later flags win as ld does.
     for path in opts.search_paths.iter().rev() {
         resolver.add_path(path.clone());
     }
@@ -726,6 +725,10 @@ fn link_multi_object_parsed(
             undefined.push("exit".to_string());
         }
 
+        // Synthetic _start leaves through libc exit(), so it needs a PLT entry.
+        if !global_symbols.contains_key("_start") && !undefined.iter().any(|s| s == "exit") {
+            undefined.push("exit".to_string());
+        }
 
         if !undefined.is_empty() {
             let (plt_data, got_plt_data) = build_plt_got_x86_64(&undefined, &layout)?;
@@ -1056,7 +1059,6 @@ fn build_dynamic_sections(
 /// `DT_SYMTAB`, `DT_STRSZ`, `DT_SYMENT`, `DT_PLTGOT`, `DT_PLTRELSZ`,
 /// `DT_PLTREL`, `DT_JMPREL`, `DT_BIND_NOW`, `DT_FLAGS` (`DF_BIND_NOW`),
 /// `DT_FLAGS_1` (`DF_1_NOW`), and a `DT_NULL` terminator.
-/// Addresses and sizes the `.dynamic` entries point at.
 struct DynamicAddrs {
     got_plt_vaddr: u64,
     dynsym_vaddr: u64,
@@ -1087,7 +1089,6 @@ fn build_dynamic_section_content(
         content.extend_from_slice(&val.to_le_bytes());
     }
     push_dyn(&mut content, 4, hash_vaddr); // DT_HASH
-    // One DT_NEEDED per -l, in command-line order, as ld does.
     for &off in needed_offsets {
         push_dyn(&mut content, 1, off as u64);
     }
