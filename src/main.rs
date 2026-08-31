@@ -13,14 +13,20 @@ mod object;
 mod platform;
 mod segment;
 
-use crate::arch::TargetArch;
-use crate::cli::{ParseAction, ParsedArgs, parse_args, print_usage};
-use crate::link::macho::link_macho_multi_object;
-use crate::link::{DynamicLinkInfo, LinkResult, MergedSection, link_multi_object};
-use crate::object::{ObjectFormat, load_objects};
-use std::env;
-use std::io::{Result, Write};
-use std::path::Path;
+use crate::{
+    arch::TargetArch,
+    cli::{ParseAction, ParsedArgs, parse_args, print_usage},
+    link::{
+        DynamicLinkInfo, LinkResult, MergedSection, link_multi_object,
+        macho::link_macho_multi_object,
+    },
+    object::{ObjectFormat, load_objects},
+};
+use std::{
+    env,
+    io::{Result, Write},
+    path::Path,
+};
 
 const ELFOSABI_NONE: u8 = 0;
 const ELFOSABI_FREEBSD: u8 = 9;

@@ -15,16 +15,15 @@ mod x86_64;
 
 pub use resolver::LibraryResolver;
 
-use crate::arch::TargetArch;
-use crate::elf::reloc_type::R_X86_64_GOTPCREL;
-use crate::elf::{
-    Elf64Header, SectionHeader, Symbol, get_strtab_from_section, get_strtab_string,
-    parse_elf64_slice, parse_rela_section, parse_symtab,
+use crate::{
+    arch::TargetArch,
+    elf::{
+        Elf64Header, SectionHeader, Symbol, get_strtab_from_section, get_strtab_string,
+        parse_elf64_slice, parse_rela_section, parse_symtab, reloc_type::R_X86_64_GOTPCREL,
+    },
+    platform::TargetPlatform,
 };
-use crate::platform::TargetPlatform;
-use std::collections::HashMap;
-use std::path::Path;
-use std::thread;
+use std::{collections::HashMap, path::Path, thread};
 
 /// Return type for symbol-table parsing: a list of symbols and the raw string table.
 type SymtabView<'a> = Option<(Vec<Symbol>, &'a [u8])>;
