@@ -166,6 +166,19 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     let mut result =
         link_multi_object_with_interp(&obj_refs, libs, args.dynamic_linker.as_deref()).ok()?;
     let arch = TargetArch::from_elf_machine(result.e_machine)?;
+    if let Some(emul) = args.emulation.as_deref() {
+        match TargetArch::from_emulation(emul) {
+            Some(want) if want != arch => {
+                eprintln!("weld: -m {emul} does not match the objects, which are {arch:?}");
+                return None;
+            }
+            None => {
+                eprintln!("weld: unknown emulation {emul}");
+                return None;
+            }
+            _ => {}
+        }
+    }
     let entry = if needs_synthetic_start(&result) {
         synthesize_elf_start_x86_64(&mut result, freebsd_abi)
             .or_else(|| select_entry(args, &result))?

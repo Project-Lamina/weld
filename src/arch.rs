@@ -22,6 +22,16 @@ impl TargetArch {
         }
     }
 
+    /// Map a GNU ld `-m` emulation name to an architecture.
+    pub fn from_emulation(name: &str) -> Option<Self> {
+        match name {
+            "elf_x86_64" | "elf_x86_64_fbsd" => Some(Self::X86_64),
+            "aarch64linux" | "aarch64elf" | "aarch64_elf" => Some(Self::AArch64),
+            "elf64lriscv" | "elf32lriscv" => Some(Self::RiscV),
+            _ => None,
+        }
+    }
+
     /// Return the ELF `e_machine` value for this architecture.
     pub fn to_elf_machine(self) -> u16 {
         match self {
