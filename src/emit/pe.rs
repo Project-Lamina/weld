@@ -8,8 +8,10 @@
 //! - Proper section/file alignment and correct RVA fixups
 
 use crate::link::{DynamicLinkInfo, MergedLayout};
-use std::collections::{HashMap, HashSet};
-use std::io::{Result, Write};
+use std::{
+    collections::{HashMap, HashSet},
+    io::{Result, Write},
+};
 
 // ---------------------------------------------------------------------------
 // PE constants

@@ -3,16 +3,20 @@
 //! Merges sections, resolves symbols, applies relocations.
 //! Supports single-object no-libc (ret42-style) initially.
 
-use crate::arch::TargetArch;
-use crate::link::{DynamicLinkInfo, LinkResult, MergedLayout, MergedSection, ObjectSectionContrib};
-use crate::macho::{
-    ARM64_RELOC_ADDEND, ARM64_RELOC_BRANCH26, ARM64_RELOC_GOT_LOAD_PAGE21,
-    ARM64_RELOC_GOT_LOAD_PAGEOFF12, ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12,
-    ARM64_RELOC_TLVP_LOAD_PAGE21, ARM64_RELOC_TLVP_LOAD_PAGEOFF12, GENERIC_RELOC_VANILLA,
-    Macho64Object, MachoSection, MachoSymbol, parse_macho_relocs, parse_macho64_object,
+use crate::{
+    arch::TargetArch,
+    link::{DynamicLinkInfo, LinkResult, MergedLayout, MergedSection, ObjectSectionContrib},
+    macho::{
+        ARM64_RELOC_ADDEND, ARM64_RELOC_BRANCH26, ARM64_RELOC_GOT_LOAD_PAGE21,
+        ARM64_RELOC_GOT_LOAD_PAGEOFF12, ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12,
+        ARM64_RELOC_TLVP_LOAD_PAGE21, ARM64_RELOC_TLVP_LOAD_PAGEOFF12, GENERIC_RELOC_VANILLA,
+        Macho64Object, MachoSection, MachoSymbol, parse_macho_relocs, parse_macho64_object,
+    },
 };
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 /// Three binary sections emitted when building stub trampolines:
 /// stubs, stub helper, and GOT slots.

@@ -1,9 +1,9 @@
-use crate::elf::{get_strtab_from_section, get_strtab_string, parse_elf64_slice, parse_symtab};
-use crate::macho::{is_macho_dylib, is_macho64, parse_macho64_object};
+use crate::{
+    elf::{get_strtab_from_section, get_strtab_string, parse_elf64_slice, parse_symtab},
+    macho::{is_macho_dylib, is_macho64, parse_macho64_object},
+};
 
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::thread;
+use std::{collections::HashSet, path::PathBuf, thread};
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const AR_MAGIC: [u8; 8] = [0x21, 0x3c, 0x61, 0x72, 0x63, 0x68, 0x3e, 0x0a];

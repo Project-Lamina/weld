@@ -4,9 +4,11 @@
 //! layout; e_machine comes from TargetArch.
 //! Dynamic linking: PT_INTERP, PT_DYNAMIC, .dynamic, .dynsym, .dynstr, .rela.plt.
 
-use crate::arch::TargetArch;
-use crate::link::{DynamicLinkInfo, MergedLayout};
-use crate::segment::{align_up_u64, build_segment_buffer};
+use crate::{
+    arch::TargetArch,
+    link::{DynamicLinkInfo, MergedLayout},
+    segment::{align_up_u64, build_segment_buffer},
+};
 use std::io::{Error, ErrorKind, Result, Write};
 
 const EI_MAG0: u8 = 0x7f;
