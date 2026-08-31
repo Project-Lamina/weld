@@ -9,6 +9,7 @@ pub struct ParsedArgs {
     pub dynamic_linker: Option<String>,
     pub target_os: Option<String>,
     pub search_paths: Vec<PathBuf>,
+    pub rpaths: Vec<String>,
     pub verbose: bool,
     pub input_files: Vec<PathBuf>,
 }
@@ -200,6 +201,16 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "-nodefaultlibs" | "-nostdlib" => {}
             s if s.starts_with("-L") && s.len() > 2 => {
                 args.search_paths.push(PathBuf::from(&s[2..]));
+            }
+            "-rpath" | "--rpath" => {
+                let next = take_required_arg(argv, &mut i, "-rpath")?;
+                args.rpaths.push(next);
+            }
+            s if s.starts_with("-rpath=") => {
+                args.rpaths.push(s["-rpath=".len()..].to_string());
+            }
+            s if s.starts_with("--rpath=") => {
+                args.rpaths.push(s["--rpath=".len()..].to_string());
             }
             "-L" => {
                 let next = take_required_arg(argv, &mut i, "-L")?;
