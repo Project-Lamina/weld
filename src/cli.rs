@@ -218,10 +218,16 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             }
             s if s.starts_with("-B") && s.len() > 2 => {}
             s if s.starts_with("-F") && s.len() > 2 => {}
+            // Output kinds weld cannot produce yet. Silently ignoring these
+            // would emit a plain executable and report success.
+            "-shared" | "--shared" | "-dylib" | "-static" | "-r" | "--relocatable" => {
+                return Err(format!("{a} is not supported yet"));
+            }
             _ => {
-                if !a.starts_with('-') {
-                    args.input_files.push(PathBuf::from(a.clone()));
+                if a.starts_with('-') {
+                    return Err(format!("unrecognized option {a}"));
                 }
+                args.input_files.push(PathBuf::from(a.clone()));
             }
         }
     }
