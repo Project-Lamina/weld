@@ -36,6 +36,7 @@ fn link_options(args: &ParsedArgs) -> LinkOptions {
     LinkOptions {
         interpreter: args.dynamic_linker.clone(),
         search_paths: args.search_paths.clone(),
+        rpaths: args.rpaths.clone(),
     }
 }
 
