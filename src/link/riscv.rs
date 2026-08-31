@@ -308,6 +308,11 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off, patch_s_imm12(instr, lo12));
                 }
 
+                // A marker paired with the relocation before it, saying the pair may be
+                // relaxed. Standard toolchains emit it by default. Nothing to patch, and
+                // declining to relax is always valid.
+                reloc_type::R_RISCV_RELAX => {}
+
                 _ => {
                     return Err(format!("unsupported RISC-V relocation type {}", rel.r_type));
                 }
