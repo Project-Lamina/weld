@@ -125,14 +125,11 @@ pub fn apply_relocations(
                     let page_s = page4k(s_plus_a);
                     let page_p = page4k(place);
                     let diff = (page_s as i64).wrapping_sub(page_p as i64);
-                    let val = (diff & 0x1FFFFF) as u32;
                     if merged.data.len() < off + 4 {
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }
                     let insn = read_u32_le(&merged.data, off);
-                    let immlo = val & 3;
-                    let immhi = (val >> 2) & 0x7FFFF;
-                    let patched = (insn & 0x9F00001F) | (immlo << 29) | (immhi << 5);
+                    let patched = encode_adrp_page_delta(insn, diff)?;
                     write_u32_le(&mut merged.data, off, patched);
                 }
                 reloc_type::R_AARCH64_CALL26 | reloc_type::R_AARCH64_JUMP26 => {
@@ -159,4 +156,50 @@ pub fn apply_relocations(
     }
 
     Ok(())
+}
+
+/// Patch an ADRP with a page delta. The immediate counts 4 KiB pages, not bytes.
+fn encode_adrp_page_delta(insn: u32, byte_delta: i64) -> Result<u32, String> {
+    let pages = byte_delta >> 12;
+    if !(-(1 << 20)..(1 << 20)).contains(&pages) {
+        return Err(format!(
+            "R_AARCH64_ADR_PREL_PG_HI21 out of range: {pages} pages"
+        ));
+    }
+    let val = (pages as u32) & 0x1FFFFF;
+    Ok((insn & 0x9F00001F) | ((val & 3) << 29) | (((val >> 2) & 0x7FFFF) << 5))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Recover the signed page count an ADRP encodes.
+    fn decode_pages(insn: u32) -> i64 {
+        let val = ((insn >> 29) & 3) | (((insn >> 5) & 0x7FFFF) << 2);
+        ((val << 11) as i32 >> 11) as i64
+    }
+
+    #[test]
+    fn adrp_encodes_pages_not_bytes() {
+        // `adrp x0, #0` as the assembler leaves it for the linker.
+        let insn = 0x9000_0000;
+        for pages in [0i64, 1, 2, -1, 1023, -1024] {
+            let patched = encode_adrp_page_delta(insn, pages * 4096).expect("in range");
+            assert_eq!(decode_pages(patched), pages, "for {pages} pages");
+        }
+        // One page forward is `adrp x0, #4096`.
+        assert_eq!(
+            encode_adrp_page_delta(insn, 4096).expect("in range"),
+            0xB000_0000
+        );
+    }
+
+    #[test]
+    fn adrp_rejects_a_delta_it_cannot_encode() {
+        let insn = 0x9000_0000;
+        let far = (1i64 << 20) * 4096;
+        assert!(encode_adrp_page_delta(insn, far).is_err());
+        assert!(encode_adrp_page_delta(insn, -far - 4096).is_err());
+    }
 }
