@@ -8,6 +8,7 @@ pub struct ParsedArgs {
     pub emulation: Option<String>,
     pub dynamic_linker: Option<String>,
     pub target_os: Option<String>,
+    pub search_paths: Vec<PathBuf>,
     pub verbose: bool,
     pub input_files: Vec<PathBuf>,
 }
@@ -122,7 +123,13 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "--version" => return Ok(ParseAction::Version),
             s if s.starts_with("-mmacosx-version-min") || s.starts_with("-mios") => {}
             "-nodefaultlibs" | "-nostdlib" => {}
-            s if s.starts_with("-L") && s.len() > 2 => {}
+            s if s.starts_with("-L") && s.len() > 2 => {
+                args.search_paths.push(PathBuf::from(&s[2..]));
+            }
+            "-L" => {
+                let next = take_required_arg(argv, &mut i, "-L")?;
+                args.search_paths.push(PathBuf::from(next));
+            }
             s if s.starts_with("-B") && s.len() > 2 => {}
             s if s.starts_with("-F") && s.len() > 2 => {}
             s if s.starts_with("-Wl,") => {}

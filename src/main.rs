@@ -17,7 +17,7 @@ use crate::{
     arch::TargetArch,
     cli::{ParseAction, ParsedArgs, parse_args, print_usage},
     link::{
-        DynamicLinkInfo, LinkResult, MergedSection, link_multi_object_with_interp,
+        DynamicLinkInfo, LinkOptions, LinkResult, MergedSection, link_multi_object_with_options,
         macho::link_macho_multi_object,
     },
     object::{ObjectFormat, load_objects},
@@ -30,6 +30,14 @@ use std::{
 
 const ELFOSABI_NONE: u8 = 0;
 const ELFOSABI_FREEBSD: u8 = 9;
+
+/// Command-line settings the linker needs, gathered in one place.
+fn link_options(args: &ParsedArgs) -> LinkOptions {
+    LinkOptions {
+        interpreter: args.dynamic_linker.clone(),
+        search_paths: args.search_paths.clone(),
+    }
+}
 
 fn os_abi_for_target(target_os: Option<&str>) -> u8 {
     match target_os {
@@ -163,8 +171,7 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     let target_os = args.target_os.as_deref();
     let os_abi = os_abi_for_target(target_os);
     let freebsd_abi = os_abi == ELFOSABI_FREEBSD;
-    let mut result =
-        link_multi_object_with_interp(&obj_refs, libs, args.dynamic_linker.as_deref()).ok()?;
+    let mut result = link_multi_object_with_options(&obj_refs, libs, &link_options(args)).ok()?;
     let arch = TargetArch::from_elf_machine(result.e_machine)?;
     if let Some(emul) = args.emulation.as_deref() {
         match TargetArch::from_emulation(emul) {
@@ -264,8 +271,7 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
     } else {
         Some(args.libraries.as_slice())
     };
-    let result =
-        link_multi_object_with_interp(&obj_refs, libs, args.dynamic_linker.as_deref()).ok()?;
+    let result = link_multi_object_with_options(&obj_refs, libs, &link_options(args)).ok()?;
     let entry = select_entry(args, &result)?;
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
     let out_file = std::fs::File::create(out_path).ok()?;
@@ -325,10 +331,10 @@ fn main() {
                         if let Some((format, data, dylib_paths)) = load_objects(&args.input_files) {
                             let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
                             let err = match format {
-                                ObjectFormat::Elf => link_multi_object_with_interp(
+                                ObjectFormat::Elf => link_multi_object_with_options(
                                     &refs,
                                     Some(&args.libraries),
-                                    args.dynamic_linker.as_deref(),
+                                    &link_options(&args),
                                 )
                                 .err(),
                                 ObjectFormat::MachO => link_macho_multi_object(

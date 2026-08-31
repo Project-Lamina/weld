@@ -23,7 +23,11 @@ use crate::{
     },
     platform::TargetPlatform,
 };
-use std::{collections::HashMap, path::Path, thread};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    thread,
+};
 
 /// Return type for symbol-table parsing: a list of symbols and the raw string table.
 type SymtabView<'a> = Option<(Vec<Symbol>, &'a [u8])>;
@@ -601,15 +605,23 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
 
 /// Link multiple object files. Same e_machine required.
 /// When libs is Some and contains "c" or "System", adds PLT/GOT for undefined symbols.
-pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<LinkResult, String> {
-    link_multi_object_with_interp(objects, libs, None)
+/// Link settings that come from the command line rather than the objects.
+#[derive(Debug, Default, Clone)]
+pub struct LinkOptions {
+    /// `ld --dynamic-linker`.
+    pub interpreter: Option<String>,
+    /// `ld -L`, searched before the platform defaults.
+    pub search_paths: Vec<PathBuf>,
 }
 
-/// `interp` overrides the program interpreter, as `ld --dynamic-linker` does.
-pub fn link_multi_object_with_interp(
+pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<LinkResult, String> {
+    link_multi_object_with_options(objects, libs, &LinkOptions::default())
+}
+
+pub fn link_multi_object_with_options(
     objects: &[&[u8]],
     libs: Option<&[String]>,
-    interp: Option<&str>,
+    opts: &LinkOptions,
 ) -> Result<LinkResult, String> {
     if objects.is_empty() {
         return Err("no objects to link".to_string());
@@ -628,11 +640,11 @@ pub fn link_multi_object_with_interp(
         parsed.push(h.join().map_err(|_| "thread join failed".to_string())??);
     }
 
-    link_multi_object_parsed(interp, &parsed, libs)
+    link_multi_object_parsed(opts, &parsed, libs)
 }
 
 fn link_multi_object_parsed(
-    interp: Option<&str>,
+    opts: &LinkOptions,
     parsed: &[ParsedObject],
     libs: Option<&[String]>,
 ) -> Result<LinkResult, String> {
@@ -675,7 +687,11 @@ fn link_multi_object_parsed(
     // Resolve library names to sonames.  Any lib matching "c" or "System"
     // (legacy names) as well as any library the resolver can locate as a
     // shared object triggers PLT generation.
-    let resolver = LibraryResolver::new(arch, TargetPlatform::current());
+    let mut resolver = LibraryResolver::new(arch, TargetPlatform::current());
+    // -L is searched before the platform defaults, so later flags win as ld does.
+    for path in opts.search_paths.iter().rev() {
+        resolver.add_path(path.clone());
+    }
     let has_shared_lib = libs
         .map(|l| {
             l.iter().any(|x| {
@@ -822,7 +838,10 @@ fn link_multi_object_parsed(
 
             // ld's --dynamic-linker when given. The default is glibc's on x86-64, which
             // is the only arch this branch runs for; it is wrong under musl.
-            let interpreter = interp.unwrap_or("/lib64/ld-linux-x86-64.so.2").to_string();
+            let interpreter = opts
+                .interpreter
+                .clone()
+                .unwrap_or_else(|| "/lib64/ld-linux-x86-64.so.2".to_string());
             // Build DT_NEEDED entries from the requested libraries, resolving
             // each name to its real soname via LibraryResolver.
             let needed: Vec<String> = libs
