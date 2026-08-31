@@ -68,6 +68,7 @@ pub mod reloc_type {
     pub const R_RISCV_HI20: u32 = 26;
     pub const R_RISCV_LO12_I: u32 = 27;
     pub const R_RISCV_LO12_S: u32 = 28;
+    pub const R_RISCV_RELAX: u32 = 51;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
