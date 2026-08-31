@@ -602,6 +602,15 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
 /// Link multiple object files. Same e_machine required.
 /// When libs is Some and contains "c" or "System", adds PLT/GOT for undefined symbols.
 pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<LinkResult, String> {
+    link_multi_object_with_interp(objects, libs, None)
+}
+
+/// `interp` overrides the program interpreter, as `ld --dynamic-linker` does.
+pub fn link_multi_object_with_interp(
+    objects: &[&[u8]],
+    libs: Option<&[String]>,
+    interp: Option<&str>,
+) -> Result<LinkResult, String> {
     if objects.is_empty() {
         return Err("no objects to link".to_string());
     }
@@ -619,10 +628,11 @@ pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<L
         parsed.push(h.join().map_err(|_| "thread join failed".to_string())??);
     }
 
-    link_multi_object_parsed(&parsed, libs)
+    link_multi_object_parsed(interp, &parsed, libs)
 }
 
 fn link_multi_object_parsed(
+    interp: Option<&str>,
     parsed: &[ParsedObject],
     libs: Option<&[String]>,
 ) -> Result<LinkResult, String> {
@@ -810,7 +820,9 @@ fn link_multi_object_parsed(
                 global_symbols.insert(sym.clone(), plt_entry_addr);
             }
 
-            let interpreter = "/lib64/ld-linux-x86-64.so.2".to_string();
+            // ld's --dynamic-linker when given. The default is glibc's on x86-64, which
+            // is the only arch this branch runs for; it is wrong under musl.
+            let interpreter = interp.unwrap_or("/lib64/ld-linux-x86-64.so.2").to_string();
             // Build DT_NEEDED entries from the requested libraries, resolving
             // each name to its real soname via LibraryResolver.
             let needed: Vec<String> = libs
