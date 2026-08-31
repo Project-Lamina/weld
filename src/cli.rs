@@ -64,10 +64,6 @@ fn skip_args(argv: &[String], i: &mut usize, count: usize) {
 /// via `-fuse-ld=weld`. Unknown flags starting with `-` are silently ignored;
 /// non-flag arguments are collected as input files.
 /// Expand `@file` response files and split `-Wl,a,b` into separate arguments.
-///
-/// Compiler drivers pass both forms, and response files are how Windows gets
-/// around the command-line length limit. Nested `@file` is followed to
-/// `MAX_RESPONSE_DEPTH` so a self-referencing file cannot loop forever.
 fn expand_argv(argv: &[String], depth: usize) -> Result<Vec<String>, String> {
     const MAX_RESPONSE_DEPTH: usize = 8;
     let mut out = Vec::with_capacity(argv.len());
@@ -89,8 +85,7 @@ fn expand_argv(argv: &[String], depth: usize) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// Split response-file text on whitespace, honouring single and double quotes
-/// and backslash escapes, as GNU ld does.
+/// Split on whitespace, honouring quotes and backslash escapes, as GNU ld does.
 fn split_response_file(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -218,8 +213,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             }
             s if s.starts_with("-B") && s.len() > 2 => {}
             s if s.starts_with("-F") && s.len() > 2 => {}
-            // Output kinds weld cannot produce yet. Silently ignoring these
-            // would emit a plain executable and report success.
+            // Output kinds weld cannot produce yet.
             "-shared" | "--shared" | "-dylib" | "-static" | "-r" | "--relocatable" => {
                 return Err(format!("{a} is not supported yet"));
             }
