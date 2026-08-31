@@ -15,7 +15,7 @@ pub struct ParsedArgs {
 }
 
 pub enum ParseAction {
-    Run(ParsedArgs),
+    Run(Box<ParsedArgs>),
     Help,
     Version,
 }
@@ -226,7 +226,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
         }
     }
 
-    Ok(ParseAction::Run(args))
+    Ok(ParseAction::Run(Box::new(args)))
 }
 
 #[cfg(test)]
