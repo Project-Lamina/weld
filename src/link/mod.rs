@@ -187,12 +187,22 @@ fn collect_mergeable_sections<'a>(
 }
 
 fn read_section_data(data: &[u8], sh: &SectionHeader) -> Vec<u8> {
-    if sh.sh_type == SHT_PROGBITS && sh.sh_size > 0 {
-        let start = sh.sh_offset as usize;
-        let end = start + sh.sh_size as usize;
-        data.get(start..end).unwrap_or(&[]).to_vec()
-    } else {
-        Vec::new()
+    if sh.sh_size == 0 {
+        return Vec::new();
+    }
+    match sh.sh_type {
+        SHT_PROGBITS => {
+            let start = sh.sh_offset as usize;
+            let end = start + sh.sh_size as usize;
+            data.get(start..end).unwrap_or(&[]).to_vec()
+        }
+        // NOBITS has no bytes in the object, but layout advances vaddr by its size and
+        // the segment's file size is taken from data.len(). Returning nothing left .bss
+        // outside the mapping and let anything placed after it alias the same address.
+        // Zeroes cost file size; the alternative is a memory size separate from the
+        // file size carried through the segment builder and the ELF writer.
+        SHT_NOBITS => vec![0u8; sh.sh_size as usize],
+        _ => Vec::new(),
     }
 }
 
@@ -1187,5 +1197,39 @@ mod tests {
         assert!(!result.layout.sections.is_empty());
         assert!(result.layout.section_by_name.contains_key(".text"));
         assert_eq!(result.e_machine, 183);
+    }
+}
+
+#[cfg(test)]
+mod nobits_tests {
+    use super::*;
+
+    fn header(sh_type: u32, size: u64) -> SectionHeader {
+        SectionHeader {
+            name_offset: 0,
+            sh_type,
+            sh_flags: 0,
+            sh_addr: 0,
+            sh_offset: 0,
+            sh_size: size,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: 1,
+            sh_entsize: 0,
+        }
+    }
+
+    #[test]
+    fn nobits_contributes_its_size_so_bss_stays_mapped() {
+        // Layout advances vaddr by sh_size while the segment's file size comes from
+        // data.len(). An empty vector here left .bss outside the LOAD segment.
+        let bss = read_section_data(&[], &header(SHT_NOBITS, 8));
+        assert_eq!(bss, vec![0u8; 8]);
+    }
+
+    #[test]
+    fn empty_and_unknown_sections_contribute_nothing() {
+        assert!(read_section_data(&[], &header(SHT_NOBITS, 0)).is_empty());
+        assert!(read_section_data(&[], &header(0, 8)).is_empty());
     }
 }
