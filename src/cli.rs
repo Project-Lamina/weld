@@ -86,7 +86,6 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             | "-mllvm"
             | "-exported_symbols_list"
             | "-install_name"
-            | "-L"
             | "-B"
             | "-F"
             | "-arch"
