@@ -4,11 +4,15 @@
 
 #![allow(dead_code)]
 
-use crate::arch::TargetArch;
-use crate::link::{DynamicLinkInfo, MergedLayout, MergedSection};
-use crate::segment::{align_up_u64, align_up_usize, build_segment_buffer};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Error, ErrorKind, Result, Write};
+use crate::{
+    arch::TargetArch,
+    link::{DynamicLinkInfo, MergedLayout, MergedSection},
+    segment::{align_up_u64, align_up_usize, build_segment_buffer},
+};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    io::{Error, ErrorKind, Result, Write},
+};
 
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
 const MH_EXECUTABLE: u32 = 2;
