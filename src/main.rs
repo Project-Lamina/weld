@@ -306,7 +306,7 @@ fn main() {
                     std::process::exit(0);
                 }
                 None => {
-                    if args.verbose {
+                    {
                         if let Some((format, data, dylib_paths)) = load_objects(&args.input_files) {
                             let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
                             let err = match format {
@@ -325,12 +325,10 @@ fn main() {
                                 }
                             };
                             if let Some(e) = err {
-                                eprintln!("[weld] native link failed: {}", e);
+                                eprintln!("weld: {e}");
                             }
                         } else {
-                            eprintln!(
-                                "[weld] load_objects returned None (check input paths/format)"
-                            );
+                            eprintln!("weld: could not read the input objects");
                         }
                     }
                     eprintln!("weld: link failed");
