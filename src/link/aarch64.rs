@@ -3,9 +3,10 @@
 //! Supports: ABS64, ABS32, RELATIVE, ADD_ABS_LO12_NC, ADR_PREL_LO21,
 //! ADR_PREL_PG_HI21, CALL26, JUMP26.
 
-use crate::elf::reloc_type;
-use crate::elf::{SectionHeader, parse_rela_section};
-use crate::link::MergedLayout;
+use crate::{
+    elf::{SectionHeader, parse_rela_section, reloc_type},
+    link::MergedLayout,
+};
 use std::collections::HashMap;
 
 fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
