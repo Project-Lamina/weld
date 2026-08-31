@@ -99,6 +99,7 @@ fn parse_object(data: Vec<u8>) -> Result<ParsedObject, String> {
 
 const SHN_UNDEF: u16 = 0;
 const SHN_ABS: u16 = 0xfff1;
+const STB_LOCAL: u8 = 0;
 
 const SHF_ALLOC: u64 = 2;
 const SHF_EXECINSTR: u64 = 4;
@@ -455,7 +456,9 @@ where
         };
 
         by_index.push(address);
-        if !name.is_empty() {
+        // A local name is private to its object. Same-object relocations still find it
+        // through by_index; only cross-object lookup must not see it.
+        if !name.is_empty() && sym.bind != STB_LOCAL {
             resolved.insert(
                 name,
                 ResolvedSymbol {
