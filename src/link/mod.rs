@@ -721,6 +721,11 @@ fn link_multi_object_parsed(
                 }
             }
         }
+        // Synthetic _start leaves through libc exit(), so it needs a PLT entry.
+        if !global_symbols.contains_key("_start") && !undefined.iter().any(|s| s == "exit") {
+            undefined.push("exit".to_string());
+        }
+
 
         if !undefined.is_empty() {
             let (plt_data, got_plt_data) = build_plt_got_x86_64(&undefined, &layout)?;
