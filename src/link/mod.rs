@@ -37,7 +37,7 @@ type ResolvedSymbols = (HashMap<String, ResolvedSymbol>, Vec<Option<u64>>);
 
 /// Four binary blobs produced when building ELF dynamic sections:
 /// `.dynsym`, `.dynstr`, `.rela.plt`, and `.hash` (SysV DT_HASH).
-type DynSections = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u32>);
+type DynSections = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u32>, Option<u32>);
 
 /// Standard SysV ELF hash function (used by DT_HASH).
 fn elf_hash(name: &[u8]) -> u32 {
@@ -612,6 +612,8 @@ pub struct LinkOptions {
     pub interpreter: Option<String>,
     /// `ld -L`, searched before the platform defaults.
     pub search_paths: Vec<PathBuf>,
+    /// `ld -rpath`, emitted as a single colon-joined `DT_RUNPATH`.
+    pub rpaths: Vec<String>,
 }
 
 pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<LinkResult, String> {
@@ -769,8 +771,14 @@ fn link_multi_object_parsed(
                 })
                 .collect();
 
-            let (dynsym_data, dynstr_data, rela_plt_data, hash_data, needed_offsets) =
-                build_dynamic_sections(&undefined, got_plt_vaddr, &needed)?;
+            let (
+                dynsym_data,
+                dynstr_data,
+                rela_plt_data,
+                hash_data,
+                needed_offsets,
+                runpath_offset,
+            ) = build_dynamic_sections(&undefined, got_plt_vaddr, &needed, &opts.rpaths)?;
             let dynsym_vaddr = vaddr;
             let dynsym_size = dynsym_data.len() as u64;
             layout.sections.push(MergedSection {
@@ -838,6 +846,7 @@ fn link_multi_object_parsed(
                     hash_vaddr,
                 },
                 &needed_offsets,
+                runpath_offset,
             )?;
             let dynamic_vaddr = vaddr;
             layout.sections.push(MergedSection {
@@ -977,12 +986,19 @@ fn build_dynamic_sections(
     plt_symbols: &[String],
     got_plt_vaddr: u64,
     needed: &[String],
+    rpaths: &[String],
 ) -> Result<DynSections, String> {
     let mut dynstr = vec![0u8];
     let mut needed_offsets: Vec<u32> = Vec::with_capacity(needed.len());
+    let mut runpath_offset = None;
     for soname in needed {
         needed_offsets.push(dynstr.len() as u32);
         dynstr.extend_from_slice(soname.as_bytes());
+        dynstr.push(0);
+    }
+    if !rpaths.is_empty() {
+        runpath_offset = Some(dynstr.len() as u32);
+        dynstr.extend_from_slice(rpaths.join(":").as_bytes());
         dynstr.push(0);
     }
 
@@ -1019,7 +1035,14 @@ fn build_dynamic_sections(
     let name_refs: Vec<&str> = plt_symbols.iter().map(|s| s.as_str()).collect();
     let hash = build_sysv_hash(&name_refs);
 
-    Ok((dynsym, dynstr, rela_plt, hash, needed_offsets))
+    Ok((
+        dynsym,
+        dynstr,
+        rela_plt,
+        hash,
+        needed_offsets,
+        runpath_offset,
+    ))
 }
 
 /// Build the raw bytes for the `.dynamic` section (`Elf64_Dyn` array).
@@ -1042,6 +1065,7 @@ struct DynamicAddrs {
 fn build_dynamic_section_content(
     addrs: &DynamicAddrs,
     needed_offsets: &[u32],
+    runpath_offset: Option<u32>,
 ) -> Result<Vec<u8>, String> {
     let DynamicAddrs {
         got_plt_vaddr,
@@ -1061,6 +1085,9 @@ fn build_dynamic_section_content(
     // One DT_NEEDED per -l, in command-line order, as ld does.
     for &off in needed_offsets {
         push_dyn(&mut content, 1, off as u64);
+    }
+    if let Some(off) = runpath_offset {
+        push_dyn(&mut content, 29, off as u64); // DT_RUNPATH
     }
     push_dyn(&mut content, 5, dynstr_vaddr);
     push_dyn(&mut content, 6, dynsym_vaddr);
