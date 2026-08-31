@@ -332,10 +332,15 @@ pub fn merge_sections_multi_object(
             let data_slice = read_section_data(obj_data, sh);
 
             let size = sh.sh_size;
-            let offset_in_merged = *section_cumul.get(&name).unwrap_or(&0);
+            let align = sh.sh_addralign.max(1);
+            // Each contribution starts at its own alignment, not wherever the previous
+            // one happened to end. Without the pad an object promising 16-byte data can
+            // land at an odd offset and no error says so.
+            let raw = *section_cumul.get(&name).unwrap_or(&0);
+            let offset_in_merged = align_up(raw, align);
+            let pad = offset_in_merged - raw;
             section_cumul.insert(name.clone(), offset_in_merged + size);
 
-            let align = sh.sh_addralign.max(1);
             section_aligns
                 .entry(name.clone())
                 .and_modify(|a| *a = (*a).max(align))
@@ -347,6 +352,9 @@ pub fn merge_sections_multi_object(
                 .or_insert(sh.sh_flags);
 
             let entry = merged_data.entry(name.clone()).or_default();
+            if pad > 0 {
+                entry.push((vec![0u8; pad as usize], pad));
+            }
             entry.push((data_slice, size));
 
             obj_contribs.insert(
