@@ -17,7 +17,7 @@ use crate::{
     arch::TargetArch,
     cli::{ParseAction, ParsedArgs, parse_args, print_usage},
     link::{
-        DynamicLinkInfo, LinkResult, MergedSection, link_multi_object,
+        DynamicLinkInfo, LinkResult, MergedSection, link_multi_object_with_interp,
         macho::link_macho_multi_object,
     },
     object::{ObjectFormat, load_objects},
@@ -163,7 +163,8 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     let target_os = args.target_os.as_deref();
     let os_abi = os_abi_for_target(target_os);
     let freebsd_abi = os_abi == ELFOSABI_FREEBSD;
-    let mut result = link_multi_object(&obj_refs, libs).ok()?;
+    let mut result =
+        link_multi_object_with_interp(&obj_refs, libs, args.dynamic_linker.as_deref()).ok()?;
     let arch = TargetArch::from_elf_machine(result.e_machine)?;
     let entry = if needs_synthetic_start(&result) {
         synthesize_elf_start_x86_64(&mut result, freebsd_abi)
@@ -250,7 +251,8 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
     } else {
         Some(args.libraries.as_slice())
     };
-    let result = link_multi_object(&obj_refs, libs).ok()?;
+    let result =
+        link_multi_object_with_interp(&obj_refs, libs, args.dynamic_linker.as_deref()).ok()?;
     let entry = select_entry(args, &result)?;
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
     let out_file = std::fs::File::create(out_path).ok()?;
@@ -310,9 +312,12 @@ fn main() {
                         if let Some((format, data, dylib_paths)) = load_objects(&args.input_files) {
                             let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
                             let err = match format {
-                                ObjectFormat::Elf => {
-                                    link_multi_object(&refs, Some(&args.libraries)).err()
-                                }
+                                ObjectFormat::Elf => link_multi_object_with_interp(
+                                    &refs,
+                                    Some(&args.libraries),
+                                    args.dynamic_linker.as_deref(),
+                                )
+                                .err(),
                                 ObjectFormat::MachO => link_macho_multi_object(
                                     &refs,
                                     Some(&args.libraries),
