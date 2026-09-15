@@ -19,7 +19,8 @@ use crate::{
     arch::TargetArch,
     elf::{
         Elf64Header, SectionHeader, Symbol, get_strtab_from_section, get_strtab_string,
-        parse_elf64_slice, parse_rela_section, parse_symtab, reloc_type::R_X86_64_GOTPCREL,
+        parse_elf64_slice, parse_rela_section, parse_symtab,
+        reloc_type::{R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX},
     },
     platform::TargetPlatform,
 };
@@ -499,13 +500,17 @@ fn collect_gotpcrel_symbol_names(data: &[u8], sections: &[SectionHeader], out: &
             continue;
         };
         for rel in relas {
-            if rel.r_type != R_X86_64_GOTPCREL {
+            if !matches!(
+                rel.r_type,
+                R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX
+            ) {
                 continue;
             }
-            if let Some(name) = sym_names.get(rel.r_sym as usize) {
-                if !name.is_empty() && !out.contains(name) {
-                    out.push(name.clone());
-                }
+            if let Some(name) = sym_names.get(rel.r_sym as usize)
+                && !name.is_empty()
+                && !out.contains(name)
+            {
+                out.push(name.clone());
             }
         }
     }
@@ -584,12 +589,14 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     apply_relocations(
         arch,
         &mut layout,
-        data,
-        &sections,
-        &names,
-        &by_index,
-        &[],
-        None,
+        &RelocInputs {
+            data,
+            sections: &sections,
+            names: &names,
+            symbol_addrs: &by_index,
+            got_entries: &[],
+            section_offset: None,
+        },
     )?;
     let symbol_addrs: HashMap<String, u64> = resolved
         .into_iter()
@@ -968,12 +975,14 @@ fn link_multi_object_parsed(
         apply_relocations(
             arch,
             &mut layout,
-            &obj.data,
-            &obj.sections,
-            &obj.names,
-            &by_index,
-            &got_by_index,
-            Some(&section_off),
+            &RelocInputs {
+                data: &obj.data,
+                sections: &obj.sections,
+                names: &obj.names,
+                symbol_addrs: &by_index,
+                got_entries: &got_by_index,
+                section_offset: Some(&section_off),
+            },
         )?;
     }
 
@@ -1158,16 +1167,29 @@ fn build_plt_got_x86_64(
 }
 
 /// Dispatch relocation application to the appropriate architecture handler.
+/// Inputs a relocation pass reads from the object being linked.
+pub struct RelocInputs<'a> {
+    pub data: &'a [u8],
+    pub sections: &'a [SectionHeader],
+    pub names: &'a [String],
+    pub symbol_addrs: &'a [Option<u64>],
+    pub got_entries: &'a [Option<u64>],
+    pub section_offset: Option<&'a HashMap<String, u64>>,
+}
+
 pub fn apply_relocations(
     arch: TargetArch,
     layout: &mut MergedLayout,
-    data: &[u8],
-    sections: &[SectionHeader],
-    names: &[String],
-    symbol_addrs: &[Option<u64>],
-    got_entries: &[Option<u64>],
-    section_offset: Option<&HashMap<String, u64>>,
+    inputs: &RelocInputs<'_>,
 ) -> Result<(), String> {
+    let RelocInputs {
+        data,
+        sections,
+        names,
+        symbol_addrs,
+        got_entries,
+        section_offset,
+    } = *inputs;
     match arch {
         TargetArch::X86_64 => x86_64::apply_relocations(
             layout,
