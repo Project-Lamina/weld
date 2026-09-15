@@ -1,12 +1,12 @@
 use crate::{
+    archive,
     elf::{get_strtab_from_section, get_strtab_string, parse_elf64_slice, parse_symtab},
     macho::{is_macho_dylib, is_macho64, parse_macho64_object},
 };
 
-use std::{collections::HashSet, path::PathBuf, thread};
+use std::{collections::HashSet, path::PathBuf};
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const AR_MAGIC: [u8; 8] = [0x21, 0x3c, 0x61, 0x72, 0x63, 0x68, 0x3e, 0x0a];
 const FAT_MAGIC: u32 = 0xCAFEBABE;
 const FAT_MAGIC_64: u32 = 0xCAFEBABF;
 const CPU_TYPE_X86_64: u32 = 0x01000007;
@@ -37,7 +37,7 @@ struct ObjectSymbolSummary {
 }
 
 #[derive(Clone)]
-struct ArchiveMember {
+struct ArchiveEntry {
     data: Vec<u8>,
     symbols: ObjectSymbolSummary,
     selected: bool,
@@ -242,15 +242,6 @@ fn coff_symbol_name(name_bytes: &[u8], strtab: &[u8]) -> String {
     String::from_utf8_lossy(&name_bytes[..end]).into_owned()
 }
 
-fn is_ar(data: &[u8]) -> bool {
-    data.len() >= AR_MAGIC.len() && data[..AR_MAGIC.len()] == AR_MAGIC
-}
-
-fn read_elf(path: &PathBuf) -> Option<Vec<u8>> {
-    let data = normalize_macho_container(std::fs::read(path).ok()?);
-    if is_elf(&data) { Some(data) } else { None }
-}
-
 #[allow(dead_code)]
 fn read_macho(path: &PathBuf) -> Option<Vec<u8>> {
     let data = normalize_macho_container(std::fs::read(path).ok()?);
@@ -342,55 +333,48 @@ fn apply_symbol_summary(
     }
 }
 
-fn extract_ar_members(data: &[u8]) -> Vec<ArchiveMember> {
-    let mut out = Vec::new();
-    if !is_ar(data) || data.len() < 8 + 60 {
-        return out;
-    }
-    let mut off = 8usize;
-    while off + 60 <= data.len() {
-        let name = std::str::from_utf8(&data[off..off + 16])
-            .unwrap_or("")
-            .trim_end_matches(' ')
-            .trim_end_matches('/');
-        let size_str = std::str::from_utf8(&data[off + 48..off + 58])
-            .unwrap_or("0")
-            .trim_end_matches(' ');
-        let member_size: usize = size_str.parse().unwrap_or(0);
-        off += 60;
-        if member_size > 0 && off + member_size <= data.len() {
-            let member = &data[off..off + member_size];
-            let payload = if let Some(suffix) = name.strip_prefix("#1/") {
-                let n: usize = suffix.parse().unwrap_or(0);
-                if n < member.len() {
-                    &member[n..]
-                } else {
-                    member
+fn load_archive_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
+    Some(
+        archive::parse_members(data)
+            .ok()?
+            .into_iter()
+            .filter_map(|member| {
+                let data = normalize_macho_container(member.data);
+                if !(is_elf(&data) || is_macho64(&data) || is_coff(&data)) {
+                    return None;
                 }
-            } else {
-                member
-            };
-
-            let normalized = normalize_macho_container(payload.to_vec());
-            if !name.is_empty()
-                && name != "/"
-                && name != "//"
-                && (is_elf(&normalized) || is_macho64(&normalized) || is_coff(&normalized))
-            {
-                let symbols = collect_object_symbol_summary(&normalized).unwrap_or_default();
-                out.push(ArchiveMember {
-                    data: normalized,
+                let symbols = collect_object_symbol_summary(&data).unwrap_or_default();
+                Some(ArchiveEntry {
+                    data,
                     symbols,
                     selected: false,
-                });
+                })
+            })
+            .collect(),
+    )
+}
+
+fn select_archive_members(
+    archives: &mut [Vec<ArchiveEntry>],
+    objects: &mut Vec<Vec<u8>>,
+    defined_symbols: &mut HashSet<String>,
+    unresolved_symbols: &mut HashSet<String>,
+) {
+    loop {
+        let mut changed = false;
+        for entry in archives.iter_mut().flatten() {
+            if entry.selected || entry.symbols.defined.is_disjoint(unresolved_symbols) {
+                continue;
             }
+            entry.selected = true;
+            apply_symbol_summary(&entry.symbols, defined_symbols, unresolved_symbols);
+            objects.push(std::mem::take(&mut entry.data));
+            changed = true;
         }
-        off += member_size;
-        if !off.is_multiple_of(2) {
-            off += 1;
+        if !changed {
+            break;
         }
     }
-    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,96 +392,46 @@ fn expand_data_to_objects(data: Vec<u8>) -> Option<Vec<Vec<u8>>> {
     }
 }
 
-pub fn load_objects(paths: &[PathBuf]) -> Option<(ObjectFormat, Vec<Vec<u8>>, Vec<PathBuf>)> {
+pub fn load_objects(
+    paths: &[PathBuf],
+    libs: &[PathBuf],
+    entries: &[String],
+) -> Option<(ObjectFormat, Vec<Vec<u8>>, Vec<PathBuf>)> {
     if paths.is_empty() {
         return None;
     }
 
     let mut all_objects: Vec<Vec<u8>> = Vec::new();
+    let mut archives: Vec<Vec<ArchiveEntry>> = Vec::new();
     let mut dylib_paths: Vec<PathBuf> = Vec::new();
     let mut defined_symbols: HashSet<String> = HashSet::new();
-    let mut unresolved_symbols: HashSet<String> = HashSet::new();
-    let trace_archive = std::env::var("WELD_TRACE_ARCHIVE").ok().as_deref() == Some("1");
+    let mut unresolved_symbols: HashSet<String> = entries.iter().cloned().collect();
 
     for path in paths {
         let data = normalize_macho_container(std::fs::read(path).ok()?);
         if is_macho_dylib(&data) {
             dylib_paths.push(path.clone());
-            continue;
-        }
-
-        if is_ar(&data) {
-            let mut members = extract_ar_members(&data);
-            let mut selected_any = false;
-            if trace_archive {
-                eprintln!(
-                    "[weld] archive {} members={}",
-                    path.display(),
-                    members.len()
-                );
+        } else if archive::is_archive(&data) {
+            archives.push(load_archive_entries(&data)?);
+        } else {
+            for obj in expand_data_to_objects(data)? {
+                let symbols = collect_object_symbol_summary(&obj).unwrap_or_default();
+                apply_symbol_summary(&symbols, &mut defined_symbols, &mut unresolved_symbols);
+                all_objects.push(obj);
             }
-
-            loop {
-                let mut changed = false;
-                for member in members.iter_mut() {
-                    if member.selected {
-                        continue;
-                    }
-                    if member.symbols.defined.is_disjoint(&unresolved_symbols) {
-                        continue;
-                    }
-                    member.selected = true;
-                    selected_any = true;
-                    if trace_archive {
-                        let mut hits: Vec<&str> = member
-                            .symbols
-                            .defined
-                            .intersection(&unresolved_symbols)
-                            .map(|s| s.as_str())
-                            .collect();
-                        hits.sort_unstable();
-                        let sample = hits.into_iter().take(4).collect::<Vec<_>>().join(",");
-                        eprintln!(
-                            "[weld]   select member defs={} undefs={} hits=[{}]",
-                            member.symbols.defined.len(),
-                            member.symbols.undefined.len(),
-                            sample
-                        );
-                    }
-                    apply_symbol_summary(
-                        &member.symbols,
-                        &mut defined_symbols,
-                        &mut unresolved_symbols,
-                    );
-                    all_objects.push(member.data.clone());
-                    changed = true;
-                }
-                if !changed {
-                    break;
-                }
-            }
-
-            if !selected_any
-                && all_objects.is_empty()
-                && let Some(first_member) = members.first()
-            {
-                apply_symbol_summary(
-                    &first_member.symbols,
-                    &mut defined_symbols,
-                    &mut unresolved_symbols,
-                );
-                all_objects.push(first_member.data.clone());
-            }
-            continue;
-        }
-
-        let objs = expand_data_to_objects(data)?;
-        for obj in objs {
-            let symbols = collect_object_symbol_summary(&obj).unwrap_or_default();
-            apply_symbol_summary(&symbols, &mut defined_symbols, &mut unresolved_symbols);
-            all_objects.push(obj);
         }
     }
+    for path in libs {
+        let data = normalize_macho_container(std::fs::read(path).ok()?);
+        archives.push(load_archive_entries(&data)?);
+    }
+
+    select_archive_members(
+        &mut archives,
+        &mut all_objects,
+        &mut defined_symbols,
+        &mut unresolved_symbols,
+    );
 
     if all_objects.is_empty() {
         return None;
@@ -525,35 +459,21 @@ pub fn load_objects(paths: &[PathBuf]) -> Option<(ObjectFormat, Vec<Vec<u8>>, Ve
     Some((format, all_objects, dylib_paths))
 }
 
-pub fn load_elf_objects(paths: &[PathBuf]) -> Option<Vec<Vec<u8>>> {
-    if paths.is_empty() {
-        return None;
-    }
-
-    if paths.len() == 1 {
-        let data = read_elf(paths.first()?)?;
-        return Some(vec![data]);
-    }
-
-    let handles: Vec<_> = paths
-        .iter()
-        .map(|path| {
-            let path = path.clone();
-            thread::spawn(move || read_elf(&path))
-        })
-        .collect();
-
-    let mut out = Vec::with_capacity(handles.len());
-    for handle in handles {
-        let data = handle.join().ok()??;
-        out.push(data);
-    }
-
-    Some(out)
+pub fn load_elf_objects(
+    paths: &[PathBuf],
+    libs: &[PathBuf],
+    entries: &[String],
+) -> Option<Vec<Vec<u8>>> {
+    let (format, objects, _) = load_objects(paths, libs, entries)?;
+    (format == ObjectFormat::Elf).then_some(objects)
 }
 
-pub fn load_macho_objects(paths: &[PathBuf]) -> Option<(Vec<Vec<u8>>, Vec<PathBuf>)> {
-    load_objects(paths).and_then(|(fmt, data, dylib_paths)| {
+pub fn load_macho_objects(
+    paths: &[PathBuf],
+    libs: &[PathBuf],
+    entries: &[String],
+) -> Option<(Vec<Vec<u8>>, Vec<PathBuf>)> {
+    load_objects(paths, libs, entries).and_then(|(fmt, data, dylib_paths)| {
         if fmt == ObjectFormat::MachO {
             Some((data, dylib_paths))
         } else {
@@ -688,5 +608,61 @@ mod tests {
             Some(CPU_TYPE_ARM64) => assert_eq!(thin, second_slice),
             _ => assert!(thin == first_slice || thin == second_slice),
         }
+    }
+}
+
+#[cfg(test)]
+mod archive_selection_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn assemble(dir: &std::path::Path, name: &str, src: &str) -> Option<PathBuf> {
+        let asm = dir.join(format!("{name}.s"));
+        let obj = dir.join(format!("{name}.o"));
+        std::fs::write(&asm, src).ok()?;
+        let status = Command::new("as")
+            .arg("-o")
+            .arg(&obj)
+            .arg(&asm)
+            .status()
+            .ok()?;
+        status.success().then_some(obj)
+    }
+
+    #[test]
+    fn pulls_only_members_reachable_from_undefined_symbols() {
+        let dir = std::env::temp_dir().join(format!("weld-archive-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (Some(main), Some(a), Some(b), Some(c)) = (
+            assemble(&dir, "main", ".globl _start\n_start:\n call dep_fn\n ret\n"),
+            assemble(&dir, "used", ".globl used_fn\nused_fn:\n ret\n"),
+            assemble(&dir, "unused", ".globl unused_fn\nunused_fn:\n ret\n"),
+            assemble(&dir, "dep", ".globl dep_fn\ndep_fn:\n call used_fn\n ret\n"),
+        ) else {
+            return;
+        };
+        let lib = dir.join("libpick.a");
+        let _ = std::fs::remove_file(&lib);
+        let status = Command::new("ar")
+            .arg("rcs")
+            .arg(&lib)
+            .args([&a, &b, &c])
+            .status();
+        let Ok(status) = status else { return };
+        assert!(status.success());
+
+        let entries = vec!["_start".to_string()];
+        let (format, objects, _) =
+            load_objects(&[main, lib], &[], &entries).expect("link inputs load");
+        assert_eq!(format, ObjectFormat::Elf);
+        assert_eq!(objects.len(), 3, "main plus the two needed members");
+        let defines = |name: &str| {
+            objects.iter().any(|obj| {
+                collect_object_symbol_summary(obj).is_some_and(|s| s.defined.contains(name))
+            })
+        };
+        assert!(defines("used_fn"));
+        assert!(defines("dep_fn"));
+        assert!(!defines("unused_fn"));
     }
 }
