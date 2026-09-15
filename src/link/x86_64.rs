@@ -71,15 +71,23 @@ pub fn apply_relocations(
                     }
                     write_u64_le(&mut merged.data, off, val);
                 }
-                reloc_type::R_X86_64_32 => {
+                reloc_type::R_X86_64_32 | reloc_type::R_X86_64_32S => {
                     let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
                         return Err(format!("undefined symbol index {}", rel.r_sym));
                     };
-                    let val = s_addr.wrapping_add_signed(a) as u32;
+                    let full = s_addr.wrapping_add_signed(a);
+                    if rel.r_type == reloc_type::R_X86_64_32S {
+                        let signed = full as i64;
+                        if signed < i64::from(i32::MIN) || signed > i64::from(i32::MAX) {
+                            return Err(format!("R_X86_64_32S value {signed} does not fit in i32"));
+                        }
+                    } else if full > u64::from(u32::MAX) {
+                        return Err(format!("R_X86_64_32 value {full} does not fit in u32"));
+                    }
                     if merged.data.len() < off + 4 {
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }
-                    write_u32_le(&mut merged.data, off, val);
+                    write_u32_le(&mut merged.data, off, full as u32);
                 }
                 reloc_type::R_X86_64_PC32 | reloc_type::R_X86_64_PLT32 => {
                     let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
@@ -91,7 +99,9 @@ pub fn apply_relocations(
                     }
                     write_u32_le(&mut merged.data, off, val);
                 }
-                reloc_type::R_X86_64_GOTPCREL => {
+                reloc_type::R_X86_64_GOTPCREL
+                | reloc_type::R_X86_64_GOTPCRELX
+                | reloc_type::R_X86_64_REX_GOTPCRELX => {
                     let got_entry_vaddr = got_entries
                         .get(rel.r_sym as usize)
                         .copied()
