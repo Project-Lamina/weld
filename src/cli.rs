@@ -194,6 +194,23 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "--version" => return Ok(ParseAction::Version),
             s if s.starts_with("-mmacosx-version-min") || s.starts_with("-mios") => {}
             "-nodefaultlibs" | "-nostdlib" => {}
+            // Driver flags weld has no work for: LTO plugins, linker state
+            // stack, and hints about output it already does one way.
+            "--as-needed" | "--no-as-needed" | "--eh-frame-hdr" | "--no-eh-frame-hdr"
+            | "--push-state" | "--pop-state" | "--build-id" | "-no-pie" | "--no-pie" => {}
+            s if s.starts_with("--hash-style=") || s.starts_with("--build-id=") => {}
+            s if s.starts_with("-plugin-opt=") || s.starts_with("--plugin-opt=") => {}
+            "-plugin" | "--plugin" => {
+                skip_args(argv, &mut i, 1);
+            }
+            "-z" => {
+                skip_args(argv, &mut i, 1);
+            }
+            // gcc passes the single-dash spelling.
+            "-dynamic-linker" => {
+                let next = take_required_arg(argv, &mut i, "-dynamic-linker")?;
+                args.dynamic_linker = Some(next);
+            }
             s if s.starts_with("-L") && s.len() > 2 => {
                 args.search_paths.push(PathBuf::from(&s[2..]));
             }
