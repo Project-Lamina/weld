@@ -34,9 +34,13 @@ pub mod reloc_type {
     pub const R_X86_64_64: u32 = 1;
     pub const R_X86_64_PC32: u32 = 2;
     pub const R_X86_64_32: u32 = 10;
+    pub const R_X86_64_32S: u32 = 11;
     pub const R_X86_64_RELATIVE: u32 = 8;
     pub const R_X86_64_PLT32: u32 = 4;
     pub const R_X86_64_GOTPCREL: u32 = 9;
+    /// Relaxable GOTPCREL forms. weld does not relax, so they behave as GOTPCREL.
+    pub const R_X86_64_GOTPCRELX: u32 = 41;
+    pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
     pub const R_X86_64_JUMP_SLOT: u32 = 7;
     pub const R_X86_64_TLSGD: u32 = 19;
     pub const R_X86_64_TLSLD: u32 = 20;
@@ -236,11 +240,9 @@ pub fn get_strtab_string(strtab: &[u8], offset: u32) -> Option<String> {
 pub fn parse_symtab(data: &[u8], symtab_sh: &SectionHeader) -> Result<Vec<Symbol>, String> {
     let sym_start = symtab_sh.sh_offset as usize;
     let entsize = symtab_sh.sh_entsize as usize;
-    let count = if entsize > 0 {
-        (symtab_sh.sh_size as usize) / entsize
-    } else {
-        (symtab_sh.sh_size as usize) / ELF64_SYM_SIZE
-    };
+    let count = (symtab_sh.sh_size as usize)
+        .checked_div(entsize)
+        .unwrap_or((symtab_sh.sh_size as usize) / ELF64_SYM_SIZE);
 
     let mut symbols = Vec::with_capacity(count);
     for i in 0..count {
