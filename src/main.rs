@@ -4,6 +4,7 @@
 //! No delegation to system linker.
 
 mod arch;
+mod archive;
 mod cli;
 mod elf;
 mod emit;
@@ -17,15 +18,16 @@ use crate::{
     arch::TargetArch,
     cli::{ParseAction, ParsedArgs, parse_args, print_usage},
     link::{
-        DynamicLinkInfo, LinkOptions, LinkResult, MergedSection, link_multi_object_with_options,
-        macho::link_macho_multi_object,
+        DynamicLinkInfo, LibraryResolver, LinkOptions, LinkResult, MergedSection,
+        link_multi_object_with_options, macho::link_macho_multi_object,
     },
     object::{ObjectFormat, load_objects},
+    platform::TargetPlatform,
 };
 use std::{
     env,
     io::{Result, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 const ELFOSABI_NONE: u8 = 0;
@@ -91,10 +93,10 @@ fn select_entry(args: &ParsedArgs, result: &LinkResult) -> Option<u64> {
     }
     result
         .symbol_addrs
-        .get("main")
+        .get("_start")
         .copied()
+        .or_else(|| result.symbol_addrs.get("main").copied())
         .or_else(|| result.symbol_addrs.get("_main").copied())
-        .or_else(|| result.symbol_addrs.get("_start").copied())
         .or_else(|| {
             result
                 .layout
@@ -175,8 +177,42 @@ fn synthesize_elf_start_x86_64(result: &mut LinkResult, freebsd_abi: bool) -> Op
     Some(start_vaddr)
 }
 
+fn host_arch() -> TargetArch {
+    if cfg!(target_arch = "aarch64") {
+        TargetArch::AArch64
+    } else if cfg!(target_arch = "riscv64") {
+        TargetArch::RiscV
+    } else {
+        TargetArch::X86_64
+    }
+}
+
+fn static_library_paths(args: &ParsedArgs) -> Vec<PathBuf> {
+    let mut resolver = LibraryResolver::new(host_arch(), TargetPlatform::current());
+    for path in args.search_paths.iter().rev() {
+        resolver.add_path(path.clone());
+    }
+    args.libraries
+        .iter()
+        .filter_map(|name| resolver.resolve(name))
+        .filter(|resolved| resolved.is_static)
+        .map(|resolved| resolved.path)
+        .collect()
+}
+
+fn entry_seeds(args: &ParsedArgs) -> Vec<String> {
+    match args.entry.as_ref() {
+        Some(entry) => vec![entry.clone()],
+        None => ["_start", "_main", "main"].map(String::from).to_vec(),
+    }
+}
+
 fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
-    let obj_data_list = object::load_elf_objects(&args.input_files)?;
+    let obj_data_list = object::load_elf_objects(
+        &args.input_files,
+        &static_library_paths(args),
+        &entry_seeds(args),
+    )?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
         None
@@ -230,7 +266,11 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
 }
 
 fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
-    let (obj_data_list, dylib_paths) = object::load_macho_objects(&args.input_files)?;
+    let (obj_data_list, dylib_paths) = object::load_macho_objects(
+        &args.input_files,
+        &static_library_paths(args),
+        &entry_seeds(args),
+    )?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
         None
@@ -279,7 +319,11 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
     }
 
     // Legacy ELF-based path (kept for compatibility).
-    let obj_data_list = object::load_elf_objects(&args.input_files)?;
+    let obj_data_list = object::load_elf_objects(
+        &args.input_files,
+        &static_library_paths(args),
+        &entry_seeds(args),
+    )?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
         None
@@ -316,7 +360,11 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         return try_weld_link_pe(args);
     }
 
-    let (format, _, _) = load_objects(&args.input_files)?;
+    let (format, _, _) = load_objects(
+        &args.input_files,
+        &static_library_paths(args),
+        &entry_seeds(args),
+    )?;
 
     match format {
         ObjectFormat::Elf => try_weld_link_elf(args),
@@ -343,7 +391,11 @@ fn main() {
                 }
                 None => {
                     {
-                        if let Some((format, data, dylib_paths)) = load_objects(&args.input_files) {
+                        if let Some((format, data, dylib_paths)) = load_objects(
+                            &args.input_files,
+                            &static_library_paths(&args),
+                            &entry_seeds(&args),
+                        ) {
                             let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
                             let err = match format {
                                 ObjectFormat::Elf => link_multi_object_with_options(
