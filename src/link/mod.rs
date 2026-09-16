@@ -25,7 +25,7 @@ use crate::{
     platform::TargetPlatform,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     thread,
 };
@@ -492,8 +492,14 @@ where
 
 /// Collect the names of all symbols referenced by `R_X86_64_GOTPCREL`
 /// relocations in `data`. New names are appended to `out`; duplicates are
-/// skipped.
-fn collect_gotpcrel_symbol_names(data: &[u8], sections: &[SectionHeader], out: &mut Vec<String>) {
+/// skipped. `seen` carries membership across objects, because `out` holds GOT
+/// slot order and scanning it per relocation is quadratic under -fPIC.
+fn collect_gotpcrel_symbol_names(
+    data: &[u8],
+    sections: &[SectionHeader],
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
     const SHT_RELA: u32 = 4;
     let sym_names = match symbol_names_by_index_raw(data, sections) {
         Some(v) => v,
@@ -512,7 +518,7 @@ fn collect_gotpcrel_symbol_names(data: &[u8], sections: &[SectionHeader], out: &
             }
             if let Some(name) = sym_names.get(rel.r_sym as usize)
                 && !name.is_empty()
-                && !out.contains(name)
+                && seen.insert(name.clone())
             {
                 out.push(name.clone());
             }
@@ -918,8 +924,14 @@ fn link_multi_object_parsed(
     let mut got_symbol_map: HashMap<String, u64> = HashMap::new();
     if arch == TargetArch::X86_64 {
         let mut unique_syms: Vec<String> = Vec::new();
+        let mut got_seen: HashSet<String> = HashSet::new();
         for obj in parsed.iter() {
-            collect_gotpcrel_symbol_names(&obj.data, &obj.sections, &mut unique_syms);
+            collect_gotpcrel_symbol_names(
+                &obj.data,
+                &obj.sections,
+                &mut unique_syms,
+                &mut got_seen,
+            );
         }
         if !unique_syms.is_empty() {
             let got_base = {
