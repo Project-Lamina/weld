@@ -105,6 +105,8 @@ fn parse_object(data: Vec<u8>) -> Result<ParsedObject, String> {
 const SHN_UNDEF: u16 = 0;
 const SHN_ABS: u16 = 0xfff1;
 const STB_LOCAL: u8 = 0;
+const STB_GLOBAL: u8 = 1;
+const STB_WEAK: u8 = 2;
 
 const SHF_ALLOC: u64 = 2;
 const SHF_EXECINSTR: u64 = 4;
@@ -229,9 +231,6 @@ fn append_merged_section(
     vaddr: &mut u64,
 ) {
     let total_size: u64 = contribs.iter().map(|(_, size)| *size).sum();
-    if total_size == 0 {
-        return;
-    }
 
     let mut merged_bytes = Vec::new();
     for (data, _) in contribs {
@@ -468,7 +467,12 @@ where
             }
         };
 
-        by_index.push(address);
+        let index_address = if sym.st_shndx == SHN_UNDEF && sym.bind == STB_WEAK {
+            Some(0)
+        } else {
+            address
+        };
+        by_index.push(index_address);
         // A local name is private to its object. Same-object relocations still find it
         // through by_index; only cross-object lookup must not see it.
         if !name.is_empty() && sym.bind != STB_LOCAL {
@@ -713,17 +717,23 @@ fn link_multi_object_parsed(
 
     if has_shared_lib && arch == TargetArch::X86_64 && e_machine == 62 {
         let mut undefined: Vec<String> = Vec::new();
-        for (obj_idx, obj) in parsed.iter().enumerate() {
-            let obj_by_index = &resolved_by_index_per_object[obj_idx];
-            let symbol_names = symbol_names_by_index(&obj.data, &obj.sections)?;
-            for (i, addr) in obj_by_index.iter().enumerate() {
-                if addr.is_none()
-                    && let Some(name) = symbol_names.get(i)
-                    && !name.is_empty()
-                    && !global_symbols.contains_key(name)
-                    && !undefined.contains(name)
+        for obj in parsed.iter() {
+            let Some((symbols, strtab)) = parse_symtab_view(&obj.data, &obj.sections)? else {
+                continue;
+            };
+            for sym in symbols
+                .iter()
+                .filter(|sym| sym.st_shndx == SHN_UNDEF && sym.bind == STB_GLOBAL)
+            {
+                let Some(name) = get_strtab_string(strtab, sym.name_offset) else {
+                    continue;
+                };
+                if !name.is_empty()
+                    && name != "_GLOBAL_OFFSET_TABLE_"
+                    && !global_symbols.contains_key(&name)
+                    && !undefined.contains(&name)
                 {
-                    undefined.push(name.clone());
+                    undefined.push(name);
                 }
             }
         }
@@ -766,6 +776,9 @@ fn link_multi_object_parsed(
             layout
                 .section_by_name
                 .insert(".got.plt".into(), layout.sections.len() - 1);
+            global_symbols
+                .entry("_GLOBAL_OFFSET_TABLE_".to_string())
+                .or_insert(got_plt_vaddr);
             let got_plt_size = 24 + (undefined.len() as u64) * 8;
             vaddr = align_up(got_plt_vaddr + got_plt_size, 8);
 
@@ -777,12 +790,11 @@ fn link_multi_object_parsed(
                         // macOS compatibility alias — not meaningful for ELF.
                         return None;
                     }
-                    Some(
-                        resolver
-                            .resolve(name)
-                            .map(|r| r.soname)
-                            .unwrap_or_else(|| resolver.expected_soname(name)),
-                    )
+                    match resolver.resolve(name) {
+                        Some(r) if r.is_static => None,
+                        Some(r) => Some(r.soname),
+                        None => Some(resolver.expected_soname(name)),
+                    }
                 })
                 .collect();
 
