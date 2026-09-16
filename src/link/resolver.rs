@@ -63,15 +63,55 @@ impl LibraryResolver {
             for (filename, soname, is_static) in &candidates {
                 let path = dir.join(filename);
                 if path.exists() {
+                    if !is_static && !is_elf_file(&path) {
+                        if let Some(found) = self.resolve_linker_script(&path) {
+                            return Some(found);
+                        }
+                        continue;
+                    }
+                    let soname = if !is_static && soname.ends_with(".so") {
+                        path.canonicalize()
+                            .ok()
+                            .and_then(|real| {
+                                real.file_name().map(|n| n.to_string_lossy().into_owned())
+                            })
+                            .unwrap_or_else(|| soname.clone())
+                    } else {
+                        soname.clone()
+                    };
                     return Some(ResolvedLibrary {
                         path,
-                        soname: soname.clone(),
+                        soname,
                         is_static: *is_static,
                     });
                 }
             }
         }
 
+        None
+    }
+
+    /// Follow a GNU ld text script (`GROUP ( libfoo.so.1 -lbar )`) to the
+    /// shared object it names, searching the same directories.
+    fn resolve_linker_script(&self, script: &Path) -> Option<ResolvedLibrary> {
+        let text = std::fs::read_to_string(script).ok()?;
+        let body = text.rsplit("*/").next()?;
+        for token in body.split(|c: char| c == '(' || c == ')' || c.is_whitespace()) {
+            if token.starts_with('-') || !token.contains(".so") {
+                continue;
+            }
+            let file_name = Path::new(token).file_name()?.to_string_lossy().into_owned();
+            let found = self
+                .search_paths
+                .iter()
+                .map(|dir| dir.join(&file_name))
+                .find(|candidate| candidate.is_file())?;
+            return Some(ResolvedLibrary {
+                path: found,
+                soname: file_name,
+                is_static: false,
+            });
+        }
         None
     }
 
@@ -159,6 +199,15 @@ impl LibraryResolver {
 // ---------------------------------------------------------------------------
 // Platform-default search paths
 // ---------------------------------------------------------------------------
+
+fn is_elf_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && magic == [0x7f, b'E', b'L', b'F']
+}
 
 fn default_search_paths(arch: TargetArch, platform: TargetPlatform) -> Vec<PathBuf> {
     match platform {
