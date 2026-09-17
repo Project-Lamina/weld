@@ -182,3 +182,32 @@ fn gc_follows_relocations_and_prunes_unwind_records() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn strip_preserves_dynamic_symbols_and_map_retains_definitions() {
+    let dir = std::env::temp_dir().join(format!("weld-strip-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("main.c"),
+        "#include <stdio.h>\nint main(void){puts(\"hello\");return 0;}\n",
+    )
+    .unwrap();
+    run("gcc", &["-fno-pie", "-c", "main.c", "-o", "main.o"], &dir);
+    for flag in ["-s", "--strip-all"] {
+        run(
+            env!("CARGO_BIN_EXE_weld"),
+            &["main.o", "-lc", flag, "--Map=output.map", "-o", "output"],
+            &dir,
+        );
+        let sections = run("readelf", &["-SW", "output"], &dir);
+        assert!(sections.contains(".dynsym") && sections.contains(".dynstr"));
+        assert!(!sections.contains(".symtab") && !sections.contains(" .strtab"));
+        let map = fs::read_to_string(dir.join("output.map")).unwrap();
+        assert!(map.contains("main") && map.contains(".text") && map.contains("Entry point"));
+        assert_eq!(
+            run(dir.join("output").to_str().unwrap(), &[], &dir),
+            "hello\n"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

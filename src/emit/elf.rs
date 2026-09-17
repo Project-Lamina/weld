@@ -73,7 +73,7 @@ pub fn emit_elf_executable(
     arch: TargetArch,
     entry: u64,
     os_abi: u8,
-    symbols: &[OutputSymbol],
+    symbols: Option<&[OutputSymbol]>,
     out: &mut impl Write,
 ) -> Result<()> {
     let (base, mut seg_buffer) = build_segment_buffer(layout, arch.default_load_base());
@@ -162,7 +162,7 @@ pub fn emit_elf_executable_dynamic(
     entry: u64,
     os_abi: u8,
     dynamic: &DynamicLinkInfo,
-    symbols: &[OutputSymbol],
+    symbols: Option<&[OutputSymbol]>,
     out: &mut impl Write,
 ) -> Result<()> {
     let interpreter = dynamic
@@ -328,7 +328,7 @@ struct SectionMetadata {
 impl SectionMetadata {
     fn new(
         layout: &MergedLayout,
-        symbols: &[OutputSymbol],
+        symbols: Option<&[OutputSymbol]>,
         segment_offset: u64,
         base: u64,
         segment_size: usize,
@@ -375,7 +375,11 @@ impl SectionMetadata {
         let mut symtab = vec![0; 24];
         let mut first_global = 1;
         for local in [true, false] {
-            for symbol in symbols.iter().filter(|s| (s.info >> 4 == 0) == local) {
+            for symbol in symbols
+                .unwrap_or_default()
+                .iter()
+                .filter(|s| (s.info >> 4 == 0) == local)
+            {
                 let name = if symbol.name.is_empty() {
                     0
                 } else {
@@ -395,11 +399,13 @@ impl SectionMetadata {
             }
         }
         let sym_index = headers.len() as u32 + 1;
-        for (name, data, kind, link, info, align, entsize) in [
-            (".symtab", symtab, 2, sym_index + 1, first_global, 8, 24),
-            (".strtab", strtab, 3, 0, 0, 1, 0),
-            (".shstrtab", Vec::new(), 3, 0, 0, 1, 0),
-        ] {
+        let mut tables = Vec::new();
+        if symbols.is_some() {
+            tables.push((".symtab", symtab, 2, sym_index + 1, first_global, 8, 24));
+            tables.push((".strtab", strtab, 3, 0, 0, 1, 0));
+        }
+        tables.push((".shstrtab", Vec::new(), 3, 0, 0, 1, 0));
+        for (name, data, kind, link, info, align, entsize) in tables {
             let offset = align_up_u64(start + bytes.len() as u64, align);
             bytes.resize((offset - start) as usize, 0);
             let name_offset = names.len() as u32;
@@ -476,7 +482,15 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        emit_elf_executable(&layout, TargetArch::X86_64, 0x400000, 0, &[], &mut out).expect("emit");
+        emit_elf_executable(
+            &layout,
+            TargetArch::X86_64,
+            0x400000,
+            0,
+            Some(&[]),
+            &mut out,
+        )
+        .expect("emit");
 
         assert!(out.len() >= 64);
         assert_eq!(&out[0..4], &[0x7f, b'E', b'L', b'F']);
@@ -505,8 +519,15 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        emit_elf_executable(&layout, TargetArch::AArch64, 0x400000, 0, &[], &mut out)
-            .expect("emit");
+        emit_elf_executable(
+            &layout,
+            TargetArch::AArch64,
+            0x400000,
+            0,
+            Some(&[]),
+            &mut out,
+        )
+        .expect("emit");
         assert!(out.len() >= 64);
         assert_eq!(&out[0..4], &[0x7f, b'E', b'L', b'F']);
         assert_eq!(out[18..20], 183u16.to_le_bytes());
@@ -533,7 +554,7 @@ mod tests {
             .unwrap_or_else(|| result.layout.sections.first().map(|s| s.vaddr).unwrap());
 
         let mut out = Vec::new();
-        emit_elf_executable(&result.layout, arch, entry, 0, &[], &mut out).expect("emit");
+        emit_elf_executable(&result.layout, arch, entry, 0, Some(&[]), &mut out).expect("emit");
 
         assert!(out.len() >= 64);
         assert_eq!(&out[0..4], &[0x7f, b'E', b'L', b'F']);
