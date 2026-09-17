@@ -117,6 +117,8 @@ const SHT_SYMTAB: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct MergedSection {
+    pub entsize: u64,
+    pub sh_type: u32,
     pub name: String,
     pub data: Vec<u8>,
     pub vaddr: u64,
@@ -147,12 +149,133 @@ pub struct DynamicLinkInfo {
     pub macho_direct_binds: Vec<(u64, String, bool, i64)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OutputSymbol {
+    pub name: String,
+    pub info: u8,
+    pub shndx: u16,
+    pub value: u64,
+    pub size: u64,
+}
+
 #[derive(Debug)]
 pub struct LinkResult {
+    pub symbols: Vec<OutputSymbol>,
     pub layout: MergedLayout,
     pub e_machine: u16,
     pub symbol_addrs: HashMap<String, u64>,
     pub dynamic: Option<DynamicLinkInfo>,
+}
+
+fn reserve_start(
+    layout: &mut MergedLayout,
+    sections: &[SectionHeader],
+    data: &[u8],
+) -> Result<(), String> {
+    let Some((symbols, strings)) = parse_symtab_view(data, sections)? else {
+        return Ok(());
+    };
+    if symbols.iter().any(|s| {
+        s.st_shndx != SHN_UNDEF
+            && get_strtab_string(strings, s.name_offset).as_deref() == Some("_start")
+    }) {
+        return Ok(());
+    }
+    reserve_start_section(layout);
+    Ok(())
+}
+
+fn reserve_start_section(layout: &mut MergedLayout) {
+    let end = layout
+        .sections
+        .iter()
+        .map(|s| s.vaddr + s.data.len() as u64)
+        .max()
+        .unwrap_or(0x400000);
+    layout
+        .section_by_name
+        .insert(".text.__weld_start".into(), layout.sections.len());
+    layout.sections.push(MergedSection {
+        name: ".text.__weld_start".into(),
+        entsize: 0,
+        sh_type: 1,
+        data: vec![0; 64],
+        vaddr: align_up(end, 16),
+        flags: 6,
+        align: 16,
+    });
+}
+
+fn move_nobits(layout: &mut MergedLayout) -> Vec<(u64, u64, u64)> {
+    let mut end = layout
+        .sections
+        .iter()
+        .filter(|s| s.sh_type != SHT_NOBITS)
+        .map(|s| s.vaddr + s.data.len() as u64)
+        .max()
+        .unwrap_or(0x400000);
+    let mut shifts = Vec::new();
+    for section in &mut layout.sections {
+        if section.sh_type == SHT_NOBITS {
+            end = align_up(end, section.align);
+            shifts.push((
+                section.vaddr,
+                section.vaddr + section.data.len() as u64,
+                end,
+            ));
+            section.vaddr = end;
+            end += section.data.len() as u64;
+        }
+    }
+    shifts
+}
+
+fn collect_output_symbols(
+    data: &[u8],
+    sections: &[SectionHeader],
+    names: &[String],
+    layout: &MergedLayout,
+    section_offset: impl Fn(&str) -> Option<u64>,
+    globals: &HashMap<String, u64>,
+) -> Result<Vec<OutputSymbol>, String> {
+    let Some((symbols, strtab)) = parse_symtab_view(data, sections)? else {
+        return Ok(Vec::new());
+    };
+    let mut output = Vec::new();
+    for sym in symbols {
+        if sym.st_shndx == SHN_UNDEF {
+            continue;
+        }
+        let name = get_strtab_string(strtab, sym.name_offset).ok_or("invalid symbol name")?;
+        let (shndx, value) = if sym.st_shndx == SHN_ABS {
+            (SHN_ABS, sym.st_value)
+        } else {
+            let Some(section_name) = names.get(sym.st_shndx as usize) else {
+                continue;
+            };
+            let Some(&index) = layout.section_by_name.get(section_name) else {
+                continue;
+            };
+            let Some(offset) = section_offset(section_name) else {
+                continue;
+            };
+            (
+                (index + 1) as u16,
+                layout.sections[index].vaddr + offset + sym.st_value,
+            )
+        };
+        if sym.bind != STB_LOCAL && globals.get(&name).is_some_and(|&addr| addr != value) {
+            continue;
+        }
+        output.push(OutputSymbol {
+            name,
+            info: (sym.bind << 4) | sym.sym_type,
+            shndx,
+            value,
+            size: sym.st_size,
+        });
+    }
+    Ok(output)
 }
 
 fn align_up(value: u64, align: u64) -> u64 {
@@ -203,11 +326,6 @@ fn read_section_data(data: &[u8], sh: &SectionHeader) -> Vec<u8> {
             let end = start + sh.sh_size as usize;
             data.get(start..end).unwrap_or(&[]).to_vec()
         }
-        // NOBITS has no bytes in the object, but layout advances vaddr by its size and
-        // the segment's file size is taken from data.len(). Returning nothing left .bss
-        // outside the mapping and let anything placed after it alias the same address.
-        // Zeroes cost file size; the alternative is a memory size separate from the
-        // file size carried through the segment builder and the ELF writer.
         SHT_NOBITS => vec![0u8; sh.sh_size as usize],
         _ => Vec::new(),
     }
@@ -243,6 +361,8 @@ fn append_merged_section(
     let idx = layout.sections.len();
     layout.section_by_name.insert(name.to_string(), idx);
     layout.sections.push(MergedSection {
+        entsize: 0,
+        sh_type: 1,
         name: name.to_string(),
         data: merged_bytes,
         vaddr: *vaddr,
@@ -273,6 +393,8 @@ pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String>
         let data_slice = read_section_data(data, sh);
 
         let merged = MergedSection {
+            entsize: sh.sh_entsize,
+            sh_type: sh.sh_type,
             name: name.clone(),
             data: data_slice,
             vaddr,
@@ -319,6 +441,7 @@ pub fn merge_sections_multi_object(
     let mut merged_data: HashMap<String, Vec<(Vec<u8>, u64)>> = HashMap::new();
     let mut section_cumul: HashMap<String, u64> = HashMap::new();
     let mut section_aligns: HashMap<String, u64> = HashMap::new();
+    let mut section_types = HashMap::new();
     let mut section_flags: HashMap<String, u64> = HashMap::new();
 
     for obj_data in objects {
@@ -333,6 +456,7 @@ pub fn merge_sections_multi_object(
         let mut obj_contribs = HashMap::new();
 
         for (name, sh) in collect_mergeable_sections(&sections, &names) {
+            section_types.insert(name.clone(), (sh.sh_type, sh.sh_entsize));
             let data_slice = read_section_data(obj_data, sh);
 
             let size = sh.sh_size;
@@ -412,6 +536,9 @@ pub fn merge_sections_multi_object(
         append_merged_section(&mut layout, name, contribs, align, flags, &mut vaddr);
     }
 
+    for section in &mut layout.sections {
+        (section.sh_type, section.entsize) = section_types[&section.name];
+    }
     Ok((layout, section_contribs))
 }
 
@@ -593,6 +720,8 @@ pub fn merge_and_resolve(
 pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let (header, sections, names) = parse_elf64_slice(data)?;
     let mut layout = merge_sections_single_object(data)?;
+    reserve_start(&mut layout, &sections, data)?;
+    move_nobits(&mut layout);
     let (resolved, by_index) = resolve_symbols(data, &layout, &sections, &names)?;
     let arch = TargetArch::from_elf_machine(header.e_machine)
         .ok_or_else(|| format!("unsupported machine {}", header.e_machine))?;
@@ -613,6 +742,14 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
         .filter_map(|(name, r)| r.address.map(|a| (name, a)))
         .collect();
     Ok(LinkResult {
+        symbols: collect_output_symbols(
+            data,
+            &sections,
+            &names,
+            &layout,
+            |_| Some(0),
+            &symbol_addrs,
+        )?,
         layout,
         e_machine: header.e_machine,
         symbol_addrs,
@@ -760,6 +897,8 @@ fn link_multi_object_parsed(
 
             let plt_vaddr = vaddr;
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".plt".into(),
                 data: plt_data,
                 vaddr: plt_vaddr,
@@ -773,6 +912,8 @@ fn link_multi_object_parsed(
 
             let got_plt_vaddr = vaddr;
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".got.plt".into(),
                 data: got_plt_data,
                 vaddr: got_plt_vaddr,
@@ -815,6 +956,8 @@ fn link_multi_object_parsed(
             let dynsym_vaddr = vaddr;
             let dynsym_size = dynsym_data.len() as u64;
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".dynsym".into(),
                 data: dynsym_data,
                 vaddr: dynsym_vaddr,
@@ -829,6 +972,8 @@ fn link_multi_object_parsed(
             let dynstr_vaddr = vaddr;
             let dynstr_size = dynstr_data.len() as u64;
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".dynstr".into(),
                 data: dynstr_data,
                 vaddr: dynstr_vaddr,
@@ -843,6 +988,8 @@ fn link_multi_object_parsed(
             let rela_plt_vaddr = vaddr;
             let rela_plt_size = rela_plt_data.len() as u64;
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".rela.plt".into(),
                 data: rela_plt_data,
                 vaddr: rela_plt_vaddr,
@@ -857,6 +1004,8 @@ fn link_multi_object_parsed(
             let hash_vaddr = vaddr;
             let hash_size = hash_data.len() as u64;
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".hash".into(),
                 data: hash_data,
                 vaddr: hash_vaddr,
@@ -883,6 +1032,8 @@ fn link_multi_object_parsed(
             )?;
             let dynamic_vaddr = vaddr;
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".dynamic".into(),
                 data: dynamic_data,
                 vaddr: dynamic_vaddr,
@@ -940,6 +1091,8 @@ fn link_multi_object_parsed(
             };
             let got_data = vec![0u8; unique_syms.len() * 8];
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".got".into(),
                 data: got_data,
                 vaddr: got_base,
@@ -951,6 +1104,24 @@ fn link_multi_object_parsed(
                 .insert(".got".into(), layout.sections.len() - 1);
             for (i, name) in unique_syms.iter().enumerate() {
                 got_symbol_map.insert(name.clone(), got_base + i as u64 * 8);
+            }
+        }
+    }
+
+    if !global_symbols.contains_key("_start")
+        && (global_symbols.contains_key("main") || global_symbols.contains_key("_main"))
+    {
+        reserve_start_section(&mut layout);
+    }
+    let shifts = move_nobits(&mut layout);
+    for address in global_symbols
+        .values_mut()
+        .chain(resolved_by_index_per_object.iter_mut().flatten().flatten())
+    {
+        for &(start, end, new) in &shifts {
+            if *address >= start && *address < end {
+                *address = new + (*address - start);
+                break;
             }
         }
     }
@@ -1010,7 +1181,24 @@ fn link_multi_object_parsed(
         )?;
     }
 
+    let mut symbols = Vec::new();
+    let mut emitted = HashSet::new();
+    for (i, obj) in parsed.iter().enumerate() {
+        for symbol in collect_output_symbols(
+            &obj.data,
+            &obj.sections,
+            &obj.names,
+            &layout,
+            |name| section_contribs[i].get(name).map(|c| c.offset_in_merged),
+            &global_symbols,
+        )? {
+            if symbol.info >> 4 == 0 || emitted.insert(symbol.name.clone()) {
+                symbols.push(symbol);
+            }
+        }
+    }
     Ok(LinkResult {
+        symbols,
         layout,
         e_machine,
         symbol_addrs: global_symbols,
