@@ -7,11 +7,9 @@
 //! - An import directory for kernel32.dll (ExitProcess + any runtime symbols)
 //! - Proper section/file alignment and correct RVA fixups
 
+use crate::collections::{HashMap, HashSet};
 use crate::link::{DynamicLinkInfo, MergedLayout};
-use std::{
-    collections::{HashMap, HashSet},
-    io::{Result, Write},
-};
+use std::io::{Result, Write};
 
 // ---------------------------------------------------------------------------
 // PE constants
@@ -618,7 +616,7 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
 
     // Build map: symbol_name → index for undefined external symbols
     let undefined_syms: Vec<String> = {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut out_v = Vec::new();
         for (i, name) in sym_names.iter().enumerate() {
             if name.is_empty() {
@@ -792,7 +790,7 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
     let dll_sym_counts = vec![k32_syms.len(), ucrt_syms.len()];
 
     // Build a lookup: undefined_sym_name → IAT entry VA (IMAGE_BASE + rdata_rva + offset)
-    let mut sym_iat_va: HashMap<String, u64> = HashMap::new();
+    let mut sym_iat_va: HashMap<String, u64> = HashMap::default();
     for (i, name) in k32_syms.iter().enumerate() {
         sym_iat_va.insert(
             name.to_string(),
@@ -1076,7 +1074,7 @@ mod tests {
                 align: 16,
             }],
             section_by_name: {
-                let mut m = HashMap::new();
+                let mut m = HashMap::default();
                 m.insert(".text".to_string(), 0);
                 m
             },

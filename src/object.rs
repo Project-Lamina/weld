@@ -4,7 +4,8 @@ use crate::{
     macho::{is_macho_dylib, is_macho64, parse_macho64_object},
 };
 
-use std::{collections::HashSet, path::PathBuf};
+use crate::collections::HashSet;
+use std::path::PathBuf;
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const FAT_MAGIC: u32 = 0xCAFEBABE;
@@ -404,19 +405,25 @@ pub fn load_objects(
     let mut all_objects: Vec<Vec<u8>> = Vec::new();
     let mut archives: Vec<Vec<ArchiveEntry>> = Vec::new();
     let mut dylib_paths: Vec<PathBuf> = Vec::new();
-    let mut defined_symbols: HashSet<String> = HashSet::new();
+    let mut defined_symbols: HashSet<String> = HashSet::default();
     let mut unresolved_symbols: HashSet<String> = entries.iter().cloned().collect();
 
-    for path in paths {
-        let data = normalize_macho_container(std::fs::read(path).ok()?);
+    let loaded = crate::parallel::map(paths.to_vec(), |path| {
+        std::fs::read(path).ok().map(normalize_macho_container)
+    });
+    let loaded: Vec<_> = loaded.into_iter().collect::<Option<_>>()?;
+    let need_summaries = !libs.is_empty() || loaded.iter().any(|data| archive::is_archive(data));
+    for (path, data) in paths.iter().zip(loaded) {
         if is_macho_dylib(&data) {
             dylib_paths.push(path.clone());
         } else if archive::is_archive(&data) {
             archives.push(load_archive_entries(&data)?);
         } else {
             for obj in expand_data_to_objects(data)? {
-                let symbols = collect_object_symbol_summary(&obj).unwrap_or_default();
-                apply_symbol_summary(&symbols, &mut defined_symbols, &mut unresolved_symbols);
+                if need_summaries {
+                    let symbols = collect_object_symbol_summary(&obj).unwrap_or_default();
+                    apply_symbol_summary(&symbols, &mut defined_symbols, &mut unresolved_symbols);
+                }
                 all_objects.push(obj);
             }
         }

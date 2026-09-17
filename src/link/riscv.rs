@@ -3,10 +3,10 @@
 //! Covers the relocations produced by a standard RISC-V toolchain:
 //! absolute, PC-relative, AUIPC+JALR call pairs, and branch/JAL.
 
+use crate::collections::HashMap;
 use crate::elf::reloc_type;
 use crate::elf::{SectionHeader, parse_rela_section};
 use crate::link::MergedLayout;
-use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Raw read/write helpers
@@ -95,7 +95,7 @@ pub fn apply_relocations(
     // Cache for PCREL_HI20 values keyed by the PC of the AUIPC instruction.
     // PCREL_LO12_I/S relocations reference the symbol of the paired AUIPC,
     // so we record the full PC-relative offset there.
-    let mut hi20_cache: HashMap<u64, i64> = HashMap::new();
+    let mut hi20_cache: HashMap<u64, i64> = HashMap::default();
 
     for rela_sh in sections.iter() {
         if rela_sh.sh_type != SHT_RELA {

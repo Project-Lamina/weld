@@ -4,15 +4,13 @@
 
 #![allow(dead_code)]
 
+use crate::collections::{BTreeMap, HashMap, HashSet};
 use crate::{
     arch::TargetArch,
     link::{DynamicLinkInfo, MergedLayout, MergedSection},
     segment::{align_up_u64, align_up_usize, build_segment_buffer},
 };
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    io::{Error, ErrorKind, Result, Write},
-};
+use std::io::{Error, ErrorKind, Result, Write};
 
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
 const MH_EXECUTABLE: u32 = 2;
@@ -723,11 +721,11 @@ pub fn emit_macho_executable_dynamic(
 
     let text_layout = MergedLayout {
         sections: text_sections_owned.clone(),
-        section_by_name: HashMap::new(),
+        section_by_name: HashMap::default(),
     };
     let data_layout = MergedLayout {
         sections: data_sections_owned.clone(),
-        section_by_name: HashMap::new(),
+        section_by_name: HashMap::default(),
     };
 
     let (text_base, text_buffer) = build_segment_buffer(&text_layout, SEG_BASE);
@@ -1146,7 +1144,7 @@ mod tests {
                 align: 16,
             }],
             section_by_name: {
-                let mut m = HashMap::new();
+                let mut m = HashMap::default();
                 m.insert(".text".into(), 0);
                 m
             },

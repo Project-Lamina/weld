@@ -63,7 +63,7 @@ fn frame_relocations<'a>(
 }
 
 pub(super) fn collect(parsed: &mut [ParsedObject], roots: &[String]) -> Result<(), String> {
-    let mut globals = HashMap::new();
+    let mut globals = HashMap::default();
     let mut tables = Vec::new();
     for (i, obj) in parsed.iter().enumerate() {
         let table = parse_symtab_view(&obj.data, &obj.sections)?.unwrap_or_default();
@@ -83,8 +83,8 @@ pub(super) fn collect(parsed: &mut [ParsedObject], roots: &[String]) -> Result<(
         }
         tables.push(table);
     }
-    let mut edges: HashMap<Node, Vec<Node>> = HashMap::new();
-    let mut live = HashSet::new();
+    let mut edges: HashMap<Node, Vec<Node>> = HashMap::default();
+    let mut live = HashSet::default();
     for name in roots {
         if let Some(&node) = globals.get(name) {
             live.insert(node);
@@ -162,7 +162,7 @@ pub(super) fn collect(parsed: &mut [ParsedObject], roots: &[String]) -> Result<(
             let relas = parse_rela_section(&obj.data, section)?;
             let mut bytes = Vec::new();
             let mut relocations = Vec::new();
-            let mut offsets = HashMap::new();
+            let mut offsets = HashMap::default();
             for frame in frames(data)? {
                 let keep = frame.cie.is_none()
                     || frame_relocations(&frame, &relas)
