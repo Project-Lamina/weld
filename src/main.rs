@@ -41,6 +41,8 @@ fn link_options(args: &ParsedArgs) -> LinkOptions {
         rpaths: args.rpaths.clone(),
         library_as_needed: args.library_as_needed.clone(),
         library_positions: args.library_positions.clone(),
+        gc_sections: args.gc_sections,
+        gc_roots: entry_seeds(args),
     }
 }
 
