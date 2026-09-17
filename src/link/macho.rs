@@ -196,6 +196,8 @@ fn merge_macho_sections(obj: &Macho64Object) -> MergedLayout {
         let idx = layout.sections.len();
         layout.section_by_name.insert(name.clone(), idx);
         layout.sections.push(MergedSection {
+            entsize: 0,
+            sh_type: 1,
             name,
             data,
             vaddr,
@@ -873,6 +875,7 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let e_machine = arch.to_elf_machine();
 
     Ok(LinkResult {
+        symbols: Vec::new(),
         layout,
         e_machine,
         symbol_addrs,
@@ -1043,6 +1046,8 @@ pub fn link_macho_multi_object(
 
             let stubs_vaddr = vaddr;
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: "__stubs".into(),
                 data: stubs_data,
                 vaddr: stubs_vaddr,
@@ -1056,6 +1061,8 @@ pub fn link_macho_multi_object(
 
             let stub_helper_vaddr = vaddr;
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: "__stub_helper".into(),
                 data: stub_helper_data,
                 vaddr: stub_helper_vaddr,
@@ -1071,6 +1078,8 @@ pub fn link_macho_multi_object(
             let got_vaddr = vaddr;
 
             layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: "__got".into(),
                 data: got_data,
                 vaddr: got_vaddr,
@@ -1227,6 +1236,7 @@ pub fn link_macho_multi_object(
     };
 
     Ok(LinkResult {
+        symbols: Vec::new(),
         layout,
         e_machine,
         symbol_addrs: global_symbols,
@@ -1467,6 +1477,8 @@ fn merge_macho_sections_multi(
         let idx = layout.sections.len();
         layout.section_by_name.insert(merged_name.clone(), idx);
         layout.sections.push(MergedSection {
+            entsize: 0,
+            sh_type: 1,
             name: merged_name.clone(),
             data: merged_bytes,
             vaddr,
@@ -1502,6 +1514,8 @@ fn merge_macho_sections_multi(
         let idx = layout.sections.len();
         layout.section_by_name.insert(merged_name.clone(), idx);
         layout.sections.push(MergedSection {
+            entsize: 0,
+            sh_type: 1,
             name: merged_name,
             data: merged_bytes,
             vaddr,

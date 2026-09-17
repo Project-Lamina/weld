@@ -132,8 +132,21 @@ fn synthesize_elf_start_x86_64(result: &mut LinkResult, freebsd_abi: bool) -> Op
         .or_else(|| result.symbol_addrs.get("_main"))
         .copied()?;
 
-    let last = result.layout.sections.last()?;
-    let start_vaddr = (last.vaddr + last.data.len() as u64 + 15) & !15;
+    let reserved = result
+        .layout
+        .section_by_name
+        .get(".text.__weld_start")
+        .copied();
+    let start_vaddr = reserved
+        .map(|i| result.layout.sections[i].vaddr)
+        .or_else(|| {
+            result
+                .layout
+                .sections
+                .iter()
+                .map(|s| (s.vaddr + s.data.len() as u64 + 15) & !15)
+                .max()
+        })?;
 
     let sys_exit: u32 = if freebsd_abi { 1 } else { 60 };
 
@@ -161,12 +174,18 @@ fn synthesize_elf_start_x86_64(result: &mut LinkResult, freebsd_abi: bool) -> Op
         }
     }
 
+    if let Some(index) = reserved {
+        result.layout.sections[index].data[..code.len()].copy_from_slice(&code);
+        return Some(start_vaddr);
+    }
     let idx = result.layout.sections.len();
     result
         .layout
         .section_by_name
         .insert(".text.__weld_start".to_string(), idx);
     result.layout.sections.push(MergedSection {
+        entsize: 0,
+        sh_type: 1,
         name: ".text.__weld_start".to_string(),
         data: code,
         vaddr: start_vaddr,
@@ -253,11 +272,20 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
             entry,
             os_abi,
             dyn_info,
+            &result.symbols,
             &mut out,
         )
         .ok()?;
     } else {
-        emit::elf::emit_elf_executable(&result.layout, arch, entry, os_abi, &mut out).ok()?;
+        emit::elf::emit_elf_executable(
+            &result.layout,
+            arch,
+            entry,
+            os_abi,
+            &result.symbols,
+            &mut out,
+        )
+        .ok()?;
     }
     out.flush().ok()?;
     drop(out);
@@ -454,8 +482,11 @@ mod tests {
         let mut symbol_addrs = HashMap::new();
         symbol_addrs.insert("main".to_string(), 0x400000u64);
         LinkResult {
+            symbols: Vec::new(),
             layout: MergedLayout {
                 sections: vec![MergedSection {
+                    entsize: 0,
+                    sh_type: 1,
                     name: ".text".to_string(),
                     data: vec![0xc3],
                     vaddr: 0x400000,

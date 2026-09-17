@@ -1067,6 +1067,8 @@ mod tests {
 
         let layout = MergedLayout {
             sections: vec![MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".text".to_string(),
                 data: vec![0xC3], // single RET instruction
                 vaddr: entry,
