@@ -5,6 +5,8 @@ pub struct ParsedArgs {
     pub output_file: Option<PathBuf>,
     pub entry: Option<String>,
     pub libraries: Vec<String>,
+    pub library_as_needed: Vec<bool>,
+    pub library_positions: Vec<usize>,
     pub emulation: Option<String>,
     pub dynamic_linker: Option<String>,
     pub target_os: Option<String>,
@@ -137,6 +139,8 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
     let argv = &expand_argv(argv, 0)?;
     let mut args = ParsedArgs::default();
     let mut i = 0;
+    let mut as_needed = false;
+    let mut states = Vec::new();
 
     while i < argv.len() {
         let a = &argv[i];
@@ -176,6 +180,8 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
                     s[2..].to_string()
                 };
                 args.libraries.push(lib);
+                args.library_as_needed.push(as_needed);
+                args.library_positions.push(args.input_files.len());
             }
             "-m" => {
                 let next = take_required_arg(argv, &mut i, "-m")?;
@@ -196,8 +202,11 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "-nodefaultlibs" | "-nostdlib" => {}
             // Driver flags weld has no work for: LTO plugins, linker state
             // stack, and hints about output it already does one way.
-            "--as-needed" | "--no-as-needed" | "--eh-frame-hdr" | "--no-eh-frame-hdr"
-            | "--push-state" | "--pop-state" | "--build-id" | "-no-pie" | "--no-pie" => {}
+            "--as-needed" => as_needed = true,
+            "--no-as-needed" => as_needed = false,
+            "--push-state" => states.push(as_needed),
+            "--pop-state" => as_needed = states.pop().ok_or("unmatched --pop-state")?,
+            "--eh-frame-hdr" | "--no-eh-frame-hdr" | "--build-id" | "-no-pie" | "--no-pie" => {}
             s if s.starts_with("--hash-style=") || s.starts_with("--build-id=") => {}
             s if s.starts_with("-plugin-opt=") || s.starts_with("--plugin-opt=") => {}
             "-plugin" | "--plugin" => {

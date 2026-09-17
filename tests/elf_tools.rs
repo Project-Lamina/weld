@@ -69,3 +69,77 @@ fn elf_tools_agree_with_ld_on_defined_symbols() {
     assert!(Command::new(dir.join("weld")).status().unwrap().success());
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn as_needed_tracks_state_and_deduplicates_sonames() {
+    let dir = std::env::temp_dir().join(format!("weld-needed-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("used.s"),
+        ".globl used\n.type used,@function\nused: ret\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("unused.s"),
+        ".globl unused\n.type unused,@function\nunused: ret\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("main.s"),
+        ".globl _start\n_start: call used\n mov $60,%eax\n xor %edi,%edi\n syscall\n",
+    )
+    .unwrap();
+    for name in ["used", "unused", "main"] {
+        run(
+            "as",
+            &[&format!("{name}.s"), "-o", &format!("{name}.o")],
+            &dir,
+        );
+    }
+    for name in ["used", "unused"] {
+        run(
+            "ld",
+            &[
+                "-shared",
+                "-soname",
+                &format!("lib{name}.so"),
+                &format!("{name}.o"),
+                "-o",
+                &format!("lib{name}.so"),
+            ],
+            &dir,
+        );
+    }
+    for (flags, expected) in [
+        (
+            vec!["--as-needed", "-lunused", "-lused", "-lused"],
+            vec!["libused.so"],
+        ),
+        (
+            vec![
+                "--as-needed",
+                "--push-state",
+                "--no-as-needed",
+                "-lunused",
+                "--pop-state",
+                "-lused",
+            ],
+            vec!["libunused.so", "libused.so"],
+        ),
+    ] {
+        let mut args = vec!["main.o", "-L."];
+        args.extend(flags);
+        args.extend(["-o", "output"]);
+        for linker in [env!("CARGO_BIN_EXE_weld"), "ld"] {
+            run(linker, &args, &dir);
+            let dynamic = run("readelf", &["-dW", "output"], &dir);
+            let needed: Vec<_> = dynamic
+                .lines()
+                .filter(|s| s.contains("(NEEDED)"))
+                .map(|s| s.split('[').nth(1).unwrap().trim_end_matches(']'))
+                .collect();
+            assert_eq!(needed, expected);
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

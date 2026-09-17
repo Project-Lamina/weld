@@ -768,6 +768,8 @@ pub struct LinkOptions {
     pub search_paths: Vec<PathBuf>,
     /// `ld -rpath`, joined into one `DT_RUNPATH`.
     pub rpaths: Vec<String>,
+    pub library_as_needed: Vec<bool>,
+    pub library_positions: Vec<usize>,
 }
 
 pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<LinkResult, String> {
@@ -885,12 +887,8 @@ fn link_multi_object_parsed(
             undefined.push("exit".to_string());
         }
 
-        // Synthetic _start leaves through libc exit(), so it needs a PLT entry.
-        if !global_symbols.contains_key("_start") && !undefined.iter().any(|s| s == "exit") {
-            undefined.push("exit".to_string());
-        }
-
-        if !undefined.is_empty() {
+        let needed = select_needed_libraries(parsed, libs.unwrap_or(&[]), opts, &resolver)?;
+        if !needed.is_empty() {
             let (plt_data, got_plt_data) = build_plt_got_x86_64(&undefined, &layout)?;
             let last = layout.sections.last().ok_or("no sections")?;
             let mut vaddr = align_up(last.vaddr + last.data.len() as u64, 16);
@@ -928,22 +926,6 @@ fn link_multi_object_parsed(
                 .or_insert(got_plt_vaddr);
             let got_plt_size = 24 + (undefined.len() as u64) * 8;
             vaddr = align_up(got_plt_vaddr + got_plt_size, 8);
-
-            let needed: Vec<String> = libs
-                .unwrap_or(&[])
-                .iter()
-                .filter_map(|name| {
-                    if name == "System" {
-                        // macOS compatibility alias — not meaningful for ELF.
-                        return None;
-                    }
-                    match resolver.resolve(name) {
-                        Some(r) if r.is_static => None,
-                        Some(r) => Some(r.soname),
-                        None => Some(resolver.expected_soname(name)),
-                    }
-                })
-                .collect();
 
             let (
                 dynsym_data,
@@ -1204,6 +1186,88 @@ fn link_multi_object_parsed(
         symbol_addrs: global_symbols,
         dynamic: dynamic_info,
     })
+}
+
+fn select_needed_libraries(
+    parsed: &[ParsedObject],
+    libs: &[String],
+    opts: &LinkOptions,
+    resolver: &LibraryResolver,
+) -> Result<Vec<String>, String> {
+    let mut needed = Vec::new();
+    let mut seen = HashSet::new();
+    let mut provided = HashSet::new();
+    for (i, name) in libs.iter().enumerate() {
+        if name == "System" {
+            continue;
+        }
+        let library = resolver
+            .resolve(name)
+            .ok_or_else(|| format!("cannot find -l{name}"))?;
+        if library.is_static {
+            continue;
+        }
+        if seen.contains(&library.soname) {
+            continue;
+        }
+        let data = std::fs::read(&library.path).map_err(|e| e.to_string())?;
+        let (_, sections, _) = parse_elf64_slice(&data)?;
+        let mut exports = HashSet::new();
+        for section in sections.iter().filter(|s| s.sh_type == 11) {
+            let strings = get_strtab_from_section(
+                &data,
+                sections
+                    .get(section.sh_link as usize)
+                    .ok_or("invalid dynsym link")?,
+            );
+            for sym in parse_symtab(&data, section)? {
+                if sym.st_shndx != SHN_UNDEF
+                    && sym.bind != STB_LOCAL
+                    && let Some(name) = get_strtab_string(strings, sym.name_offset)
+                {
+                    exports.insert(name);
+                }
+            }
+        }
+        let mut retain = !opts.library_as_needed.get(i).copied().unwrap_or(false);
+        if !retain {
+            let count = opts
+                .library_positions
+                .get(i)
+                .copied()
+                .unwrap_or(parsed.len());
+            let mut definitions = HashSet::new();
+            let mut references = HashSet::new();
+            for obj in parsed.iter().take(count) {
+                if let Some((symbols, strings)) = parse_symtab_view(&obj.data, &obj.sections)? {
+                    for sym in symbols.iter().filter(|s| s.bind != STB_LOCAL) {
+                        let Some(name) = get_strtab_string(strings, sym.name_offset) else {
+                            continue;
+                        };
+                        if sym.st_shndx != SHN_UNDEF {
+                            definitions.insert(name);
+                        } else if sym.bind != STB_WEAK {
+                            references.insert(name);
+                        }
+                    }
+                }
+            }
+            if !definitions.contains("_start")
+                && (definitions.contains("main") || definitions.contains("_main"))
+            {
+                references.insert("exit".into());
+            }
+            retain = references
+                .iter()
+                .any(|s| !definitions.contains(s) && !provided.contains(s) && exports.contains(s));
+        }
+        if retain {
+            seen.insert(library.soname.clone());
+            needed.push(library.soname);
+            provided.extend(exports);
+        }
+    }
+    Ok(needed)
 }
 
 /// Build the raw bytes for `.dynsym`, `.dynstr`, `.rela.plt`, and `.hash`
