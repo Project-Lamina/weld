@@ -211,3 +211,48 @@ fn strip_preserves_dynamic_symbols_and_map_retains_definitions() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn parallel_loading_preserves_local_symbols_and_archive_selection() {
+    let dir = std::env::temp_dir().join(format!("weld-parallel-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let mut names = Vec::new();
+    for i in 0..40 {
+        let next = if i == 39 {
+            "archive_fn".into()
+        } else {
+            format!("chain{}", i + 1)
+        };
+        let start = if i == 0 {
+            ".globl _start\n_start: call chain0\n mov %eax,%edi\n mov $60,%eax\n syscall\n"
+        } else {
+            ""
+        };
+        fs::write(dir.join("input.s"), format!(".text\n{start}.globl chain{i}\nchain{i}: lea private(%rip),%r11\n call {next}\n ret\n.data\nprivate: .quad {i}\n")).unwrap();
+        let name = format!("input{i}.o");
+        run("as", &["input.s", "-o", &name], &dir);
+        names.push(name);
+    }
+    for (name, source) in [
+        (
+            "used",
+            ".globl archive_fn\narchive_fn: xor %eax,%eax\n ret\n",
+        ),
+        ("unused", ".globl unreachable\nunreachable: ret\n"),
+    ] {
+        fs::write(dir.join("archive.s"), source).unwrap();
+        run("as", &["archive.s", "-o", &format!("{name}.o")], &dir);
+    }
+    run("ar", &["rcs", "libinput.a", "used.o", "unused.o"], &dir);
+    let mut args: Vec<_> = names.iter().map(String::as_str).collect();
+    args.extend(["libinput.a", "-o", "output"]);
+    run(env!("CARGO_BIN_EXE_weld"), &args, &dir);
+    assert!(Command::new(dir.join("output")).status().unwrap().success());
+    let symbols = run("readelf", &["-sW", "output"], &dir);
+    assert!(symbols.contains("archive_fn") && !symbols.contains("unreachable"));
+    assert_eq!(
+        symbols.lines().filter(|s| s.ends_with(" private")).count(),
+        40
+    );
+    fs::remove_dir_all(dir).unwrap();
+}

@@ -1,9 +1,9 @@
 //! x86_64 relocation application.
 
+use crate::collections::HashMap;
 use crate::elf::reloc_type;
 use crate::elf::{SectionHeader, parse_rela_section};
 use crate::link::MergedLayout;
-use std::collections::HashMap;
 
 fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());

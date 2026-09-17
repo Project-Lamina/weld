@@ -14,6 +14,7 @@ pub mod resolver;
 mod riscv;
 mod x86_64;
 
+use crate::collections::{HashMap, HashSet};
 pub use resolver::LibraryResolver;
 
 use crate::{
@@ -25,11 +26,7 @@ use crate::{
     },
     platform::TargetPlatform,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    thread,
-};
+use std::path::{Path, PathBuf};
 
 /// Return type for symbol-table parsing: a list of symbols and the raw string table.
 type SymtabView<'a> = Option<(Vec<Symbol>, &'a [u8])>;
@@ -383,7 +380,7 @@ pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String>
 
     let mut layout = MergedLayout {
         sections: Vec::new(),
-        section_by_name: HashMap::new(),
+        section_by_name: HashMap::default(),
     };
 
     let mut vaddr: u64 = 0x400000;
@@ -440,11 +437,11 @@ pub fn merge_sections_multi_object(
 
     let mut section_contribs: Vec<HashMap<String, ObjectSectionContrib>> =
         Vec::with_capacity(objects.len());
-    let mut merged_data: HashMap<String, Vec<(Vec<u8>, u64)>> = HashMap::new();
-    let mut section_cumul: HashMap<String, u64> = HashMap::new();
-    let mut section_aligns: HashMap<String, u64> = HashMap::new();
-    let mut section_types = HashMap::new();
-    let mut section_flags: HashMap<String, u64> = HashMap::new();
+    let mut merged_data: HashMap<String, Vec<(Vec<u8>, u64)>> = HashMap::default();
+    let mut section_cumul: HashMap<String, u64> = HashMap::default();
+    let mut section_aligns: HashMap<String, u64> = HashMap::default();
+    let mut section_types = HashMap::default();
+    let mut section_flags: HashMap<String, u64> = HashMap::default();
 
     for obj_data in objects {
         let (header, sections, names) = parse_elf64_slice(obj_data)?;
@@ -455,7 +452,7 @@ pub fn merge_sections_multi_object(
             ));
         }
 
-        let mut obj_contribs = HashMap::new();
+        let mut obj_contribs = HashMap::default();
 
         for (name, sh) in collect_mergeable_sections(&sections, &names) {
             section_types.insert(name.clone(), (sh.sh_type, sh.sh_entsize));
@@ -502,7 +499,7 @@ pub fn merge_sections_multi_object(
     let section_order = [".text", ".rodata", ".data", ".bss"];
     let mut layout = MergedLayout {
         sections: Vec::new(),
-        section_by_name: HashMap::new(),
+        section_by_name: HashMap::default(),
     };
 
     let mut vaddr: u64 = 0x400000;
@@ -571,10 +568,10 @@ where
     F: FnMut(&str) -> Option<u64>,
 {
     let Some((symbols, strtab)) = parse_symtab_view(data, sections)? else {
-        return Ok((HashMap::new(), Vec::new()));
+        return Ok((HashMap::default(), Vec::new()));
     };
 
-    let mut resolved = HashMap::new();
+    let mut resolved = HashMap::default();
     let mut by_index: Vec<Option<u64>> = Vec::with_capacity(symbols.len());
 
     for sym in &symbols {
@@ -785,23 +782,25 @@ pub fn link_multi_object_with_options(
     libs: Option<&[String]>,
     opts: &LinkOptions,
 ) -> Result<LinkResult, String> {
+    link_elf_objects(objects.iter().map(|s| s.to_vec()).collect(), libs, opts)
+}
+
+pub fn link_elf_objects(
+    objects: Vec<Vec<u8>>,
+    libs: Option<&[String]>,
+    opts: &LinkOptions,
+) -> Result<LinkResult, String> {
     if objects.is_empty() {
-        return Err("no objects to link".to_string());
+        return Err("no objects to link".into());
     }
     if objects.len() == 1 && libs.is_none() && !opts.gc_sections {
-        return link_single_object(objects[0]);
+        return link_single_object(&objects[0]);
     }
+    let mut timer = crate::timing::PhaseTimer::new();
+    let parsed_results = crate::parallel::map(objects, parse_object);
+    let mut parsed: Vec<_> = parsed_results.into_iter().collect::<Result<_, _>>()?;
 
-    let owned: Vec<Vec<u8>> = objects.iter().map(|s| s.to_vec()).collect();
-    let handles: Vec<_> = owned
-        .into_iter()
-        .map(|data| thread::spawn(move || parse_object(data)))
-        .collect();
-    let mut parsed = Vec::with_capacity(handles.len());
-    for h in handles {
-        parsed.push(h.join().map_err(|_| "thread join failed".to_string())??);
-    }
-
+    timer.mark("parse objects");
     if opts.gc_sections {
         gc::collect(&mut parsed, &opts.gc_roots)?;
         for obj in &mut parsed {
@@ -829,24 +828,29 @@ fn link_multi_object_parsed(
         return link_single_object(&parsed[0].data);
     }
 
+    let mut timer = crate::timing::PhaseTimer::new();
     let objects: Vec<&[u8]> = parsed.iter().map(|p| p.data.as_slice()).collect();
     let (mut layout, section_contribs) = merge_sections_multi_object(&objects)?;
     let e_machine = parsed[0].header.e_machine;
     let arch = TargetArch::from_elf_machine(e_machine)
         .ok_or_else(|| format!("unsupported machine {}", e_machine))?;
 
-    let mut global_symbols: HashMap<String, u64> = HashMap::new();
+    timer.mark("merge sections");
+    let mut global_symbols: HashMap<String, u64> = HashMap::default();
     let mut resolved_by_index_per_object: Vec<Vec<Option<u64>>> = Vec::with_capacity(parsed.len());
 
-    for (obj_idx, obj) in parsed.iter().enumerate() {
-        let obj_contribs = &section_contribs[obj_idx];
-        let (resolved, by_index) = resolve_symbols_for_object(
-            &obj.data,
-            &layout,
-            &obj.sections,
-            &obj.names,
-            obj_contribs,
-        )?;
+    let resolutions =
+        crate::parallel::map(parsed.iter().enumerate().collect(), |(obj_idx, obj)| {
+            resolve_symbols_for_object(
+                &obj.data,
+                &layout,
+                &obj.sections,
+                &obj.names,
+                &section_contribs[obj_idx],
+            )
+        });
+    for resolution in resolutions {
+        let (resolved, by_index) = resolution?;
         resolved_by_index_per_object.push(by_index);
 
         for (name, r) in resolved {
@@ -856,6 +860,7 @@ fn link_multi_object_parsed(
         }
     }
 
+    timer.mark("resolve symbols");
     let mut dynamic_info: Option<DynamicLinkInfo> = None;
 
     // Resolve library names to sonames.  Any lib matching "c" or "System"
@@ -878,11 +883,16 @@ fn link_multi_object_parsed(
 
     if has_shared_lib && arch == TargetArch::X86_64 && e_machine == 62 {
         let mut undefined: Vec<String> = Vec::new();
+        let mut undefined_seen = HashSet::default();
         for obj in parsed.iter() {
             let Some((symbols, strtab)) = parse_symtab_view(&obj.data, &obj.sections)? else {
                 continue;
             };
-            let referenced = referenced_symbols(obj)?;
+            let referenced = if opts.gc_sections {
+                referenced_symbols(obj)?
+            } else {
+                HashSet::default()
+            };
             for (index, sym) in symbols
                 .iter()
                 .enumerate()
@@ -897,7 +907,7 @@ fn link_multi_object_parsed(
                 if !name.is_empty()
                     && name != "_GLOBAL_OFFSET_TABLE_"
                     && !global_symbols.contains_key(&name)
-                    && !undefined.contains(&name)
+                    && undefined_seen.insert(name.clone())
                 {
                     undefined.push(name);
                 }
@@ -1075,10 +1085,11 @@ fn link_multi_object_parsed(
     // Pre-scan all objects to find referenced symbol names, assign a GOT slot per
     // unique name, then fill each slot once global_symbols is final (PLT entries
     // included). For external symbols without a definition, the slot stays 0.
-    let mut got_symbol_map: HashMap<String, u64> = HashMap::new();
+    timer.mark("dynamic sections");
+    let mut got_symbol_map: HashMap<String, u64> = HashMap::default();
     if arch == TargetArch::X86_64 {
         let mut unique_syms: Vec<String> = Vec::new();
-        let mut got_seen: HashSet<String> = HashSet::new();
+        let mut got_seen: HashSet<String> = HashSet::default();
         for obj in parsed.iter() {
             collect_gotpcrel_symbol_names(
                 &obj.data,
@@ -1144,6 +1155,7 @@ fn link_multi_object_parsed(
         }
     }
 
+    timer.mark("GOT and NOBITS layout");
     for (obj_idx, obj) in parsed.iter().enumerate() {
         let obj_contribs = &section_contribs[obj_idx];
         let obj_by_index = &resolved_by_index_per_object[obj_idx];
@@ -1184,22 +1196,27 @@ fn link_multi_object_parsed(
         )?;
     }
 
+    timer.mark("apply relocations");
     let mut symbols = Vec::new();
-    let mut emitted = HashSet::new();
-    for (i, obj) in parsed.iter().enumerate() {
-        for symbol in collect_output_symbols(
+    let mut emitted = HashSet::default();
+    let output_symbols = crate::parallel::map(parsed.iter().enumerate().collect(), |(i, obj)| {
+        collect_output_symbols(
             &obj.data,
             &obj.sections,
             &obj.names,
             &layout,
             |name| section_contribs[i].get(name).map(|c| c.offset_in_merged),
             &global_symbols,
-        )? {
+        )
+    });
+    for result in output_symbols {
+        for symbol in result? {
             if symbol.info >> 4 == 0 || emitted.insert(symbol.name.clone()) {
                 symbols.push(symbol);
             }
         }
     }
+    timer.mark("collect output symbols");
     Ok(LinkResult {
         symbols,
         layout,
@@ -1210,7 +1227,7 @@ fn link_multi_object_parsed(
 }
 
 fn referenced_symbols(obj: &ParsedObject) -> Result<HashSet<usize>, String> {
-    let mut referenced = HashSet::new();
+    let mut referenced = HashSet::default();
     for section in obj.sections.iter().filter(|s| s.sh_type == 4) {
         if obj
             .sections
@@ -1232,8 +1249,8 @@ fn select_needed_libraries(
     resolver: &LibraryResolver,
 ) -> Result<Vec<String>, String> {
     let mut needed = Vec::new();
-    let mut seen = HashSet::new();
-    let mut provided = HashSet::new();
+    let mut seen = HashSet::default();
+    let mut provided = HashSet::default();
     for (i, name) in libs.iter().enumerate() {
         if name == "System" {
             continue;
@@ -1249,7 +1266,7 @@ fn select_needed_libraries(
         }
         let data = std::fs::read(&library.path).map_err(|e| e.to_string())?;
         let (_, sections, _) = parse_elf64_slice(&data)?;
-        let mut exports = HashSet::new();
+        let mut exports = HashSet::default();
         for section in sections.iter().filter(|s| s.sh_type == 11) {
             let strings = get_strtab_from_section(
                 &data,
@@ -1273,11 +1290,15 @@ fn select_needed_libraries(
                 .get(i)
                 .copied()
                 .unwrap_or(parsed.len());
-            let mut definitions = HashSet::new();
-            let mut references = HashSet::new();
+            let mut definitions = HashSet::default();
+            let mut references = HashSet::default();
             for obj in parsed.iter().take(count) {
                 if let Some((symbols, strings)) = parse_symtab_view(&obj.data, &obj.sections)? {
-                    let referenced = referenced_symbols(obj)?;
+                    let referenced = if opts.gc_sections {
+                        referenced_symbols(obj)?
+                    } else {
+                        HashSet::default()
+                    };
                     for (index, sym) in symbols
                         .iter()
                         .enumerate()

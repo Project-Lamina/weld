@@ -458,9 +458,9 @@ impl SectionMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collections::HashMap;
     use crate::link::{MergedSection, link_single_object};
     use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-    use std::collections::HashMap;
 
     #[test]
     fn test_emit_elf_header() {
@@ -475,7 +475,7 @@ mod tests {
                 align: 16,
             }],
             section_by_name: {
-                let mut m = HashMap::new();
+                let mut m = HashMap::default();
                 m.insert(".text".into(), 0);
                 m
             },
@@ -512,7 +512,7 @@ mod tests {
                 align: 16,
             }],
             section_by_name: {
-                let mut m = HashMap::new();
+                let mut m = HashMap::default();
                 m.insert(".text".into(), 0);
                 m
             },

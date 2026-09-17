@@ -13,6 +13,9 @@ repository = "https://github.com/Project-Lamina/weld"
 name = "weld"
 path = "src/main.rs"
 
+[dependencies]
+rustc-hash = "2.1.2"
+
 [dev-dependencies]
 lamina-platform = { version = "0.1.1" }
 ras = { package = "lamina-ras", version = "0.1.1", features = ["encoder"] }
