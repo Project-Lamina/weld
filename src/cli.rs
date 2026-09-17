@@ -14,6 +14,8 @@ pub struct ParsedArgs {
     pub rpaths: Vec<String>,
     pub verbose: bool,
     pub gc_sections: bool,
+    pub strip_all: bool,
+    pub map_file: Option<PathBuf>,
     pub input_files: Vec<PathBuf>,
 }
 
@@ -203,6 +205,13 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "-nodefaultlibs" | "-nostdlib" => {}
             // Driver flags weld has no work for: LTO plugins, linker state
             // stack, and hints about output it already does one way.
+            "--strip-all" | "-s" => args.strip_all = true,
+            "--Map" | "-Map" => {
+                args.map_file = Some(PathBuf::from(take_required_arg(argv, &mut i, a)?))
+            }
+            s if s.starts_with("--Map=") || s.starts_with("-Map=") => {
+                args.map_file = Some(PathBuf::from(s.split_once('=').unwrap().1));
+            }
             "--gc-sections" => args.gc_sections = true,
             "--no-gc-sections" => args.gc_sections = false,
             "--as-needed" => as_needed = true,

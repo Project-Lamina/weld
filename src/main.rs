@@ -230,6 +230,50 @@ fn entry_seeds(args: &ParsedArgs) -> Vec<String> {
     }
 }
 
+fn elf_link_map(result: &LinkResult, entry: u64) -> String {
+    use std::fmt::Write;
+    let mut map = format!(
+        "Entry point 0x{entry:016x}\n\nAddress            Size               Section / Symbol\n"
+    );
+    let mut sections: Vec<_> = result.layout.sections.iter().enumerate().collect();
+    sections.sort_by_key(|(_, s)| s.vaddr);
+    let mut symbols: Vec<_> = result.symbols.iter().collect();
+    symbols.sort_by(|a, b| (a.shndx, a.value, &a.name).cmp(&(b.shndx, b.value, &b.name)));
+    for (index, section) in sections {
+        writeln!(
+            map,
+            "0x{:016x} 0x{:016x} {}",
+            section.vaddr,
+            section.data.len(),
+            section.name
+        )
+        .unwrap();
+        for symbol in symbols
+            .iter()
+            .filter(|s| s.shndx as usize == index + 1 && !s.name.is_empty())
+        {
+            writeln!(
+                map,
+                "  0x{:016x} 0x{:016x} {}",
+                symbol.value, symbol.size, symbol.name
+            )
+            .unwrap();
+        }
+    }
+    for symbol in symbols
+        .iter()
+        .filter(|s| s.shndx == 0xfff1 && !s.name.is_empty())
+    {
+        writeln!(
+            map,
+            "0x{:016x} 0x{:016x} {} (ABS)",
+            symbol.value, symbol.size, symbol.name
+        )
+        .unwrap();
+    }
+    map
+}
+
 fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     let obj_data_list = object::load_elf_objects(
         &args.input_files,
@@ -267,6 +311,15 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
         select_entry(args, &result)?
     };
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
+    if let Some(path) = args.map_file.as_deref() {
+        let map = elf_link_map(&result, entry);
+        if path == Path::new("-") {
+            print!("{map}");
+        } else {
+            std::fs::write(path, map).ok()?;
+        }
+    }
+    let symbols = (!args.strip_all).then_some(result.symbols.as_slice());
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
     if let Some(ref dyn_info) = result.dynamic {
@@ -276,20 +329,13 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
             entry,
             os_abi,
             dyn_info,
-            &result.symbols,
+            symbols,
             &mut out,
         )
         .ok()?;
     } else {
-        emit::elf::emit_elf_executable(
-            &result.layout,
-            arch,
-            entry,
-            os_abi,
-            &result.symbols,
-            &mut out,
-        )
-        .ok()?;
+        emit::elf::emit_elf_executable(&result.layout, arch, entry, os_abi, symbols, &mut out)
+            .ok()?;
     }
     out.flush().ok()?;
     drop(out);
