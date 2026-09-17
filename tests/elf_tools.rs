@@ -143,3 +143,42 @@ fn as_needed_tracks_state_and_deduplicates_sonames() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn gc_follows_relocations_and_prunes_unwind_records() {
+    let dir = std::env::temp_dir().join(format!("weld-gc-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("input.c"), "int live_data=42; int dead_data[4096]={1}; __attribute__((noinline)) int live(void){return live_data;} __attribute__((noinline)) int dead(void){return dead_data[0];} int main(void){return live()!=42;}").unwrap();
+    run(
+        "gcc",
+        &[
+            "-O0",
+            "-fno-pie",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-c",
+            "input.c",
+            "-o",
+            "input.o",
+        ],
+        &dir,
+    );
+    let linker = env!("CARGO_BIN_EXE_weld");
+    run(linker, &["input.o", "-lc", "-o", "full"], &dir);
+    run(
+        linker,
+        &["input.o", "-lc", "--gc-sections", "-o", "gc"],
+        &dir,
+    );
+    assert!(Command::new(dir.join("gc")).status().unwrap().success());
+    let symbols = run("readelf", &["-sW", "gc"], &dir);
+    assert!(symbols.contains("live_data"));
+    assert!(!symbols.contains("dead"));
+    let frames = run("readelf", &["--debug-dump=frames", "gc"], &dir);
+    assert_eq!(frames.matches(" FDE ").count(), 2);
+    assert!(
+        fs::metadata(dir.join("gc")).unwrap().len() + 16000
+            < fs::metadata(dir.join("full")).unwrap().len()
+    );
+    fs::remove_dir_all(dir).unwrap();
+}

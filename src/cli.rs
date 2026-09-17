@@ -13,6 +13,7 @@ pub struct ParsedArgs {
     pub search_paths: Vec<PathBuf>,
     pub rpaths: Vec<String>,
     pub verbose: bool,
+    pub gc_sections: bool,
     pub input_files: Vec<PathBuf>,
 }
 
@@ -202,6 +203,8 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "-nodefaultlibs" | "-nostdlib" => {}
             // Driver flags weld has no work for: LTO plugins, linker state
             // stack, and hints about output it already does one way.
+            "--gc-sections" => args.gc_sections = true,
+            "--no-gc-sections" => args.gc_sections = false,
             "--as-needed" => as_needed = true,
             "--no-as-needed" => as_needed = false,
             "--push-state" => states.push(as_needed),

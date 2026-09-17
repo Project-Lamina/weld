@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 mod aarch64;
+mod gc;
 pub mod macho;
 pub mod resolver;
 mod riscv;
@@ -307,7 +308,8 @@ fn collect_mergeable_sections<'a>(
         .iter()
         .enumerate()
         .filter(|(_, sh)| {
-            (sh.sh_type == SHT_PROGBITS || sh.sh_type == SHT_NOBITS) && is_allocatable(sh.sh_flags)
+            (matches!(sh.sh_type, SHT_PROGBITS | SHT_NOBITS | 14..=16))
+                && is_allocatable(sh.sh_flags)
         })
         .map(|(i, sh)| (names.get(i).cloned().unwrap_or_default(), sh))
         .collect();
@@ -321,7 +323,7 @@ fn read_section_data(data: &[u8], sh: &SectionHeader) -> Vec<u8> {
         return Vec::new();
     }
     match sh.sh_type {
-        SHT_PROGBITS => {
+        SHT_PROGBITS | 14..=16 => {
             let start = sh.sh_offset as usize;
             let end = start + sh.sh_size as usize;
             data.get(start..end).unwrap_or(&[]).to_vec()
@@ -770,6 +772,8 @@ pub struct LinkOptions {
     pub rpaths: Vec<String>,
     pub library_as_needed: Vec<bool>,
     pub library_positions: Vec<usize>,
+    pub gc_sections: bool,
+    pub gc_roots: Vec<String>,
 }
 
 pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<LinkResult, String> {
@@ -784,7 +788,7 @@ pub fn link_multi_object_with_options(
     if objects.is_empty() {
         return Err("no objects to link".to_string());
     }
-    if objects.len() == 1 && libs.is_none() {
+    if objects.len() == 1 && libs.is_none() && !opts.gc_sections {
         return link_single_object(objects[0]);
     }
 
@@ -798,6 +802,18 @@ pub fn link_multi_object_with_options(
         parsed.push(h.join().map_err(|_| "thread join failed".to_string())??);
     }
 
+    if opts.gc_sections {
+        gc::collect(&mut parsed, &opts.gc_roots)?;
+        for obj in &mut parsed {
+            for (i, section) in obj.sections.iter().enumerate() {
+                let offset = obj.header.e_shoff as usize + i * 64;
+                obj.data[offset + 8..offset + 16].copy_from_slice(&section.sh_flags.to_le_bytes());
+                obj.data[offset + 24..offset + 32]
+                    .copy_from_slice(&section.sh_offset.to_le_bytes());
+                obj.data[offset + 32..offset + 40].copy_from_slice(&section.sh_size.to_le_bytes());
+            }
+        }
+    }
     link_multi_object_parsed(opts, &parsed, libs)
 }
 
@@ -809,7 +825,7 @@ fn link_multi_object_parsed(
     if parsed.is_empty() {
         return Err("no objects to link".to_string());
     }
-    if parsed.len() == 1 && libs.is_none() {
+    if parsed.len() == 1 && libs.is_none() && !opts.gc_sections {
         return link_single_object(&parsed[0].data);
     }
 
@@ -866,10 +882,15 @@ fn link_multi_object_parsed(
             let Some((symbols, strtab)) = parse_symtab_view(&obj.data, &obj.sections)? else {
                 continue;
             };
-            for sym in symbols
+            let referenced = referenced_symbols(obj)?;
+            for (index, sym) in symbols
                 .iter()
-                .filter(|sym| sym.st_shndx == SHN_UNDEF && sym.bind == STB_GLOBAL)
+                .enumerate()
+                .filter(|(_, sym)| sym.st_shndx == SHN_UNDEF && sym.bind == STB_GLOBAL)
             {
+                if opts.gc_sections && !referenced.contains(&index) {
+                    continue;
+                }
                 let Some(name) = get_strtab_string(strtab, sym.name_offset) else {
                     continue;
                 };
@@ -1188,6 +1209,22 @@ fn link_multi_object_parsed(
     })
 }
 
+fn referenced_symbols(obj: &ParsedObject) -> Result<HashSet<usize>, String> {
+    let mut referenced = HashSet::new();
+    for section in obj.sections.iter().filter(|s| s.sh_type == 4) {
+        if obj
+            .sections
+            .get(section.sh_info as usize)
+            .is_some_and(|s| is_allocatable(s.sh_flags))
+        {
+            for relocation in parse_rela_section(&obj.data, section)? {
+                referenced.insert(relocation.r_sym as usize);
+            }
+        }
+    }
+    Ok(referenced)
+}
+
 fn select_needed_libraries(
     parsed: &[ParsedObject],
     libs: &[String],
@@ -1240,7 +1277,25 @@ fn select_needed_libraries(
             let mut references = HashSet::new();
             for obj in parsed.iter().take(count) {
                 if let Some((symbols, strings)) = parse_symtab_view(&obj.data, &obj.sections)? {
-                    for sym in symbols.iter().filter(|s| s.bind != STB_LOCAL) {
+                    let referenced = referenced_symbols(obj)?;
+                    for (index, sym) in symbols
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.bind != STB_LOCAL)
+                    {
+                        if opts.gc_sections
+                            && sym.st_shndx == SHN_UNDEF
+                            && !referenced.contains(&index)
+                        {
+                            continue;
+                        }
+                        if opts.gc_sections
+                            && sym.st_shndx != SHN_UNDEF
+                            && sym.st_shndx < 0xff00
+                            && obj.sections[sym.st_shndx as usize].sh_flags & SHF_ALLOC == 0
+                        {
+                            continue;
+                        }
                         let Some(name) = get_strtab_string(strings, sym.name_offset) else {
                             continue;
                         };
