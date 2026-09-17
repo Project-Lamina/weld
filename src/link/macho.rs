@@ -3,6 +3,7 @@
 //! Merges sections, resolves symbols, applies relocations.
 //! Supports single-object no-libc (ret42-style) initially.
 
+use crate::collections::{HashMap, HashSet};
 use crate::{
     arch::TargetArch,
     link::{DynamicLinkInfo, LinkResult, MergedLayout, MergedSection, ObjectSectionContrib},
@@ -13,10 +14,7 @@ use crate::{
         Macho64Object, MachoSection, MachoSymbol, parse_macho_relocs, parse_macho64_object,
     },
 };
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
 /// Three binary sections emitted when building stub trampolines:
 /// stubs, stub helper, and GOT slots.
@@ -178,7 +176,7 @@ fn merge_macho_sections(obj: &Macho64Object) -> MergedLayout {
 
     let mut layout = MergedLayout {
         sections: Vec::new(),
-        section_by_name: HashMap::new(),
+        section_by_name: HashMap::default(),
     };
 
     let mut vaddr = SEG_BASE;
@@ -211,8 +209,8 @@ fn merge_macho_sections(obj: &Macho64Object) -> MergedLayout {
 }
 
 fn resolve_macho_symbols(obj: &Macho64Object, layout: &MergedLayout) -> HashMap<String, u64> {
-    let mut addrs = HashMap::new();
-    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
+    let mut addrs = HashMap::default();
+    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::default();
 
     for (i, sec) in obj.sections.iter().enumerate() {
         let sect_idx = (i + 1) as u8;
@@ -239,7 +237,7 @@ fn symbol_addr_by_index(
     layout: &MergedLayout,
     symbol_addrs: &HashMap<String, u64>,
 ) -> Vec<Option<u64>> {
-    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
+    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::default();
     for (i, sec) in obj.sections.iter().enumerate() {
         let sect_idx = (i + 1) as u8;
         let name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
@@ -428,7 +426,7 @@ fn apply_macho_relocations(
 ) -> Result<(), String> {
     let trace_relocs = std::env::var("WELD_TRACE_RELOCS").ok().as_deref() == Some("1");
     let trace_tls = std::env::var("WELD_TRACE_TLS").ok().as_deref() == Some("1");
-    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
+    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::default();
     for (i, sec) in obj.sections.iter().enumerate() {
         let sect_idx = (i + 1) as u8;
         let merged_name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
@@ -485,7 +483,7 @@ fn apply_macho_relocations(
             .and_then(|m| m.get(&((i + 1) as u8)).copied())
             .unwrap_or(0) as usize;
 
-        let mut addend_by_address: HashMap<u32, i64> = HashMap::new();
+        let mut addend_by_address: HashMap<u32, i64> = HashMap::default();
 
         for r in &relocs {
             if r.r_type == ARM64_RELOC_ADDEND {
@@ -906,11 +904,11 @@ pub fn link_macho_multi_object(
         .ok_or_else(|| format!("unsupported Mach-O cputype {}", objects[0].header.cputype))?;
     let e_machine = arch.to_elf_machine();
 
-    let mut global_symbols: HashMap<String, u64> = HashMap::new();
-    let mut global_symbol_weak: HashMap<String, bool> = HashMap::new();
+    let mut global_symbols: HashMap<String, u64> = HashMap::default();
+    let mut global_symbol_weak: HashMap<String, bool> = HashMap::default();
     for (obj_idx, obj) in objects.iter().enumerate() {
         let contrib = &section_contribs[obj_idx];
-        let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
+        let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::default();
         for (i, sec) in obj.sections.iter().enumerate() {
             let sect_idx = (i + 1) as u8;
             let merged_name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
@@ -950,11 +948,11 @@ pub fn link_macho_multi_object(
         .unwrap_or(false);
 
     let mut undefined: Vec<String> = Vec::new();
-    let mut undefined_set: HashSet<String> = HashSet::new();
-    let mut weak_undefined: HashSet<String> = HashSet::new();
+    let mut undefined_set: HashSet<String> = HashSet::default();
+    let mut weak_undefined: HashSet<String> = HashSet::default();
     let mut got_symbols: Vec<String> = Vec::new();
-    let mut got_symbol_set: HashSet<String> = HashSet::new();
-    let mut rebase_addrs: HashSet<u64> = HashSet::new();
+    let mut got_symbol_set: HashSet<String> = HashSet::default();
+    let mut rebase_addrs: HashSet<u64> = HashSet::default();
     let mut direct_binds: Vec<(u64, String, bool, i64)> = Vec::new();
     if arch == TargetArch::AArch64 {
         for obj in &objects {
@@ -1164,7 +1162,7 @@ pub fn link_macho_multi_object(
             .map(|(i, s)| (s.clone(), got_vaddr + (i as u64) * 8))
             .collect()
     } else {
-        HashMap::new()
+        HashMap::default()
     };
 
     for (obj_idx, obj) in objects.iter().enumerate() {
@@ -1319,7 +1317,7 @@ fn symbol_addr_by_index_multi(
     global_symbols: &HashMap<String, u64>,
     contrib: &HashMap<u8, ObjectSectionContrib>,
 ) -> Vec<Option<u64>> {
-    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::new();
+    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::default();
     for (i, sec) in obj.sections.iter().enumerate() {
         let sect_idx = (i + 1) as u8;
         let merged_name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
@@ -1400,11 +1398,11 @@ fn merge_macho_sections_multi(
     ];
 
     let mut section_contribs: Vec<HashMap<u8, ObjectSectionContrib>> =
-        (0..objects.len()).map(|_| HashMap::new()).collect();
-    let mut merged_data: HashMap<String, Vec<(Vec<u8>, u64)>> = HashMap::new();
-    let mut section_cumul: HashMap<String, u64> = HashMap::new();
-    let mut section_aligns: HashMap<String, u64> = HashMap::new();
-    let mut section_flags: HashMap<String, u64> = HashMap::new();
+        (0..objects.len()).map(|_| HashMap::default()).collect();
+    let mut merged_data: HashMap<String, Vec<(Vec<u8>, u64)>> = HashMap::default();
+    let mut section_cumul: HashMap<String, u64> = HashMap::default();
+    let mut section_aligns: HashMap<String, u64> = HashMap::default();
+    let mut section_flags: HashMap<String, u64> = HashMap::default();
 
     for (obj_idx, obj) in objects.iter().enumerate() {
         for (sec_i, sec) in obj.sections.iter().enumerate() {
@@ -1453,7 +1451,7 @@ fn merge_macho_sections_multi(
 
     let mut layout = MergedLayout {
         sections: Vec::new(),
-        section_by_name: HashMap::new(),
+        section_by_name: HashMap::default(),
     };
     let mut vaddr = SEG_BASE;
 

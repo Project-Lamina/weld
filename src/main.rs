@@ -6,13 +6,16 @@
 mod arch;
 mod archive;
 mod cli;
+mod collections;
 mod elf;
 mod emit;
 mod link;
 mod macho;
 mod object;
+mod parallel;
 mod platform;
 mod segment;
+mod timing;
 
 use crate::{
     arch::TargetArch,
@@ -274,13 +277,8 @@ fn elf_link_map(result: &LinkResult, entry: u64) -> String {
     map
 }
 
-fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
-    let obj_data_list = object::load_elf_objects(
-        &args.input_files,
-        &static_library_paths(args),
-        &entry_seeds(args),
-    )?;
-    let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
+fn try_weld_link_elf(args: &ParsedArgs, obj_data_list: Vec<Vec<u8>>) -> Option<i32> {
+    let mut timer = timing::PhaseTimer::new();
     let libs = if args.libraries.is_empty() {
         None
     } else {
@@ -289,7 +287,8 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
     let target_os = args.target_os.as_deref();
     let os_abi = os_abi_for_target(target_os);
     let freebsd_abi = os_abi == ELFOSABI_FREEBSD;
-    let mut result = link_multi_object_with_options(&obj_refs, libs, &link_options(args)).ok()?;
+    let mut result = link::link_elf_objects(obj_data_list, libs, &link_options(args)).ok()?;
+    timer.mark("link ELF objects");
     let arch = TargetArch::from_elf_machine(result.e_machine)?;
     if let Some(emul) = args.emulation.as_deref() {
         match TargetArch::from_emulation(emul) {
@@ -338,6 +337,7 @@ fn try_weld_link_elf(args: &ParsedArgs) -> Option<i32> {
             .ok()?;
     }
     out.flush().ok()?;
+    timer.mark("emit ELF");
     drop(out);
     set_executable(out_path);
     Some(0)
@@ -438,14 +438,16 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         return try_weld_link_pe(args);
     }
 
-    let (format, _, _) = load_objects(
+    let mut timer = timing::PhaseTimer::new();
+    let (format, objects, _) = load_objects(
         &args.input_files,
         &static_library_paths(args),
         &entry_seeds(args),
     )?;
 
+    timer.mark("detect format and load objects");
     match format {
-        ObjectFormat::Elf => try_weld_link_elf(args),
+        ObjectFormat::Elf => try_weld_link_elf(args, objects),
         ObjectFormat::MachO => try_weld_link_macho(args),
         ObjectFormat::Coff => try_weld_link_pe(args),
     }
@@ -523,13 +525,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collections::HashMap;
     use crate::link::MergedLayout;
-    use std::collections::HashMap;
 
     fn static_main_result() -> LinkResult {
-        let mut section_by_name = HashMap::new();
+        let mut section_by_name = HashMap::default();
         section_by_name.insert(".text".to_string(), 0);
-        let mut symbol_addrs = HashMap::new();
+        let mut symbol_addrs = HashMap::default();
         symbol_addrs.insert("main".to_string(), 0x400000u64);
         LinkResult {
             symbols: Vec::new(),
