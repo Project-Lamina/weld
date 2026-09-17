@@ -6,7 +6,7 @@
 
 use crate::{
     arch::TargetArch,
-    link::{DynamicLinkInfo, MergedLayout},
+    link::{DynamicLinkInfo, MergedLayout, OutputSymbol},
     segment::{align_up_u64, build_segment_buffer},
 };
 use std::io::{Error, ErrorKind, Result, Write};
@@ -73,9 +73,19 @@ pub fn emit_elf_executable(
     arch: TargetArch,
     entry: u64,
     os_abi: u8,
+    symbols: &[OutputSymbol],
     out: &mut impl Write,
 ) -> Result<()> {
-    let (base, seg_buffer) = build_segment_buffer(layout, arch.default_load_base());
+    let (base, mut seg_buffer) = build_segment_buffer(layout, arch.default_load_base());
+    let mem_size = seg_buffer.len() as u64;
+    let file_size = layout
+        .sections
+        .iter()
+        .filter(|s| s.sh_type != 8)
+        .map(|s| s.vaddr - base + s.data.len() as u64)
+        .max()
+        .unwrap_or(0);
+    seg_buffer.truncate(file_size as usize);
     let seg_size = seg_buffer.len() as u64;
     let seg_align = arch.page_align();
 
@@ -100,6 +110,14 @@ pub fn emit_elf_executable(
     ehdr[54..56].copy_from_slice(&(ELF64_PHDR_SIZE as u16).to_le_bytes());
     ehdr[56..58].copy_from_slice(&phnum.to_le_bytes());
 
+    let metadata = SectionMetadata::new(
+        layout,
+        symbols,
+        seg_offset_for_metadata(&ehdr, seg_align),
+        base,
+        seg_buffer.len(),
+    );
+    metadata.set_header(&mut ehdr);
     out.write_all(&ehdr)?;
 
     let mut phdr_load = [0u8; ELF64_PHDR_SIZE];
@@ -109,7 +127,7 @@ pub fn emit_elf_executable(
     phdr_load[16..24].copy_from_slice(&base.to_le_bytes());
     phdr_load[24..32].copy_from_slice(&base.to_le_bytes());
     phdr_load[32..40].copy_from_slice(&seg_size.to_le_bytes());
-    phdr_load[40..48].copy_from_slice(&seg_size.to_le_bytes());
+    phdr_load[40..48].copy_from_slice(&mem_size.to_le_bytes());
     phdr_load[48..56].copy_from_slice(&seg_align.to_le_bytes());
     out.write_all(&phdr_load)?;
 
@@ -124,6 +142,7 @@ pub fn emit_elf_executable(
     }
 
     out.write_all(&seg_buffer)?;
+    out.write_all(&metadata.bytes)?;
 
     Ok(())
 }
@@ -143,6 +162,7 @@ pub fn emit_elf_executable_dynamic(
     entry: u64,
     os_abi: u8,
     dynamic: &DynamicLinkInfo,
+    symbols: &[OutputSymbol],
     out: &mut impl Write,
 ) -> Result<()> {
     let interpreter = dynamic
@@ -152,7 +172,16 @@ pub fn emit_elf_executable_dynamic(
     let interp_bytes = format!("{}\0", interpreter);
     let interp_len = interp_bytes.len();
 
-    let (base, seg_buffer) = build_segment_buffer(layout, arch.default_load_base());
+    let (base, mut seg_buffer) = build_segment_buffer(layout, arch.default_load_base());
+    let mem_size = seg_buffer.len() as u64;
+    let file_size = layout
+        .sections
+        .iter()
+        .filter(|s| s.sh_type != 8)
+        .map(|s| s.vaddr - base + s.data.len() as u64)
+        .max()
+        .unwrap_or(0);
+    seg_buffer.truncate(file_size as usize);
     let seg_align = arch.page_align();
 
     let phoff = 64u64;
@@ -191,6 +220,14 @@ pub fn emit_elf_executable_dynamic(
     ehdr[54..56].copy_from_slice(&(ELF64_PHDR_SIZE as u16).to_le_bytes());
     ehdr[56..58].copy_from_slice(&phnum.to_le_bytes());
 
+    let metadata = SectionMetadata::new(
+        layout,
+        symbols,
+        seg_offset_for_metadata(&ehdr, seg_align),
+        base,
+        seg_buffer.len(),
+    );
+    metadata.set_header(&mut ehdr);
     out.write_all(&ehdr)?;
 
     // PT_PHDR: glibc's dl_main scans the main executable's program headers and
@@ -223,7 +260,7 @@ pub fn emit_elf_executable_dynamic(
     phdr_load[16..24].copy_from_slice(&load_vaddr.to_le_bytes());
     phdr_load[24..32].copy_from_slice(&load_vaddr.to_le_bytes());
     phdr_load[32..40].copy_from_slice(&load_filesz.to_le_bytes());
-    phdr_load[40..48].copy_from_slice(&load_filesz.to_le_bytes());
+    phdr_load[40..48].copy_from_slice(&(seg_start + mem_size).to_le_bytes());
     phdr_load[48..56].copy_from_slice(&seg_align.to_le_bytes());
     out.write_all(&phdr_load)?;
 
@@ -271,8 +308,145 @@ pub fn emit_elf_executable_dynamic(
     }
     // Write code segment (no INTERP prefix — sections map to correct VAs).
     out.write_all(&seg_buffer)?;
+    out.write_all(&metadata.bytes)?;
 
     Ok(())
+}
+
+fn seg_offset_for_metadata(ehdr: &[u8; 64], align: u64) -> u64 {
+    let phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap()) as u64;
+    align_up_u64(64 + phnum * ELF64_PHDR_SIZE as u64, align)
+}
+
+struct SectionMetadata {
+    bytes: Vec<u8>,
+    shoff: u64,
+    count: u16,
+    names_index: u16,
+}
+
+impl SectionMetadata {
+    fn new(
+        layout: &MergedLayout,
+        symbols: &[OutputSymbol],
+        segment_offset: u64,
+        base: u64,
+        segment_size: usize,
+    ) -> Self {
+        use crate::elf::SectionHeader;
+        let start = segment_offset + segment_size as u64;
+        let mut bytes = Vec::new();
+        let mut names = vec![0];
+        let mut headers = Vec::new();
+        let index = |name: &str| {
+            layout
+                .section_by_name
+                .get(name)
+                .map_or(0, |i| (i + 1) as u32)
+        };
+        for section in &layout.sections {
+            let name_offset = names.len() as u32;
+            names.extend_from_slice(section.name.as_bytes());
+            names.push(0);
+            let (kind, link, info, entsize) = match section.name.as_str() {
+                ".dynsym" => (11, index(".dynstr"), 1, 24),
+                ".dynstr" => (3, 0, 0, 0),
+                ".dynamic" => (6, index(".dynstr"), 0, 16),
+                ".hash" => (5, index(".dynsym"), 0, 4),
+                ".rela.plt" => (4, index(".dynsym"), index(".got.plt"), 24),
+                ".got" | ".got.plt" => (1, 0, 0, 8),
+                ".plt" => (1, 0, 0, 16),
+                _ => (section.sh_type, 0, 0, section.entsize),
+            };
+            headers.push(SectionHeader {
+                name_offset,
+                sh_type: kind,
+                sh_flags: section.flags,
+                sh_addr: section.vaddr,
+                sh_offset: segment_offset + section.vaddr - base,
+                sh_size: section.data.len() as u64,
+                sh_link: link,
+                sh_info: info,
+                sh_addralign: section.align,
+                sh_entsize: entsize,
+            });
+        }
+        let mut strtab = vec![0];
+        let mut symtab = vec![0; 24];
+        let mut first_global = 1;
+        for local in [true, false] {
+            for symbol in symbols.iter().filter(|s| (s.info >> 4 == 0) == local) {
+                let name = if symbol.name.is_empty() {
+                    0
+                } else {
+                    let offset = strtab.len() as u32;
+                    strtab.extend_from_slice(symbol.name.as_bytes());
+                    strtab.push(0);
+                    offset
+                };
+                symtab.extend_from_slice(&name.to_le_bytes());
+                symtab.extend_from_slice(&[symbol.info, 0]);
+                symtab.extend_from_slice(&symbol.shndx.to_le_bytes());
+                symtab.extend_from_slice(&symbol.value.to_le_bytes());
+                symtab.extend_from_slice(&symbol.size.to_le_bytes());
+                if local {
+                    first_global += 1;
+                }
+            }
+        }
+        let sym_index = headers.len() as u32 + 1;
+        for (name, data, kind, link, info, align, entsize) in [
+            (".symtab", symtab, 2, sym_index + 1, first_global, 8, 24),
+            (".strtab", strtab, 3, 0, 0, 1, 0),
+            (".shstrtab", Vec::new(), 3, 0, 0, 1, 0),
+        ] {
+            let offset = align_up_u64(start + bytes.len() as u64, align);
+            bytes.resize((offset - start) as usize, 0);
+            let name_offset = names.len() as u32;
+            names.extend_from_slice(name.as_bytes());
+            names.push(0);
+            let data = if name == ".shstrtab" { &names } else { &data };
+            bytes.extend_from_slice(data);
+            headers.push(SectionHeader {
+                name_offset,
+                sh_type: kind,
+                sh_flags: 0,
+                sh_addr: 0,
+                sh_offset: offset,
+                sh_size: data.len() as u64,
+                sh_link: link,
+                sh_info: info,
+                sh_addralign: align,
+                sh_entsize: entsize,
+            });
+        }
+        let shoff = align_up_u64(start + bytes.len() as u64, 8);
+        bytes.resize((shoff - start) as usize + 64, 0);
+        for h in &headers {
+            bytes.extend_from_slice(&h.name_offset.to_le_bytes());
+            bytes.extend_from_slice(&h.sh_type.to_le_bytes());
+            for value in [h.sh_flags, h.sh_addr, h.sh_offset, h.sh_size] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes.extend_from_slice(&h.sh_link.to_le_bytes());
+            bytes.extend_from_slice(&h.sh_info.to_le_bytes());
+            bytes.extend_from_slice(&h.sh_addralign.to_le_bytes());
+            bytes.extend_from_slice(&h.sh_entsize.to_le_bytes());
+        }
+        Self {
+            bytes,
+            shoff,
+            count: headers.len() as u16 + 1,
+            names_index: headers.len() as u16,
+        }
+    }
+
+    fn set_header(&self, header: &mut [u8; 64]) {
+        header[40..48].copy_from_slice(&self.shoff.to_le_bytes());
+        header[58..60].copy_from_slice(&64u16.to_le_bytes());
+        header[60..62].copy_from_slice(&self.count.to_le_bytes());
+        header[62..64].copy_from_slice(&self.names_index.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +460,8 @@ mod tests {
     fn test_emit_elf_header() {
         let layout = MergedLayout {
             sections: vec![MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".text".into(),
                 data: vec![0xc3],
                 vaddr: 0x400000,
@@ -300,7 +476,7 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        emit_elf_executable(&layout, TargetArch::X86_64, 0x400000, 0, &mut out).expect("emit");
+        emit_elf_executable(&layout, TargetArch::X86_64, 0x400000, 0, &[], &mut out).expect("emit");
 
         assert!(out.len() >= 64);
         assert_eq!(&out[0..4], &[0x7f, b'E', b'L', b'F']);
@@ -313,6 +489,8 @@ mod tests {
     fn test_emit_aarch64() {
         let layout = MergedLayout {
             sections: vec![MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".text".into(),
                 data: vec![0xd6, 0x5f, 0x03, 0xc0],
                 vaddr: 0x400000,
@@ -327,7 +505,8 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        emit_elf_executable(&layout, TargetArch::AArch64, 0x400000, 0, &mut out).expect("emit");
+        emit_elf_executable(&layout, TargetArch::AArch64, 0x400000, 0, &[], &mut out)
+            .expect("emit");
         assert!(out.len() >= 64);
         assert_eq!(&out[0..4], &[0x7f, b'E', b'L', b'F']);
         assert_eq!(out[18..20], 183u16.to_le_bytes());
@@ -354,7 +533,7 @@ mod tests {
             .unwrap_or_else(|| result.layout.sections.first().map(|s| s.vaddr).unwrap());
 
         let mut out = Vec::new();
-        emit_elf_executable(&result.layout, arch, entry, 0, &mut out).expect("emit");
+        emit_elf_executable(&result.layout, arch, entry, 0, &[], &mut out).expect("emit");
 
         assert!(out.len() >= 64);
         assert_eq!(&out[0..4], &[0x7f, b'E', b'L', b'F']);

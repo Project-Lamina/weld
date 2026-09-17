@@ -709,6 +709,8 @@ pub fn emit_macho_executable_dynamic(
         .collect();
     if data_sections_owned.is_empty() {
         data_sections_owned.push(MergedSection {
+            entsize: 0,
+            sh_type: 1,
             name: "__data".to_string(),
             data: vec![0u8; 8],
             vaddr: 0,
@@ -1135,6 +1137,8 @@ mod tests {
     fn test_emit_macho_header() {
         let layout = MergedLayout {
             sections: vec![MergedSection {
+                entsize: 0,
+                sh_type: 1,
                 name: ".text".into(),
                 data: vec![0xc3],
                 vaddr: 0x100000000,
