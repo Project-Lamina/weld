@@ -204,7 +204,7 @@ fn reserve_start_section(layout: &mut MergedLayout) {
     });
 }
 
-fn move_nobits(layout: &mut MergedLayout) -> Vec<(u64, u64, u64)> {
+fn move_nobits(layout: &mut MergedLayout) {
     let mut end = layout
         .sections
         .iter()
@@ -212,20 +212,13 @@ fn move_nobits(layout: &mut MergedLayout) -> Vec<(u64, u64, u64)> {
         .map(|s| s.vaddr + s.data.len() as u64)
         .max()
         .unwrap_or(0x400000);
-    let mut shifts = Vec::new();
     for section in &mut layout.sections {
         if section.sh_type == SHT_NOBITS {
             end = align_up(end, section.align);
-            shifts.push((
-                section.vaddr,
-                section.vaddr + section.data.len() as u64,
-                end,
-            ));
             section.vaddr = end;
             end += section.data.len() as u64;
         }
     }
-    shifts
 }
 
 fn collect_output_symbols(
@@ -1127,15 +1120,38 @@ fn link_multi_object_parsed(
     {
         reserve_start_section(&mut layout);
     }
-    let shifts = move_nobits(&mut layout);
-    for address in global_symbols
-        .values_mut()
-        .chain(resolved_by_index_per_object.iter_mut().flatten().flatten())
-    {
-        for &(start, end, new) in &shifts {
-            if *address >= start && *address < end {
-                *address = new + (*address - start);
-                break;
+    move_nobits(&mut layout);
+    for (i, obj) in parsed.iter().enumerate() {
+        let Some(table) = obj.sections.iter().find(|s| s.sh_type == SHT_SYMTAB) else {
+            continue;
+        };
+        let strings = get_strtab_from_section(&obj.data, &obj.sections[table.sh_link as usize]);
+        for (index, record) in get_strtab_from_section(&obj.data, table)
+            .chunks_exact(24)
+            .enumerate()
+        {
+            let shndx = u16::from_le_bytes(record[6..8].try_into().unwrap()) as usize;
+            if obj
+                .sections
+                .get(shndx)
+                .is_none_or(|s| s.sh_type != SHT_NOBITS)
+            {
+                continue;
+            }
+            let name = &obj.names[shndx];
+            let Some(contribution) = section_contribs[i].get(name) else {
+                continue;
+            };
+            let symbol = crate::elf::parse_symbol_entry(record, 0)?;
+            let address = layout.sections[layout.section_by_name[name]].vaddr
+                + contribution.offset_in_merged
+                + symbol.st_value;
+            let old = resolved_by_index_per_object[i][index].replace(address);
+            if symbol.bind != STB_LOCAL
+                && let Some(name) = get_strtab_string(strings, symbol.name_offset)
+                && global_symbols.get(&name).copied() == old
+            {
+                global_symbols.insert(name, address);
             }
         }
     }
