@@ -1267,6 +1267,7 @@ fn select_needed_libraries(
     let mut needed = Vec::new();
     let mut seen = HashSet::default();
     let mut provided = HashSet::default();
+    let inspect_exports = opts.library_as_needed.iter().any(|&needed| needed);
     for (i, name) in libs.iter().enumerate() {
         if name == "System" {
             continue;
@@ -1278,6 +1279,11 @@ fn select_needed_libraries(
             continue;
         }
         if seen.contains(&library.soname) {
+            continue;
+        }
+        if !inspect_exports {
+            seen.insert(library.soname.clone());
+            needed.push(library.soname);
             continue;
         }
         let data = std::fs::read(&library.path).map_err(|e| e.to_string())?;
