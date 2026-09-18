@@ -256,3 +256,38 @@ fn parallel_loading_preserves_local_symbols_and_archive_selection() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn nobits_boundary_symbols_follow_dynamic_layout() {
+    let dir = std::env::temp_dir().join(format!("weld-nobits-end-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("start.s"), ".globl _start\n_start: lea buffer_end(%rip),%rax\n lea buffer(%rip),%rdx\n sub %rdx,%rax\n cmp $4096,%rax\n setne %dil\n movzbl %dil,%edi\n mov $60,%eax\n syscall\n").unwrap();
+    fs::write(
+        dir.join("data.s"),
+        ".bss\n.balign 16\n.globl buffer\nbuffer: .skip 4096\n.globl buffer_end\nbuffer_end:\n",
+    )
+    .unwrap();
+    for name in ["start", "data"] {
+        run(
+            "as",
+            &[&format!("{name}.s"), "-o", &format!("{name}.o")],
+            &dir,
+        );
+    }
+    run(
+        env!("CARGO_BIN_EXE_weld"),
+        &["start.o", "data.o", "-lc", "-o", "output"],
+        &dir,
+    );
+    assert!(Command::new(dir.join("output")).status().unwrap().success());
+    let symbols = run("readelf", &["-sW", "output"], &dir);
+    let address = |name: &str| {
+        let line = symbols
+            .lines()
+            .find(|s| s.ends_with(&format!(" {name}")))
+            .unwrap();
+        u64::from_str_radix(line.split_whitespace().nth(1).unwrap(), 16).unwrap()
+    };
+    assert_eq!(address("buffer_end") - address("buffer"), 4096);
+    fs::remove_dir_all(dir).unwrap();
+}
