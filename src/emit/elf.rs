@@ -185,7 +185,12 @@ pub fn emit_elf_executable_dynamic(
     let seg_align = arch.page_align();
 
     let phoff = 64u64;
-    let phnum = 5u16; // PHDR, LOAD, DYNAMIC, INTERP, GNU_STACK
+    let unwind = layout
+        .section_by_name
+        .get(".eh_frame_hdr")
+        .map(|&i| &layout.sections[i]);
+    let protected: Vec<_> = layout.sections.iter().filter(|s| s.is_relro()).collect();
+    let phnum = 5u16 + u16::from(unwind.is_some()) + u16::from(!protected.is_empty());
     let ph_size = (phnum as usize) * ELF64_PHDR_SIZE;
     let seg_start = align_up_u64(phoff + ph_size as u64, seg_align);
 
@@ -299,6 +304,30 @@ pub fn emit_elf_executable_dynamic(
     phdr_stack[4..8].copy_from_slice(&(PF_R | PF_W).to_le_bytes());
     out.write_all(&phdr_stack)?;
 
+    let mut extra_header = |kind: u32, address: u64, size: u64, align: u64| -> Result<()> {
+        let mut header = [0u8; ELF64_PHDR_SIZE];
+        header[..4].copy_from_slice(&kind.to_le_bytes());
+        header[4..8].copy_from_slice(&PF_R.to_le_bytes());
+        header[8..16].copy_from_slice(&(seg_start + address - base).to_le_bytes());
+        header[16..24].copy_from_slice(&address.to_le_bytes());
+        header[24..32].copy_from_slice(&address.to_le_bytes());
+        header[32..40].copy_from_slice(&size.to_le_bytes());
+        header[40..48].copy_from_slice(&size.to_le_bytes());
+        header[48..56].copy_from_slice(&align.to_le_bytes());
+        out.write_all(&header)
+    };
+    if let Some(section) = unwind {
+        extra_header(0x6474e550, section.vaddr, section.data.len() as u64, 4)?;
+    }
+    if let Some(start) = protected.iter().map(|s| s.vaddr).min() {
+        let end = protected
+            .iter()
+            .map(|s| s.vaddr + s.data.len() as u64)
+            .max()
+            .unwrap();
+        extra_header(0x6474e552, start, end - start, 1)?;
+    }
+
     // Write interpreter string in the padding gap, then pad to seg_start.
     out.write_all(interp_bytes.as_bytes())?;
     let used = ph_size + interp_len;
@@ -354,6 +383,29 @@ impl SectionMetadata {
                 ".dynamic" => (6, index(".dynstr"), 0, 16),
                 ".hash" => (5, index(".dynsym"), 0, 4),
                 ".rela.plt" => (4, index(".dynsym"), index(".got.plt"), 24),
+                ".rela.dyn" => (4, index(".dynsym"), 0, 24),
+                ".gnu.version" => (0x6fffffff, index(".dynsym"), 0, 2),
+                ".gnu.version_r" => (
+                    0x6ffffffe,
+                    index(".dynstr"),
+                    {
+                        let mut count = 0;
+                        let mut offset = 0;
+                        while offset + 16 <= section.data.len() {
+                            count += 1;
+                            let next = u32::from_le_bytes(
+                                section.data[offset + 12..offset + 16].try_into().unwrap(),
+                            ) as usize;
+                            if next == 0 {
+                                break;
+                            }
+                            offset += next;
+                        }
+                        count
+                    },
+                    0,
+                ),
+                ".gnu.hash" => (0x6ffffff6, index(".dynsym"), 0, 0),
                 ".got" | ".got.plt" => (1, 0, 0, 8),
                 ".plt" => (1, 0, 0, 16),
                 _ => (section.sh_type, 0, 0, section.entsize),
