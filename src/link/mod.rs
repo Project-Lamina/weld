@@ -12,6 +12,7 @@ mod gc;
 pub mod macho;
 pub mod resolver;
 mod riscv;
+mod runtime;
 mod x86_64;
 
 use crate::collections::{HashMap, HashSet};
@@ -122,6 +123,12 @@ pub struct MergedSection {
     pub vaddr: u64,
     pub flags: u64,
     pub align: u64,
+}
+
+impl MergedSection {
+    pub fn is_relro(&self) -> bool {
+        runtime::relro(&self.name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -887,11 +894,9 @@ fn link_multi_object_parsed(
             } else {
                 HashSet::default()
             };
-            for (index, sym) in symbols
-                .iter()
-                .enumerate()
-                .filter(|(_, sym)| sym.st_shndx == SHN_UNDEF && sym.bind == STB_GLOBAL)
-            {
+            for (index, sym) in symbols.iter().enumerate().filter(|(_, sym)| {
+                sym.st_shndx == SHN_UNDEF && matches!(sym.bind, STB_GLOBAL | STB_WEAK)
+            }) {
                 if opts.gc_sections && !referenced.contains(&index) {
                     continue;
                 }
@@ -1116,6 +1121,28 @@ fn link_multi_object_parsed(
         }
     }
 
+    let runtime = if let Some(dynamic) = &dynamic_info {
+        Some(runtime::prepare(
+            &mut layout,
+            parsed,
+            dynamic,
+            libs.unwrap_or(&[]),
+            &resolver,
+            &got_symbol_map,
+            &mut global_symbols,
+        )?)
+    } else {
+        None
+    };
+    if runtime.is_some()
+        && let Some(&idx) = layout.section_by_name.get(".got")
+    {
+        let old = got_symbol_map.values().min().copied().unwrap_or(0);
+        let new = layout.sections[idx].vaddr;
+        for address in got_symbol_map.values_mut() {
+            *address = new + *address - old;
+        }
+    }
     if !global_symbols.contains_key("_start")
         && (global_symbols.contains_key("main") || global_symbols.contains_key("_main"))
     {
@@ -1132,11 +1159,9 @@ fn link_multi_object_parsed(
             .enumerate()
         {
             let shndx = u16::from_le_bytes(record[6..8].try_into().unwrap()) as usize;
-            if obj
-                .sections
-                .get(shndx)
-                .is_none_or(|s| s.sh_type != SHT_NOBITS)
-            {
+            if obj.sections.get(shndx).is_none_or(|s| {
+                s.sh_type != SHT_NOBITS && !(runtime.is_some() && runtime::relro(&obj.names[shndx]))
+            }) {
                 continue;
             }
             let name = &obj.names[shndx];
@@ -1213,6 +1238,9 @@ fn link_multi_object_parsed(
         )?;
     }
 
+    if let Some(runtime) = runtime {
+        runtime::finish(&mut layout, &section_contribs, &runtime)?;
+    }
     timer.mark("apply relocations");
     let mut symbols = Vec::new();
     let mut emitted = HashSet::default();
@@ -1406,7 +1434,7 @@ fn build_dynamic_sections(
     for sym in plt_symbols {
         let off = dynstr.len() as u32;
         str_offsets.push(off);
-        dynstr.extend_from_slice(sym.as_bytes());
+        dynstr.extend_from_slice(sym.split('@').next().unwrap().as_bytes());
         dynstr.push(0);
     }
 
@@ -1432,7 +1460,10 @@ fn build_dynamic_sections(
         rela_plt.extend_from_slice(&0i64.to_le_bytes());
     }
 
-    let name_refs: Vec<&str> = plt_symbols.iter().map(|s| s.as_str()).collect();
+    let name_refs: Vec<&str> = plt_symbols
+        .iter()
+        .map(|s| s.split('@').next().unwrap())
+        .collect();
     let hash = build_sysv_hash(&name_refs);
 
     Ok((

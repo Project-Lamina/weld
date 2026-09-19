@@ -61,7 +61,7 @@ pub fn apply_relocations(
                     }
                     write_u64_le(&mut merged.data, off, val);
                 }
-                reloc_type::R_X86_64_64 => {
+                reloc_type::R_X86_64_64 | 6 => {
                     let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
                         return Err(format!("undefined symbol index {}", rel.r_sym));
                     };
