@@ -762,6 +762,7 @@ pub struct LinkOptions {
     pub rpaths: Vec<String>,
     pub library_as_needed: Vec<bool>,
     pub library_positions: Vec<usize>,
+    pub object_positions: Vec<usize>,
     pub gc_sections: bool,
     pub gc_roots: Vec<String>,
 }
@@ -1267,6 +1268,7 @@ fn select_needed_libraries(
     let mut needed = Vec::new();
     let mut seen = HashSet::default();
     let mut provided = HashSet::default();
+    let mut shared_references = HashSet::default();
     let inspect_exports = opts.library_as_needed.iter().any(|&needed| needed);
     for (i, name) in libs.iter().enumerate() {
         if name == "System" {
@@ -1289,6 +1291,7 @@ fn select_needed_libraries(
         let data = std::fs::read(&library.path).map_err(|e| e.to_string())?;
         let (_, sections, _) = parse_elf64_slice(&data)?;
         let mut exports = HashSet::default();
+        let mut library_references = HashSet::default();
         for section in sections.iter().filter(|s| s.sh_type == 11) {
             let strings = get_strtab_from_section(
                 &data,
@@ -1297,24 +1300,29 @@ fn select_needed_libraries(
                     .ok_or("invalid dynsym link")?,
             );
             for sym in parse_symtab(&data, section)? {
-                if sym.st_shndx != SHN_UNDEF
-                    && sym.bind != STB_LOCAL
+                if sym.bind != STB_LOCAL
                     && let Some(name) = get_strtab_string(strings, sym.name_offset)
                 {
-                    exports.insert(name);
+                    if sym.st_shndx != SHN_UNDEF {
+                        exports.insert(name);
+                    } else if sym.bind != STB_WEAK {
+                        library_references.insert(name);
+                    }
                 }
             }
         }
         let mut retain = !opts.library_as_needed.get(i).copied().unwrap_or(false);
         if !retain {
-            let count = opts
-                .library_positions
-                .get(i)
-                .copied()
-                .unwrap_or(parsed.len());
+            let count = opts.library_positions.get(i).copied().unwrap_or(usize::MAX);
             let mut definitions = HashSet::default();
-            let mut references = HashSet::default();
-            for obj in parsed.iter().take(count) {
+            let mut references = shared_references.clone();
+            for (_, obj) in parsed.iter().enumerate().filter(|(index, _)| {
+                opts.object_positions
+                    .get(*index)
+                    .copied()
+                    .unwrap_or(*index + 1)
+                    <= count
+            }) {
                 if let Some((symbols, strings)) = parse_symtab_view(&obj.data, &obj.sections)? {
                     let referenced = if opts.gc_sections {
                         referenced_symbols(obj)?
@@ -1363,6 +1371,7 @@ fn select_needed_libraries(
             seen.insert(library.soname.clone());
             needed.push(library.soname);
             provided.extend(exports);
+            shared_references.extend(library_references);
         }
     }
     Ok(needed)
