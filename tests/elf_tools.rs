@@ -291,3 +291,86 @@ fn nobits_boundary_symbols_follow_dynamic_layout() {
     assert_eq!(address("buffer_end") - address("buffer"), 4096);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn as_needed_counts_archive_members_and_retained_dso_references() {
+    let dir = std::env::temp_dir().join(format!("weld-needed-origins-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    for (name, source) in [
+        (
+            "main",
+            ".globl _start\n_start: call entry\n mov $60,%eax\n xor %edi,%edi\n syscall\n",
+        ),
+        ("first", ".globl entry\nentry: call internal\n ret\n"),
+        (
+            "second",
+            ".globl internal\ninternal: call dependency\n ret\n",
+        ),
+        ("late", ".globl late\nlate: ret\n"),
+        ("provider", ".globl dependency\ndependency: ret\n"),
+        ("shared", ".globl entry\nentry: call dependency\n ret\n"),
+    ] {
+        fs::write(dir.join("input.s"), source).unwrap();
+        run("as", &["input.s", "-o", &format!("{name}.o")], &dir);
+    }
+    run("ar", &["rcs", "libarchive.a", "first.o", "second.o"], &dir);
+    run(
+        "ld",
+        &[
+            "-shared",
+            "-soname",
+            "libprovider.so",
+            "provider.o",
+            "-o",
+            "libprovider.so",
+        ],
+        &dir,
+    );
+    run(
+        "ld",
+        &[
+            "-shared",
+            "-soname",
+            "libshared.so",
+            "shared.o",
+            "-o",
+            "libshared.so",
+        ],
+        &dir,
+    );
+    for (input, expected) in [
+        (
+            vec![
+                "main.o",
+                "libarchive.a",
+                "--as-needed",
+                "-lprovider",
+                "late.o",
+            ],
+            vec!["libprovider.so"],
+        ),
+        (
+            vec!["main.o", "-larchive", "--as-needed", "-lprovider", "late.o"],
+            vec!["libprovider.so"],
+        ),
+        (
+            vec!["main.o", "--as-needed", "-lshared", "-lprovider"],
+            vec!["libshared.so", "libprovider.so"],
+        ),
+    ] {
+        let mut args = vec!["-L."];
+        args.extend(input);
+        args.extend(["-o", "output"]);
+        for linker in [env!("CARGO_BIN_EXE_weld"), "ld"] {
+            run(linker, &args, &dir);
+            let dynamic = run("readelf", &["-dW", "output"], &dir);
+            let needed: Vec<_> = dynamic
+                .lines()
+                .filter(|s| s.contains("(NEEDED)"))
+                .map(|s| s.split('[').nth(1).unwrap().trim_end_matches(']'))
+                .collect();
+            assert_eq!(needed, expected);
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

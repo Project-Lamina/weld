@@ -46,6 +46,7 @@ fn link_options(args: &ParsedArgs) -> LinkOptions {
         library_positions: args.library_positions.clone(),
         gc_sections: args.gc_sections,
         gc_roots: entry_seeds(args),
+        object_positions: Vec::new(),
     }
 }
 
@@ -214,15 +215,29 @@ fn host_arch() -> TargetArch {
 }
 
 fn static_library_paths(args: &ParsedArgs) -> Vec<PathBuf> {
+    static_library_inputs(args)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect()
+}
+
+fn static_library_inputs(args: &ParsedArgs) -> Vec<(PathBuf, usize)> {
     let mut resolver = LibraryResolver::new(host_arch(), TargetPlatform::current());
     for path in args.search_paths.iter().rev() {
         resolver.add_path(path.clone());
     }
     args.libraries
         .iter()
-        .filter_map(|name| resolver.resolve(name))
-        .filter(|resolved| resolved.is_static)
-        .map(|resolved| resolved.path)
+        .enumerate()
+        .filter_map(|(i, name)| {
+            let library = resolver.resolve(name)?;
+            library.is_static.then(|| {
+                (
+                    library.path,
+                    args.library_positions.get(i).copied().unwrap_or(usize::MAX),
+                )
+            })
+        })
         .collect()
 }
 
@@ -277,7 +292,11 @@ fn elf_link_map(result: &LinkResult, entry: u64) -> String {
     map
 }
 
-fn try_weld_link_elf(args: &ParsedArgs, obj_data_list: Vec<Vec<u8>>) -> Option<i32> {
+fn try_weld_link_elf(
+    args: &ParsedArgs,
+    obj_data_list: Vec<Vec<u8>>,
+    object_positions: Vec<usize>,
+) -> Option<i32> {
     let mut timer = timing::PhaseTimer::new();
     let libs = if args.libraries.is_empty() {
         None
@@ -287,7 +306,9 @@ fn try_weld_link_elf(args: &ParsedArgs, obj_data_list: Vec<Vec<u8>>) -> Option<i
     let target_os = args.target_os.as_deref();
     let os_abi = os_abi_for_target(target_os);
     let freebsd_abi = os_abi == ELFOSABI_FREEBSD;
-    let mut result = link::link_elf_objects(obj_data_list, libs, &link_options(args)).ok()?;
+    let mut opts = link_options(args);
+    opts.object_positions = object_positions;
+    let mut result = link::link_elf_objects(obj_data_list, libs, &opts).ok()?;
     timer.mark("link ELF objects");
     let arch = TargetArch::from_elf_machine(result.e_machine)?;
     if let Some(emul) = args.emulation.as_deref() {
@@ -439,15 +460,19 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
     }
 
     let mut timer = timing::PhaseTimer::new();
-    let (format, objects, _) = load_objects(
+    let (libraries, library_positions): (Vec<_>, Vec<_>) =
+        static_library_inputs(args).into_iter().unzip();
+    let loaded = object::load_objects_with_positions(
         &args.input_files,
-        &static_library_paths(args),
+        &libraries,
         &entry_seeds(args),
+        &args.input_positions,
+        &library_positions,
     )?;
 
     timer.mark("detect format and load objects");
-    match format {
-        ObjectFormat::Elf => try_weld_link_elf(args, objects),
+    match loaded.format {
+        ObjectFormat::Elf => try_weld_link_elf(args, loaded.objects, loaded.positions),
         ObjectFormat::MachO => try_weld_link_macho(args),
         ObjectFormat::Coff => try_weld_link_pe(args),
     }

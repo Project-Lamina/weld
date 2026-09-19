@@ -17,6 +17,7 @@ pub struct ParsedArgs {
     pub strip_all: bool,
     pub map_file: Option<PathBuf>,
     pub input_files: Vec<PathBuf>,
+    pub input_positions: Vec<usize>,
 }
 
 pub enum ParseAction {
@@ -184,7 +185,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
                 };
                 args.libraries.push(lib);
                 args.library_as_needed.push(as_needed);
-                args.library_positions.push(args.input_files.len());
+                args.library_positions.push(i);
             }
             "-m" => {
                 let next = take_required_arg(argv, &mut i, "-m")?;
@@ -260,6 +261,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
                     return Err(format!("unrecognized option {a}"));
                 }
                 args.input_files.push(PathBuf::from(a.clone()));
+                args.input_positions.push(i);
             }
         }
     }

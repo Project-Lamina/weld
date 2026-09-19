@@ -39,6 +39,7 @@ struct ObjectSymbolSummary {
 
 #[derive(Clone)]
 struct ArchiveEntry {
+    position: usize,
     data: Vec<u8>,
     symbols: ObjectSymbolSummary,
     selected: bool,
@@ -334,7 +335,7 @@ fn apply_symbol_summary(
     }
 }
 
-fn load_archive_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
+fn load_archive_entries(data: &[u8], position: usize) -> Option<Vec<ArchiveEntry>> {
     Some(
         archive::parse_members(data)
             .ok()?
@@ -346,6 +347,7 @@ fn load_archive_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
                 }
                 let symbols = collect_object_symbol_summary(&data).unwrap_or_default();
                 Some(ArchiveEntry {
+                    position,
                     data,
                     symbols,
                     selected: false,
@@ -358,6 +360,7 @@ fn load_archive_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
 fn select_archive_members(
     archives: &mut [Vec<ArchiveEntry>],
     objects: &mut Vec<Vec<u8>>,
+    positions: &mut Vec<usize>,
     defined_symbols: &mut HashSet<String>,
     unresolved_symbols: &mut HashSet<String>,
 ) {
@@ -370,6 +373,7 @@ fn select_archive_members(
             entry.selected = true;
             apply_symbol_summary(&entry.symbols, defined_symbols, unresolved_symbols);
             objects.push(std::mem::take(&mut entry.data));
+            positions.push(entry.position);
             changed = true;
         }
         if !changed {
@@ -398,11 +402,30 @@ pub fn load_objects(
     libs: &[PathBuf],
     entries: &[String],
 ) -> Option<(ObjectFormat, Vec<Vec<u8>>, Vec<PathBuf>)> {
+    let loaded = load_objects_with_positions(paths, libs, entries, &[], &[])?;
+    Some((loaded.format, loaded.objects, loaded.dylibs))
+}
+
+pub struct LoadedObjects {
+    pub format: ObjectFormat,
+    pub objects: Vec<Vec<u8>>,
+    pub dylibs: Vec<PathBuf>,
+    pub positions: Vec<usize>,
+}
+
+pub fn load_objects_with_positions(
+    paths: &[PathBuf],
+    libs: &[PathBuf],
+    entries: &[String],
+    path_positions: &[usize],
+    library_positions: &[usize],
+) -> Option<LoadedObjects> {
     if paths.is_empty() {
         return None;
     }
 
     let mut all_objects: Vec<Vec<u8>> = Vec::new();
+    let mut positions = Vec::new();
     let mut archives: Vec<Vec<ArchiveEntry>> = Vec::new();
     let mut dylib_paths: Vec<PathBuf> = Vec::new();
     let mut defined_symbols: HashSet<String> = HashSet::default();
@@ -413,11 +436,12 @@ pub fn load_objects(
     });
     let loaded: Vec<_> = loaded.into_iter().collect::<Option<_>>()?;
     let need_summaries = !libs.is_empty() || loaded.iter().any(|data| archive::is_archive(data));
-    for (path, data) in paths.iter().zip(loaded) {
+    for (i, (path, data)) in paths.iter().zip(loaded).enumerate() {
+        let position = path_positions.get(i).copied().unwrap_or(i + 1);
         if is_macho_dylib(&data) {
             dylib_paths.push(path.clone());
         } else if archive::is_archive(&data) {
-            archives.push(load_archive_entries(&data)?);
+            archives.push(load_archive_entries(&data, position)?);
         } else {
             for obj in expand_data_to_objects(data)? {
                 if need_summaries {
@@ -425,17 +449,23 @@ pub fn load_objects(
                     apply_symbol_summary(&symbols, &mut defined_symbols, &mut unresolved_symbols);
                 }
                 all_objects.push(obj);
+                positions.push(position);
             }
         }
     }
-    for path in libs {
+    for (i, path) in libs.iter().enumerate() {
+        let position = library_positions
+            .get(i)
+            .copied()
+            .unwrap_or(paths.len() + i + 1);
         let data = normalize_macho_container(std::fs::read(path).ok()?);
-        archives.push(load_archive_entries(&data)?);
+        archives.push(load_archive_entries(&data, position)?);
     }
 
     select_archive_members(
         &mut archives,
         &mut all_objects,
+        &mut positions,
         &mut defined_symbols,
         &mut unresolved_symbols,
     );
@@ -463,7 +493,12 @@ pub fn load_objects(
             return None;
         }
     }
-    Some((format, all_objects, dylib_paths))
+    Some(LoadedObjects {
+        format,
+        objects: all_objects,
+        dylibs: dylib_paths,
+        positions,
+    })
 }
 
 pub fn load_elf_objects(
