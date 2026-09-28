@@ -1,4 +1,5 @@
 use super::*;
+use super::dynamic::elf_hash;
 
 struct Export {
     symbol: Symbol,
