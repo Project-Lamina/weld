@@ -15,6 +15,7 @@ pub struct ParsedArgs {
     pub verbose: bool,
     pub gc_sections: bool,
     pub strip_all: bool,
+    pub pie: bool,
     pub map_file: Option<PathBuf>,
     pub input_files: Vec<PathBuf>,
     pub input_positions: Vec<usize>,
@@ -219,7 +220,9 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "--no-as-needed" => as_needed = false,
             "--push-state" => states.push(as_needed),
             "--pop-state" => as_needed = states.pop().ok_or("unmatched --pop-state")?,
-            "--eh-frame-hdr" | "--no-eh-frame-hdr" | "--build-id" | "-no-pie" | "--no-pie" => {}
+            "-pie" | "--pie" => args.pie = true,
+            "-no-pie" | "--no-pie" => args.pie = false,
+            "--eh-frame-hdr" | "--no-eh-frame-hdr" | "--build-id" => {}
             s if s.starts_with("--hash-style=") || s.starts_with("--build-id=") => {}
             s if s.starts_with("-plugin-opt=") || s.starts_with("--plugin-opt=") => {}
             "-plugin" | "--plugin" => {
