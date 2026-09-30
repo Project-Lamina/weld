@@ -589,6 +589,7 @@ fn link_multi_object_parsed(
         let mut by_index: Vec<Option<u64>> = Vec::with_capacity(obj_by_index.len());
         for (i, addr) in obj_by_index.iter().enumerate() {
             let resolved_addr = match addr {
+                Some(0) => Some(symbol_names.get(i).and_then(|name| global_symbols.get(name)).copied().unwrap_or(0)),
                 Some(a) => Some(*a),
                 None => symbol_names
                     .get(i)
