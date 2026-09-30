@@ -142,6 +142,7 @@ pub(super) struct DynamicAddrs {
     pub(super) rela_plt_vaddr: u64,
     pub(super) rela_plt_size: u64,
     pub(super) hash_vaddr: u64,
+    pub(super) pie: bool,
 }
 
 pub(super) fn build_dynamic_section_content(
@@ -157,6 +158,7 @@ pub(super) fn build_dynamic_section_content(
         rela_plt_vaddr,
         rela_plt_size,
         hash_vaddr,
+        pie,
     } = *addrs;
     let mut content = Vec::new();
     fn push_dyn(content: &mut Vec<u8>, tag: u64, val: u64) {
@@ -183,7 +185,7 @@ pub(super) fn build_dynamic_section_content(
     // PLT trampoline state (GOT[0]=_DYNAMIC, GOT slot back-pointers).
     push_dyn(&mut content, 24, 0); // DT_BIND_NOW
     push_dyn(&mut content, 30, 0x8); // DT_FLAGS = DF_BIND_NOW
-    push_dyn(&mut content, 0x6ffffffb, 0x1); // DT_FLAGS_1 = DF_1_NOW
+    push_dyn(&mut content, 0x6ffffffb, 0x1 | if pie { 0x08000000 } else { 0 }); // DT_FLAGS_1 = DF_1_NOW
     push_dyn(&mut content, 0, 0);
     Ok(content)
 }
