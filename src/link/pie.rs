@@ -1,7 +1,9 @@
 use super::*;
+use crate::elf::reloc_type::*;
 
 pub(super) struct RelativeRelocations {
     slots: Vec<(usize, usize, Option<i64>)>,
+    kind: u32,
 }
 
 pub(super) fn prepare(
@@ -11,6 +13,13 @@ pub(super) fn prepare(
     got: &HashMap<String, u64>,
     globals: &HashMap<String, u64>,
 ) -> Result<RelativeRelocations, String> {
+    let arch = TargetArch::from_elf_machine(objects[0].header.e_machine)
+        .ok_or("unsupported PIE architecture")?;
+    let (absolute, relative_kind, rejected): (u32, u32, &[u32]) = match arch {
+        TargetArch::X86_64 => (R_X86_64_64, R_X86_64_RELATIVE, &[R_X86_64_32, R_X86_64_32S]),
+        TargetArch::AArch64 => (R_AARCH64_ABS64, R_AARCH64_RELATIVE, &[R_AARCH64_ABS32]),
+        TargetArch::RiscV => return Err("RISC-V PIE relocations unsupported".into()),
+    };
     let mut slots = Vec::new();
     let mut absolute_names = HashSet::default();
     let mut defined_names = HashSet::default();
@@ -38,7 +47,7 @@ pub(super) fn prepare(
             };
             let index = layout.section_by_name[&obj.names[target]];
             for rel in parse_rela_section(&obj.data, section)? {
-                let relative = rel.r_type == crate::elf::reloc_type::R_X86_64_RELATIVE;
+                let relative = rel.r_type == relative_kind;
                 let symbol = symbols
                     .get(rel.r_sym as usize)
                     .ok_or("invalid PIE symbol index")?;
@@ -51,12 +60,17 @@ pub(super) fn prepare(
                     continue;
                 }
                 match rel.r_type {
-                    1 | 6 | 8 => slots.push((
-                        index,
-                        (contribution.offset_in_merged + rel.r_offset) as usize,
-                        relative.then_some(rel.r_addend),
-                    )),
-                    10 | 11 => {
+                    kind if kind == absolute
+                        || relative
+                        || (arch == TargetArch::X86_64 && kind == 6) =>
+                    {
+                        slots.push((
+                            index,
+                            (contribution.offset_in_merged + rel.r_offset) as usize,
+                            relative.then_some(rel.r_addend),
+                        ))
+                    }
+                    kind if rejected.contains(&kind) => {
                         return Err(format!(
                             "relocation type {} requires position independent input for PIE",
                             rel.r_type
@@ -97,7 +111,10 @@ pub(super) fn prepare(
         sh_type: 4,
         entsize: 24,
     });
-    Ok(RelativeRelocations { slots })
+    Ok(RelativeRelocations {
+        slots,
+        kind: relative_kind,
+    })
 }
 
 pub(super) fn finish(
@@ -114,7 +131,7 @@ pub(super) fn finish(
         let addend = addend.unwrap_or_else(|| i64::from_le_bytes(slot.try_into().unwrap()));
         slot.copy_from_slice(&addend.to_le_bytes());
         bytes.extend_from_slice(&(section.vaddr + *offset as u64).to_le_bytes());
-        bytes.extend_from_slice(&8u64.to_le_bytes());
+        bytes.extend_from_slice(&u64::from(pending.kind).to_le_bytes());
         bytes.extend_from_slice(&addend.to_le_bytes());
     }
     let dynidx = layout.section_by_name[".dynamic"];
@@ -183,7 +200,14 @@ pub(super) fn add_dynamic(
     append(".dynamic", content, SHF_ALLOC | SHF_WRITE);
     DynamicLinkInfo {
         pie: true,
-        interpreter: Some(interpreter.unwrap_or_else(|| "/lib64/ld-linux-x86-64.so.2".into())),
+        interpreter: Some(interpreter.unwrap_or_else(|| {
+            match arch {
+                TargetArch::X86_64 => "/lib64/ld-linux-x86-64.so.2",
+                TargetArch::AArch64 => "/lib/ld-linux-aarch64.so.1",
+                TargetArch::RiscV => "/lib/ld-linux-riscv64-lp64d.so.1",
+            }
+            .into()
+        })),
         ..DynamicLinkInfo::default()
     }
 }
