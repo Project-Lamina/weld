@@ -185,7 +185,14 @@ pub(super) fn build_dynamic_section_content(
     // PLT trampoline state (GOT[0]=_DYNAMIC, GOT slot back-pointers).
     push_dyn(&mut content, 24, 0); // DT_BIND_NOW
     push_dyn(&mut content, 30, 0x8); // DT_FLAGS = DF_BIND_NOW
-    push_dyn(&mut content, 0x6ffffffb, 0x1 | if pie { 0x08000000 } else { 0 }); // DT_FLAGS_1 = DF_1_NOW
+    push_dyn(
+        &mut content,
+        0x6ffffffb,
+        0x1 | if pie { 0x08000000 } else { 0 },
+    ); // DT_FLAGS_1 = DF_1_NOW
+    if pie {
+        push_dyn(&mut content, 0x6ffffff9, 0);
+    }
     push_dyn(&mut content, 0, 0);
     Ok(content)
 }
@@ -232,4 +239,21 @@ pub(super) fn build_plt_got_x86_64(
     let got = vec![0u8; got_size];
 
     Ok((plt, got))
+}
+
+pub(super) fn set_relative_tags(layout: &mut MergedLayout, count: u64) {
+    let relaidx = layout.section_by_name[".rela.dyn"];
+    let dynidx = layout.section_by_name[".dynamic"];
+    let address = layout.sections[relaidx].vaddr;
+    let size = layout.sections[relaidx].data.len() as u64;
+    for record in layout.sections[dynidx].data.chunks_exact_mut(16) {
+        let value = match u64::from_le_bytes(record[..8].try_into().unwrap()) {
+            7 => address,
+            8 => size,
+            9 => 24,
+            0x6ffffff9 => count,
+            _ => continue,
+        };
+        record[8..].copy_from_slice(&value.to_le_bytes());
+    }
 }

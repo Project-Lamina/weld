@@ -1,5 +1,5 @@
-use super::*;
 use super::dynamic::elf_hash;
+use super::*;
 
 struct Export {
     symbol: Symbol,
@@ -229,7 +229,7 @@ pub(super) fn prepare(
                 let symbol = *indices
                     .get(index)
                     .ok_or("invalid dynamic relocation symbol")?;
-                if kind != 8 && symbol == 0 {
+                if (kind == 8 && dynamic.pie) || (kind != 8 && symbol == 0) {
                     continue;
                 }
                 let relocation = crate::elf::parse_rela_entry(record, 0)?;
@@ -393,7 +393,19 @@ pub(super) fn prepare(
             .filter(|name| imports.contains_key(*name))
             .count()
         + relocations.len();
-    append(layout, ".rela.dyn", vec![0; count * 24], 8, SHF_ALLOC);
+    if let Some(&idx) = layout.section_by_name.get(".rela.dyn") {
+        let end = layout
+            .sections
+            .iter()
+            .map(|s| s.vaddr + s.data.len() as u64)
+            .max()
+            .unwrap();
+        layout.sections[idx].vaddr = align_up(end, 8);
+        let size = layout.sections[idx].data.len() + count * 24;
+        layout.sections[idx].data.resize(size, 0);
+    } else {
+        append(layout, ".rela.dyn", vec![0; count * 24], 8, SHF_ALLOC);
+    }
     if let Some(&idx) = layout.section_by_name.get(".eh_frame") {
         let count = frame_entries(&layout.sections[idx])?.len();
         append(

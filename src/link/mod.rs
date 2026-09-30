@@ -8,32 +8,32 @@
 #![allow(dead_code)]
 
 mod aarch64;
-mod gc;
 mod dynamic;
-mod merge;
-mod symbols;
+mod gc;
 pub mod macho;
+mod merge;
+mod pie;
 pub mod resolver;
 mod riscv;
 mod runtime;
+mod symbols;
 mod x86_64;
 
 use crate::collections::{HashMap, HashSet};
+pub use dynamic::DynamicLinkInfo;
+use dynamic::{
+    DynamicAddrs, build_dynamic_section_content, build_dynamic_sections, build_plt_got_x86_64,
+};
 pub use merge::{
     MergedLayout, MergedSection, ObjectSectionContrib, merge_sections_multi_object,
     merge_sections_single_object,
 };
 use merge::{align_up, is_allocatable, move_nobits, reserve_start, reserve_start_section};
-pub use dynamic::DynamicLinkInfo;
-use dynamic::{
-    DynamicAddrs, build_dynamic_section_content, build_dynamic_sections, build_plt_got_x86_64,
-};
 pub use resolver::LibraryResolver;
 pub use symbols::{OutputSymbol, resolve_symbols};
 use symbols::{
-    collect_gotpcrel_symbol_names, collect_output_symbols,
-    parse_symtab_view, resolve_symbols_for_object,
-    symbol_names_by_index,
+    collect_gotpcrel_symbol_names, collect_output_symbols, parse_symtab_view,
+    resolve_symbols_for_object, symbol_names_by_index,
 };
 
 use crate::{
@@ -504,6 +504,17 @@ fn link_multi_object_parsed(
         }
     }
 
+    let pie_relocations = if opts.pie {
+        Some(pie::prepare(
+            &mut layout,
+            parsed,
+            &section_contribs,
+            &got_symbol_map,
+            &global_symbols,
+        )?)
+    } else {
+        None
+    };
     let runtime = if let Some(dynamic) = &dynamic_info {
         Some(runtime::prepare(
             &mut layout,
@@ -517,6 +528,13 @@ fn link_multi_object_parsed(
     } else {
         None
     };
+    if opts.pie && dynamic_info.is_none() {
+        dynamic_info = Some(pie::add_dynamic(
+            &mut layout,
+            arch,
+            opts.interpreter.clone(),
+        ));
+    }
     if runtime.is_some()
         && let Some(&idx) = layout.section_by_name.get(".got")
     {
@@ -589,7 +607,13 @@ fn link_multi_object_parsed(
         let mut by_index: Vec<Option<u64>> = Vec::with_capacity(obj_by_index.len());
         for (i, addr) in obj_by_index.iter().enumerate() {
             let resolved_addr = match addr {
-                Some(0) => Some(symbol_names.get(i).and_then(|name| global_symbols.get(name)).copied().unwrap_or(0)),
+                Some(0) => Some(
+                    symbol_names
+                        .get(i)
+                        .and_then(|name| global_symbols.get(name))
+                        .copied()
+                        .unwrap_or(0),
+                ),
                 Some(a) => Some(*a),
                 None => symbol_names
                     .get(i)
@@ -624,6 +648,9 @@ fn link_multi_object_parsed(
 
     if let Some(runtime) = runtime {
         runtime::finish(&mut layout, &section_contribs, &runtime)?;
+    }
+    if let Some(pending) = pie_relocations {
+        pie::finish(&mut layout, pending)?;
     }
     timer.mark("apply relocations");
     let mut symbols = Vec::new();
