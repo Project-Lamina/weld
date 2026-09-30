@@ -412,6 +412,7 @@ fn link_multi_object_parsed(
 
             let dynamic_data = build_dynamic_section_content(
                 &DynamicAddrs {
+                    pie: opts.pie,
                     got_plt_vaddr,
                     dynsym_vaddr,
                     dynstr_vaddr,
