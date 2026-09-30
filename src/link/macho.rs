@@ -1222,6 +1222,7 @@ pub fn link_macho_multi_object(
             }
         }
         Some(DynamicLinkInfo {
+            pie: false,
             needed,
             plt_symbols,
             weak_plt_symbols,

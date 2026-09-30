@@ -19,6 +19,7 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const EV_CURRENT: u8 = 1;
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
 const EV_CURRENT_U32: u32 = 1;
 const PT_PHDR: u32 = 6;
 const PT_LOAD: u32 = 1;
@@ -215,7 +216,8 @@ pub fn emit_elf_executable_dynamic(
     ehdr[5] = ELFDATA2LSB;
     ehdr[6] = EV_CURRENT;
     ehdr[7] = os_abi;
-    ehdr[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+    let elf_type = if dynamic.pie { ET_DYN } else { ET_EXEC };
+    ehdr[16..18].copy_from_slice(&elf_type.to_le_bytes());
     ehdr[18..20].copy_from_slice(&arch.to_elf_machine().to_le_bytes());
     ehdr[20..24].copy_from_slice(&EV_CURRENT_U32.to_le_bytes());
     ehdr[24..32].copy_from_slice(&entry.to_le_bytes());

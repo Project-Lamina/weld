@@ -39,6 +39,7 @@ const ELFOSABI_FREEBSD: u8 = 9;
 /// Command-line settings the linker needs, gathered in one place.
 fn link_options(args: &ParsedArgs) -> LinkOptions {
     LinkOptions {
+        pie: args.pie,
         interpreter: args.dynamic_linker.clone(),
         search_paths: args.search_paths.clone(),
         rpaths: args.rpaths.clone(),
@@ -383,6 +384,7 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
     let out_file = std::fs::File::create(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
     let fallback_dyn = DynamicLinkInfo {
+        pie: false,
         needed: vec!["/usr/lib/libSystem.B.dylib".to_string()],
         plt_symbols: Vec::new(),
         weak_plt_symbols: Vec::new(),
