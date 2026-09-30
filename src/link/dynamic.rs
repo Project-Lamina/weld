@@ -49,6 +49,7 @@ pub(super) fn build_sysv_hash(sym_names: &[&str]) -> Vec<u8> {
 }
 #[derive(Debug, Default)]
 pub struct DynamicLinkInfo {
+    pub pie: bool,
     pub needed: Vec<String>,
     pub plt_symbols: Vec<String>,
     pub weak_plt_symbols: Vec<String>,
