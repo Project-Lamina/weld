@@ -134,6 +134,7 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
 /// Link settings that come from the command line rather than the objects.
 #[derive(Debug, Default, Clone)]
 pub struct LinkOptions {
+    pub pie: bool,
     /// `ld --dynamic-linker`.
     pub interpreter: Option<String>,
     /// `ld -L`.
@@ -167,7 +168,7 @@ pub fn link_elf_objects(
     if objects.is_empty() {
         return Err("no objects to link".into());
     }
-    if objects.len() == 1 && libs.is_none() && !opts.gc_sections {
+    if objects.len() == 1 && libs.is_none() && !opts.gc_sections && !opts.pie {
         return link_single_object(&objects[0]);
     }
     let mut timer = crate::timing::PhaseTimer::new();
@@ -198,7 +199,7 @@ fn link_multi_object_parsed(
     if parsed.is_empty() {
         return Err("no objects to link".to_string());
     }
-    if parsed.len() == 1 && libs.is_none() && !opts.gc_sections {
+    if parsed.len() == 1 && libs.is_none() && !opts.gc_sections && !opts.pie {
         return link_single_object(&parsed[0].data);
     }
 
@@ -208,6 +209,13 @@ fn link_multi_object_parsed(
     let e_machine = parsed[0].header.e_machine;
     let arch = TargetArch::from_elf_machine(e_machine)
         .ok_or_else(|| format!("unsupported machine {}", e_machine))?;
+
+    if opts.pie {
+        let base = arch.page_align();
+        for section in &mut layout.sections {
+            section.vaddr = section.vaddr - 0x400000 + base;
+        }
+    }
 
     timer.mark("merge sections");
     let mut global_symbols: HashMap<String, u64> = HashMap::default();
@@ -443,6 +451,7 @@ fn link_multi_object_parsed(
             // Build DT_NEEDED entries from the requested libraries, resolving
             // each name to its real soname via LibraryResolver.
             dynamic_info = Some(DynamicLinkInfo {
+                pie: opts.pie,
                 needed: needed.clone(),
                 plt_symbols: undefined,
                 weak_plt_symbols: Vec::new(),
