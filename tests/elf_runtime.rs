@@ -51,18 +51,19 @@ int main() {
     )
     .unwrap();
     let expected = "ctor\nsum=285 caught:boom\ndtor\n";
-    for flags in ["-fno-pic", "-fPIC"] {
+    for (mode, flags) in [
+        ("-no-pie", "-fno-pic"),
+        ("-no-pie", "-fPIC"),
+        ("-pie", "-fPIE"),
+        ("-pie", "-fPIC"),
+    ] {
         run(
             "g++",
-            &["-no-pie", flags, "-c", "input.cpp", "-o", "input.o"],
+            &[mode, flags, "-c", "input.cpp", "-o", "input.o"],
             &dir,
         );
-        run("g++", &["-no-pie", "input.o", "-o", "reference"], &dir);
-        run(
-            "g++",
-            &["-no-pie", "-Bprefix", "input.o", "-o", "output"],
-            &dir,
-        );
+        run("g++", &[mode, "input.o", "-o", "reference"], &dir);
+        run("g++", &[mode, "-Bprefix", "input.o", "-o", "output"], &dir);
         assert_eq!(run("./reference", &[], &dir), expected);
         assert_eq!(run("./output", &[], &dir), expected);
         let tags = run("readelf", &["-dW", "output"], &dir);
@@ -129,11 +130,16 @@ int main(void) {
         ],
         &dir,
     );
-    for flags in ["-fno-pic", "-fPIC"] {
+    for (mode, flags) in [
+        ("-no-pie", "-fno-pic"),
+        ("-no-pie", "-fPIC"),
+        ("-pie", "-fPIE"),
+        ("-pie", "-fPIC"),
+    ] {
         run(
             "gcc",
             &[
-                "-no-pie",
+                mode,
                 flags,
                 "-Bprefix",
                 "input.c",
@@ -201,12 +207,10 @@ int main(void) { if (absent || state != 123) return 1; printf("%d\n", state); re
 "#,
     )
     .unwrap();
-    run(
-        "gcc",
-        &["-no-pie", "-Bprefix", "input.c", "-o", "output"],
-        &dir,
-    );
-    assert_eq!(run("./output", &[], &dir), "123\nfirst dtor\nlast dtor\n");
+    for mode in ["-no-pie", "-pie"] {
+        run("gcc", &[mode, "-Bprefix", "input.c", "-o", "output"], &dir);
+        assert_eq!(run("./output", &[], &dir), "123\nfirst dtor\nlast dtor\n");
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 
