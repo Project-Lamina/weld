@@ -40,6 +40,7 @@ const ELFOSABI_FREEBSD: u8 = 9;
 fn link_options(args: &ParsedArgs) -> LinkOptions {
     LinkOptions {
         pie: args.pie,
+        static_link: args.static_link,
         interpreter: args.dynamic_linker.clone(),
         search_paths: args.search_paths.clone(),
         rpaths: args.rpaths.clone(),
@@ -231,7 +232,11 @@ fn static_library_inputs(args: &ParsedArgs) -> Vec<(PathBuf, usize)> {
         .iter()
         .enumerate()
         .filter_map(|(i, name)| {
-            let library = resolver.resolve(name)?;
+            let library = if args.static_link {
+                resolver.resolve_static(name)?
+            } else {
+                resolver.resolve(name)?
+            };
             library.is_static.then(|| {
                 (
                     library.path,
@@ -461,6 +466,18 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         return try_weld_link_pe(args);
     }
 
+    if args.static_link {
+        let mut resolver = LibraryResolver::new(host_arch(), TargetPlatform::current());
+        for path in args.search_paths.iter().rev() {
+            resolver.add_path(path.clone());
+        }
+        for name in &args.libraries {
+            if resolver.resolve_static(name).is_none() {
+                eprintln!("weld: cannot find static library -l{name}");
+                return Some(1);
+            }
+        }
+    }
     let mut timer = timing::PhaseTimer::new();
     let (libraries, library_positions): (Vec<_>, Vec<_>) =
         static_library_inputs(args).into_iter().unzip();

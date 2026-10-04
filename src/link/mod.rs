@@ -155,6 +155,7 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
 #[derive(Debug, Default, Clone)]
 pub struct LinkOptions {
     pub pie: bool,
+    pub static_link: bool,
     /// `ld --dynamic-linker`.
     pub interpreter: Option<String>,
     /// `ld -L`.
@@ -188,7 +189,7 @@ pub fn link_elf_objects(
     if objects.is_empty() {
         return Err("no objects to link".into());
     }
-    if objects.len() == 1 && libs.is_none() && !opts.gc_sections && !opts.pie {
+    if objects.len() == 1 && libs.is_none() && !opts.gc_sections && !opts.pie && !opts.static_link {
         return link_single_object(&objects[0]);
     }
     let mut timer = crate::timing::PhaseTimer::new();
@@ -219,10 +220,44 @@ fn link_multi_object_parsed(
     if parsed.is_empty() {
         return Err("no objects to link".to_string());
     }
-    if parsed.len() == 1 && libs.is_none() && !opts.gc_sections && !opts.pie {
+    if parsed.len() == 1 && libs.is_none() && !opts.gc_sections && !opts.pie && !opts.static_link {
         return link_single_object(&parsed[0].data);
     }
 
+    if opts.static_link {
+        if opts.pie {
+            return Err("static PIE is not supported".into());
+        }
+        for obj in parsed {
+            if obj.header.e_type != 1 {
+                return Err(
+                    "static links require ELF relocatable inputs; shared objects are not supported"
+                        .into(),
+                );
+            }
+            if let Some((index, _)) = obj
+                .sections
+                .iter()
+                .enumerate()
+                .find(|(_, section)| section.sh_flags & 0x400 != 0 && section.sh_size != 0)
+            {
+                return Err(format!(
+                    "static TLS is not supported (section {}); static glibc requires TLS layout, PT_TLS and thread-pointer relocations",
+                    obj.names[index]
+                ));
+            }
+            if let Some((symbols, strings)) = parse_symtab_view(&obj.data, &obj.sections)?
+                && let Some(symbol) = symbols
+                    .iter()
+                    .find(|symbol| symbol.sym_type == 10 && symbol.st_shndx != SHN_UNDEF)
+            {
+                let name = get_strtab_string(strings, symbol.name_offset).unwrap_or_default();
+                return Err(format!(
+                    "static GNU IFUNC is not supported: {name}; resolver calls require IRELATIVE relocations and startup relocation tables"
+                ));
+            }
+        }
+    }
     let mut timer = crate::timing::PhaseTimer::new();
     let objects: Vec<&[u8]> = parsed.iter().map(|p| p.data.as_slice()).collect();
     let (mut layout, section_contribs) = merge_sections_multi_object(&objects)?;
@@ -272,16 +307,17 @@ fn link_multi_object_parsed(
     for path in opts.search_paths.iter().rev() {
         resolver.add_path(path.clone());
     }
-    let has_shared_lib = libs
-        .map(|l| {
-            l.iter().any(|x| {
-                if x == "c" || x == "System" {
-                    return true;
-                }
-                resolver.resolve(x).map(|r| !r.is_static).unwrap_or(false)
+    let has_shared_lib = !opts.static_link
+        && libs
+            .map(|l| {
+                l.iter().any(|x| {
+                    if x == "c" || x == "System" {
+                        return true;
+                    }
+                    resolver.resolve(x).map(|r| !r.is_static).unwrap_or(false)
+                })
             })
-        })
-        .unwrap_or(false);
+            .unwrap_or(false);
 
     if has_shared_lib && arch == TargetArch::X86_64 && e_machine == 62 {
         let mut undefined: Vec<String> = Vec::new();

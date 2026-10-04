@@ -119,9 +119,10 @@ pub fn apply_relocations(
                 | reloc_type::R_X86_64_TLSLD
                 | reloc_type::R_X86_64_DTPOFF32
                 | reloc_type::R_X86_64_GOTTPOFF => {
-                    // TLS relocations: requires dynamic TLS support (not yet
-                    // implemented). Skip without patching; binary will crash on
-                    // TLS access.
+                    return Err(format!(
+                        "unsupported x86_64 TLS relocation type {}",
+                        rel.r_type
+                    ));
                 }
                 _ => {
                     return Err(format!("unsupported x86_64 relocation type {}", rel.r_type));
