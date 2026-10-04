@@ -18,7 +18,11 @@ pub(super) fn prepare(
     let (absolute, relative_kind, rejected): (u32, u32, &[u32]) = match arch {
         TargetArch::X86_64 => (R_X86_64_64, R_X86_64_RELATIVE, &[R_X86_64_32, R_X86_64_32S]),
         TargetArch::AArch64 => (R_AARCH64_ABS64, R_AARCH64_RELATIVE, &[R_AARCH64_ABS32]),
-        TargetArch::RiscV => return Err("RISC-V PIE relocations unsupported".into()),
+        TargetArch::RiscV => (
+            R_RISCV_64,
+            R_RISCV_RELATIVE,
+            &[R_RISCV_32, R_RISCV_HI20, R_RISCV_LO12_I, R_RISCV_LO12_S],
+        ),
     };
     let mut slots = Vec::new();
     let mut absolute_names = HashSet::default();
