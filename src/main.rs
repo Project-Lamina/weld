@@ -464,6 +464,17 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
     let mut timer = timing::PhaseTimer::new();
     let (libraries, library_positions): (Vec<_>, Vec<_>) =
         static_library_inputs(args).into_iter().unzip();
+    if let Err(error) = object::reject_lto_inputs(
+        &args
+            .input_files
+            .iter()
+            .chain(&libraries)
+            .cloned()
+            .collect::<Vec<_>>(),
+    ) {
+        eprintln!("weld: {error}");
+        return Some(1);
+    }
     let loaded = object::load_objects_with_positions(
         &args.input_files,
         &libraries,
