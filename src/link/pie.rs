@@ -56,11 +56,18 @@ pub(super) fn prepare(
                     .get(rel.r_sym as usize)
                     .ok_or("invalid PIE symbol index")?;
                 let name = get_strtab_string(strings, symbol.name_offset).unwrap_or_default();
-                if !relative
-                    && (symbol.st_shndx == SHN_ABS
-                        || absolute_names.contains(&name)
-                        || (symbol.st_shndx == SHN_UNDEF && !defined_names.contains(&name)))
-                {
+                let absolute_symbol = symbol.st_shndx == SHN_ABS
+                    || (symbol.st_shndx == SHN_UNDEF && absolute_names.contains(&name));
+                if !relative && absolute_symbol {
+                    continue;
+                }
+                if rejected.contains(&rel.r_type) {
+                    return Err(format!(
+                        "relocation type {} requires position independent input for PIE",
+                        rel.r_type
+                    ));
+                }
+                if !relative && symbol.st_shndx == SHN_UNDEF && !defined_names.contains(&name) {
                     continue;
                 }
                 match rel.r_type {
@@ -73,12 +80,6 @@ pub(super) fn prepare(
                             (contribution.offset_in_merged + rel.r_offset) as usize,
                             relative.then_some(rel.r_addend),
                         ))
-                    }
-                    kind if rejected.contains(&kind) => {
-                        return Err(format!(
-                            "relocation type {} requires position independent input for PIE",
-                            rel.r_type
-                        ));
                     }
                     _ => (),
                 }
