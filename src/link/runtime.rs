@@ -244,6 +244,11 @@ pub(super) fn prepare(
             }
         }
     }
+    for name in &dynamic.plt_symbols {
+        if !exports.contains_key(name) && (!weak.contains(name) || strong.contains(name)) {
+            return Err(format!("undefined symbol {name}"));
+        }
+    }
     let mut copies = Vec::new();
     let mut copy_symbols = Vec::new();
     for name in &dynamic.plt_symbols {

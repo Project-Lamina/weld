@@ -57,6 +57,9 @@ pub struct ParsedObject {
 /// Parse an ELF64 object's header, section headers, and section names.
 fn parse_object(data: Vec<u8>) -> Result<ParsedObject, String> {
     let (header, sections, names) = parse_elf64_slice(&data)?;
+    if header.e_type == 1 && names.iter().any(|name| name.starts_with(".gnu.lto_")) {
+        return Err("GCC LTO is not supported".into());
+    }
     Ok(ParsedObject {
         data,
         header,
@@ -91,10 +94,27 @@ pub struct LinkResult {
 /// apply relocations.
 pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let (header, sections, names) = parse_elf64_slice(data)?;
+    if header.e_type == 1 && names.iter().any(|name| name.starts_with(".gnu.lto_")) {
+        return Err("GCC LTO is not supported".into());
+    }
     let mut layout = merge_sections_single_object(data)?;
     reserve_start(&mut layout, &sections, data)?;
     move_nobits(&mut layout);
     let (resolved, by_index) = resolve_symbols(data, &layout, &sections, &names)?;
+    for (name, symbol) in &resolved {
+        if !symbol.is_defined && symbol.address.is_none() {
+            let strong = parse_symtab_view(data, &sections)?.is_some_and(|(symbols, strings)| {
+                symbols.iter().any(|s| {
+                    s.bind == STB_GLOBAL
+                        && s.st_shndx == SHN_UNDEF
+                        && get_strtab_string(strings, s.name_offset).as_ref() == Some(name)
+                })
+            });
+            if strong {
+                return Err(format!("undefined symbol {name}"));
+            }
+        }
+    }
     let arch = TargetArch::from_elf_machine(header.e_machine)
         .ok_or_else(|| format!("unsupported machine {}", header.e_machine))?;
     apply_relocations(
@@ -598,6 +618,7 @@ fn link_multi_object_parsed(
         }
     }
 
+    validate_undefined(parsed, &global_symbols, opts.gc_sections)?;
     timer.mark("GOT and NOBITS layout");
     for (obj_idx, obj) in parsed.iter().enumerate() {
         let obj_contribs = &section_contribs[obj_idx];
@@ -680,6 +701,38 @@ fn link_multi_object_parsed(
         symbol_addrs: global_symbols,
         dynamic: dynamic_info,
     })
+}
+
+fn validate_undefined(
+    parsed: &[ParsedObject],
+    globals: &HashMap<String, u64>,
+    gc_sections: bool,
+) -> Result<(), String> {
+    for obj in parsed {
+        let Some((symbols, strings)) = parse_symtab_view(&obj.data, &obj.sections)? else {
+            continue;
+        };
+        let referenced = if gc_sections {
+            Some(referenced_symbols(obj)?)
+        } else {
+            None
+        };
+        for (index, symbol) in symbols.iter().enumerate() {
+            if symbol.st_shndx != SHN_UNDEF
+                || symbol.bind != STB_GLOBAL
+                || referenced.as_ref().is_some_and(|set| !set.contains(&index))
+            {
+                continue;
+            }
+            if let Some(name) = get_strtab_string(strings, symbol.name_offset)
+                && !name.is_empty()
+                && !globals.contains_key(&name)
+            {
+                return Err(format!("undefined symbol {name}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn referenced_symbols(obj: &ParsedObject) -> Result<HashSet<usize>, String> {
