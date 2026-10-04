@@ -337,6 +337,25 @@ mod tests {
     }
 
     #[test]
+    fn pie_flags_use_last_option() {
+        for (flags, expected) in [
+            (vec![], false),
+            (vec!["-pie"], true),
+            (vec!["--pie"], true),
+            (vec!["-pie", "-no-pie"], false),
+            (vec!["--pie", "--no-pie"], false),
+            (vec!["--no-pie", "-pie"], true),
+            (vec!["-no-pie", "--pie"], true),
+        ] {
+            let argv: Vec<_> = flags.into_iter().map(String::from).collect();
+            let ParseAction::Run(parsed) = parse_args(&argv).unwrap() else {
+                panic!("expected link action");
+            };
+            assert_eq!(parsed.pie, expected, "{argv:?}");
+        }
+    }
+
+    #[test]
     fn wl_prefix_splits_into_separate_args() {
         let out = expand_argv(&["-Wl,-L,libdir".into(), "a.o".into()], 0).unwrap();
         assert_eq!(out, vec!["-L", "libdir", "a.o"]);
