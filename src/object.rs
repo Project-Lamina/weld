@@ -397,6 +397,27 @@ fn expand_data_to_objects(data: Vec<u8>) -> Option<Vec<Vec<u8>>> {
     }
 }
 
+pub fn reject_lto_inputs(paths: &[PathBuf]) -> Result<(), String> {
+    fn check(data: &[u8], name: &str) -> Result<(), String> {
+        if archive::is_archive(data) {
+            for member in archive::parse_members(data)? {
+                check(&member.data, &format!("{name}({})", member.name))?;
+            }
+        } else if is_elf(data) {
+            let (header, _, names) = parse_elf64_slice(data)?;
+            if header.e_type == 1 && names.iter().any(|name| name.starts_with(".gnu.lto_")) {
+                return Err(format!("{name}: GCC LTO is not supported"));
+            }
+        }
+        Ok(())
+    }
+    for path in paths {
+        let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        check(&data, &path.display().to_string())?;
+    }
+    Ok(())
+}
+
 pub fn load_objects(
     paths: &[PathBuf],
     libs: &[PathBuf],
