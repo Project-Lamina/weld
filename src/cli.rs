@@ -16,6 +16,7 @@ pub struct ParsedArgs {
     pub gc_sections: bool,
     pub strip_all: bool,
     pub pie: bool,
+    pub static_link: bool,
     pub map_file: Option<PathBuf>,
     pub input_files: Vec<PathBuf>,
     pub input_positions: Vec<usize>,
@@ -146,6 +147,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
     let mut i = 0;
     let mut as_needed = false;
     let mut states = Vec::new();
+    let mut group_depth = 0usize;
 
     while i < argv.len() {
         let a = &argv[i];
@@ -220,6 +222,14 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "--no-as-needed" => as_needed = false,
             "--push-state" => states.push(as_needed),
             "--pop-state" => as_needed = states.pop().ok_or("unmatched --pop-state")?,
+            "-static" | "--static" => {
+                args.static_link = true;
+                args.pie = false;
+            }
+            "--start-group" | "-(" => group_depth += 1,
+            "--end-group" | "-)" => {
+                group_depth = group_depth.checked_sub(1).ok_or("unmatched --end-group")?;
+            }
             "-pie" | "--pie" => args.pie = true,
             "-no-pie" | "--no-pie" => args.pie = false,
             "--eh-frame-hdr" | "--no-eh-frame-hdr" | "--build-id" => {}
@@ -256,7 +266,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             s if s.starts_with("-B") && s.len() > 2 => {}
             s if s.starts_with("-F") && s.len() > 2 => {}
             // Output kinds weld cannot produce yet.
-            "-shared" | "--shared" | "-dylib" | "-static" | "-r" | "--relocatable" => {
+            "-shared" | "--shared" | "-dylib" | "-r" | "--relocatable" => {
                 return Err(format!("{a} is not supported yet"));
             }
             _ => {
@@ -269,6 +279,12 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
         }
     }
 
+    if group_depth != 0 {
+        return Err("unclosed --start-group".into());
+    }
+    if args.static_link && args.pie {
+        return Err("static PIE is not supported".into());
+    }
     Ok(ParseAction::Run(Box::new(args)))
 }
 

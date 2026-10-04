@@ -91,6 +91,22 @@ impl LibraryResolver {
         None
     }
 
+    pub fn resolve_static(&self, name: &str) -> Option<ResolvedLibrary> {
+        let filename = name
+            .strip_prefix(':')
+            .map(String::from)
+            .unwrap_or_else(|| format!("lib{name}.a"));
+        self.search_paths
+            .iter()
+            .map(|dir| dir.join(&filename))
+            .find(|path| path.is_file())
+            .map(|path| ResolvedLibrary {
+                path,
+                soname: filename,
+                is_static: true,
+            })
+    }
+
     /// Follow a GNU ld text script (`GROUP ( libfoo.so.1 -lbar )`) to the
     /// shared object it names, searching the same directories.
     fn resolve_linker_script(&self, script: &Path) -> Option<ResolvedLibrary> {
