@@ -397,23 +397,17 @@ fn expand_data_to_objects(data: Vec<u8>) -> Option<Vec<Vec<u8>>> {
     }
 }
 
-pub fn reject_lto_inputs(paths: &[PathBuf]) -> Result<(), String> {
-    fn check(data: &[u8], name: &str) -> Result<(), String> {
-        if archive::is_archive(data) {
-            for member in archive::parse_members(data)? {
-                check(&member.data, &format!("{name}({})", member.name))?;
-            }
-        } else if is_elf(data) {
-            let (header, _, names) = parse_elf64_slice(data)?;
-            if header.e_type == 1 && names.iter().any(|name| name.starts_with(".gnu.lto_")) {
-                return Err(format!("{name}: GCC LTO is not supported"));
-            }
+/// Refuse GCC LTO objects: their real content lives in `.gnu.lto_*` sections that only
+/// the LTO plugin can expand, so linking them would silently drop every definition.
+pub fn reject_lto_objects(objects: &[Vec<u8>]) -> Result<(), String> {
+    for data in objects {
+        if !is_elf(data) {
+            continue;
         }
-        Ok(())
-    }
-    for path in paths {
-        let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        check(&data, &path.display().to_string())?;
+        let (header, _, names) = parse_elf64_slice(data)?;
+        if header.e_type == 1 && names.iter().any(|name| name.starts_with(".gnu.lto_")) {
+            return Err("GCC LTO is not supported".to_string());
+        }
     }
     Ok(())
 }
