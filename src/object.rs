@@ -40,12 +40,14 @@ struct ObjectSymbolSummary {
 #[derive(Clone)]
 struct ArchiveEntry {
     position: usize,
-    data: Vec<u8>,
+    start: usize,
+    len: usize,
     symbols: Option<ObjectSymbolSummary>,
     selected: bool,
 }
 
 struct ArchiveEntries {
+    buffer: Vec<u8>,
     members: Vec<ArchiveEntry>,
     index: Option<HashMap<String, Vec<usize>>>,
 }
@@ -340,25 +342,29 @@ fn apply_symbol_summary(
     }
 }
 
-fn load_archive_entries(data: &[u8], position: usize) -> Option<ArchiveEntries> {
-    let archive = archive::parse_members(data).ok()?;
+fn load_archive_entries(data: Vec<u8>, position: usize) -> Option<ArchiveEntries> {
+    let archive = archive::parse_members(&data).ok()?;
     let mut offsets = HashMap::default();
     let mut members = Vec::new();
     for member in archive.members {
-        let data = normalize_macho_container(member.data);
-        if !(is_elf(&data) || is_macho64(&data) || is_coff(&data)) {
+        let body = member.data(&data);
+        if !(is_elf(body) || is_macho64(body) || is_coff(body)) {
             continue;
         }
         offsets.insert(member.offset, members.len());
         members.push(ArchiveEntry {
             position,
-            data,
+            start: member.start,
+            len: member.len,
             symbols: None,
             selected: false,
         });
     }
     let index = archive.index.and_then(|index| {
-        if members.iter().any(|entry| !is_elf(&entry.data)) {
+        if members
+            .iter()
+            .any(|entry| !is_elf(data.get(entry.start..entry.start + entry.len).unwrap_or(&[])))
+        {
             return None;
         }
         index
@@ -374,10 +380,15 @@ fn load_archive_entries(data: &[u8], position: usize) -> Option<ArchiveEntries> 
     });
     if index.is_none() {
         for entry in &mut members {
-            entry.symbols = Some(collect_object_symbol_summary(&entry.data).unwrap_or_default());
+            let body = data.get(entry.start..entry.start + entry.len).unwrap_or(&[]);
+            entry.symbols = Some(collect_object_symbol_summary(body).unwrap_or_default());
         }
     }
-    Some(ArchiveEntries { members, index })
+    Some(ArchiveEntries {
+        buffer: data,
+        members,
+        index,
+    })
 }
 
 fn select_archive_members(
@@ -414,17 +425,36 @@ fn select_archive_members(
                 };
                 let Some(i) = next else { break };
                 cursor = i + 1;
+                if archive.members[i].symbols.is_none() {
+                    let body = {
+                        let entry = &archive.members[i];
+                        archive
+                            .buffer
+                            .get(entry.start..entry.start + entry.len)
+                            .unwrap_or(&[])
+                    };
+                    let summary = collect_object_symbol_summary(body).unwrap_or_default();
+                    archive.members[i].symbols = Some(summary);
+                }
+                let body_owned = {
+                    let entry = &archive.members[i];
+                    archive
+                        .buffer
+                        .get(entry.start..entry.start + entry.len)
+                        .unwrap_or(&[])
+                        .to_vec()
+                };
                 let entry = &mut archive.members[i];
-                let symbols = entry.symbols.get_or_insert_with(|| {
-                    collect_object_symbol_summary(&entry.data).unwrap_or_default()
-                });
+                let symbols = entry.symbols.as_ref().expect("summary just set");
                 if symbols.defined.is_disjoint(unresolved_symbols) {
                     continue;
                 }
                 entry.selected = true;
-                apply_symbol_summary(symbols, defined_symbols, unresolved_symbols);
-                objects.push(std::mem::take(&mut entry.data));
-                positions.push(entry.position);
+                let position = entry.position;
+                let symbols = entry.symbols.clone().expect("summary just set");
+                apply_symbol_summary(&symbols, defined_symbols, unresolved_symbols);
+                objects.push(normalize_macho_container(body_owned));
+                positions.push(position);
                 changed = true;
             }
         }
@@ -508,7 +538,7 @@ pub fn load_objects_with_positions(
         if is_macho_dylib(&data) {
             dylib_paths.push(path.clone());
         } else if archive::is_archive(&data) {
-            archives.push(load_archive_entries(&data, position)?);
+            archives.push(load_archive_entries(data, position)?);
         } else {
             for obj in expand_data_to_objects(data)? {
                 if need_summaries {
@@ -531,7 +561,7 @@ pub fn load_objects_with_positions(
             .copied()
             .unwrap_or(paths.len() + i + 1);
         let data = normalize_macho_container(std::fs::read(path).ok()?);
-        archives.push(load_archive_entries(&data, position)?);
+        archives.push(load_archive_entries(data, position)?);
     }
 
     select_archive_members(
@@ -773,13 +803,17 @@ mod archive_selection_tests {
                 .success()
         );
         let data = std::fs::read(&lib).unwrap();
-        let mut indexed = load_archive_entries(&data, 7).unwrap();
+        let mut indexed = load_archive_entries(data.clone(), 7).unwrap();
         assert!(indexed.index.is_some());
         assert!(indexed.members.iter().all(|entry| entry.symbols.is_none()));
-        let mut eager = load_archive_entries(&data, 7).unwrap();
+        let mut eager = load_archive_entries(data, 7).unwrap();
         eager.index = None;
-        for entry in &mut eager.members {
-            entry.symbols = Some(collect_object_symbol_summary(&entry.data).unwrap());
+        for i in 0..eager.members.len() {
+            let body = {
+                let entry = &eager.members[i];
+                eager.buffer[entry.start..entry.start + entry.len].to_vec()
+            };
+            eager.members[i].symbols = Some(collect_object_symbol_summary(&body).unwrap());
         }
         let select = |archive: &mut ArchiveEntries| {
             let mut objects = Vec::new();
@@ -820,7 +854,7 @@ mod archive_selection_tests {
                 .unwrap()
                 .success()
         );
-        let mut fallback = load_archive_entries(&std::fs::read(unindexed).unwrap(), 7).unwrap();
+        let mut fallback = load_archive_entries(std::fs::read(unindexed).unwrap(), 7).unwrap();
         assert!(fallback.index.is_none());
         assert!(fallback.members.iter().all(|entry| entry.symbols.is_some()));
         assert_eq!(objects, select(&mut fallback));

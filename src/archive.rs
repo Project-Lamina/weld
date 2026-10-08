@@ -6,8 +6,16 @@ const HEADER_LEN: usize = 60;
 pub struct Member {
     #[allow(dead_code)]
     pub name: String,
-    pub data: Vec<u8>,
+    /// Body range within the archive buffer; members are not copied out.
+    pub start: usize,
+    pub len: usize,
     pub offset: usize,
+}
+
+impl Member {
+    pub fn data<'a>(&self, archive: &'a [u8]) -> &'a [u8] {
+        archive.get(self.start..self.start + self.len).unwrap_or(&[])
+    }
 }
 
 pub struct Archive {
@@ -76,12 +84,14 @@ pub fn parse_members(data: &[u8]) -> Result<Archive, String> {
             _ => {}
         }
 
-        let (name, body) = if let Some(len) = raw_name.strip_prefix("#1/") {
+        let body_at = off - size - (size & 1);
+        let (name, body_start, body_len) = if let Some(len) = raw_name.strip_prefix("#1/") {
             let len: usize = len.parse().map_err(|_| "bad BSD archive name length")?;
             let name_bytes = payload.get(..len).ok_or("truncated BSD archive name")?;
             (
                 String::from_utf8_lossy(name_bytes).into_owned(),
-                &payload[len..],
+                body_at + len,
+                size - len,
             )
         } else if let Some(index) = raw_name.strip_prefix('/') {
             let index: usize = index.parse().map_err(|_| "bad GNU archive name index")?;
@@ -90,14 +100,19 @@ pub fn parse_members(data: &[u8]) -> Result<Archive, String> {
                 .windows(2)
                 .position(|w| w == b"/\n")
                 .unwrap_or(table.len());
-            (String::from_utf8_lossy(&table[..end]).into_owned(), payload)
+            (
+                String::from_utf8_lossy(&table[..end]).into_owned(),
+                body_at,
+                size,
+            )
         } else {
-            (raw_name.trim_end_matches('/').to_string(), payload)
+            (raw_name.trim_end_matches('/').to_string(), body_at, size)
         };
 
         members.push(Member {
             name,
-            data: body.to_vec(),
+            start: body_start,
+            len: body_len,
             offset,
         });
     }
@@ -138,8 +153,8 @@ mod tests {
         let members = archive.members;
         let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["a_very_long_member.o", "short.o"]);
-        assert_eq!(members[0].data, b"first");
-        assert_eq!(members[1].data, b"second!");
+        assert_eq!(members[0].data(&ar), b"first");
+        assert_eq!(members[1].data(&ar), b"second!");
     }
 
     #[test]
