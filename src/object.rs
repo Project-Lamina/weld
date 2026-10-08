@@ -468,7 +468,12 @@ pub fn load_objects_with_positions(
             }
         }
     }
+    // gcc passes -lgcc twice; the fixed point below makes a second copy redundant.
+    let mut seen_libs: HashSet<PathBuf> = HashSet::default();
     for (i, path) in libs.iter().enumerate() {
+        if !seen_libs.insert(path.clone()) {
+            continue;
+        }
         let position = library_positions
             .get(i)
             .copied()
