@@ -4,7 +4,7 @@ use crate::{
     macho::{is_macho_dylib, is_macho64, parse_macho64_object},
 };
 
-use crate::collections::HashSet;
+use crate::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -41,8 +41,13 @@ struct ObjectSymbolSummary {
 struct ArchiveEntry {
     position: usize,
     data: Vec<u8>,
-    symbols: ObjectSymbolSummary,
+    symbols: Option<ObjectSymbolSummary>,
     selected: bool,
+}
+
+struct ArchiveEntries {
+    members: Vec<ArchiveEntry>,
+    index: Option<HashMap<String, Vec<usize>>>,
 }
 
 fn read_u32_be(data: &[u8], off: usize) -> Option<u32> {
@@ -335,30 +340,48 @@ fn apply_symbol_summary(
     }
 }
 
-fn load_archive_entries(data: &[u8], position: usize) -> Option<Vec<ArchiveEntry>> {
-    Some(
-        archive::parse_members(data)
-            .ok()?
+fn load_archive_entries(data: &[u8], position: usize) -> Option<ArchiveEntries> {
+    let archive = archive::parse_members(data).ok()?;
+    let mut offsets = HashMap::default();
+    let mut members = Vec::new();
+    for member in archive.members {
+        let data = normalize_macho_container(member.data);
+        if !(is_elf(&data) || is_macho64(&data) || is_coff(&data)) {
+            continue;
+        }
+        offsets.insert(member.offset, members.len());
+        members.push(ArchiveEntry {
+            position,
+            data,
+            symbols: None,
+            selected: false,
+        });
+    }
+    let index = archive.index.and_then(|index| {
+        if members.iter().any(|entry| !is_elf(&entry.data)) {
+            return None;
+        }
+        index
             .into_iter()
-            .filter_map(|member| {
-                let data = normalize_macho_container(member.data);
-                if !(is_elf(&data) || is_macho64(&data) || is_coff(&data)) {
-                    return None;
-                }
-                let symbols = collect_object_symbol_summary(&data).unwrap_or_default();
-                Some(ArchiveEntry {
-                    position,
-                    data,
-                    symbols,
-                    selected: false,
-                })
+            .map(|(name, offsets_in_index)| {
+                let indices = offsets_in_index
+                    .iter()
+                    .map(|offset| offsets.get(offset).copied())
+                    .collect::<Option<Vec<_>>>()?;
+                Some((name, indices))
             })
-            .collect(),
-    )
+            .collect::<Option<HashMap<_, _>>>()
+    });
+    if index.is_none() {
+        for entry in &mut members {
+            entry.symbols = Some(collect_object_symbol_summary(&entry.data).unwrap_or_default());
+        }
+    }
+    Some(ArchiveEntries { members, index })
 }
 
 fn select_archive_members(
-    archives: &mut [Vec<ArchiveEntry>],
+    archives: &mut [ArchiveEntries],
     objects: &mut Vec<Vec<u8>>,
     positions: &mut Vec<usize>,
     defined_symbols: &mut HashSet<String>,
@@ -366,15 +389,44 @@ fn select_archive_members(
 ) {
     loop {
         let mut changed = false;
-        for entry in archives.iter_mut().flatten() {
-            if entry.selected || entry.symbols.defined.is_disjoint(unresolved_symbols) {
-                continue;
+        for archive in archives.iter_mut() {
+            let mut cursor = 0;
+            loop {
+                let next = if let Some(index) = &archive.index {
+                    unresolved_symbols
+                        .iter()
+                        .filter_map(|name| index.get(name))
+                        .flatten()
+                        .copied()
+                        .filter(|&i| i >= cursor && !archive.members[i].selected)
+                        .min()
+                } else {
+                    (cursor..archive.members.len()).find(|&i| {
+                        let entry = &archive.members[i];
+                        !entry.selected
+                            && !entry
+                                .symbols
+                                .as_ref()
+                                .unwrap()
+                                .defined
+                                .is_disjoint(unresolved_symbols)
+                    })
+                };
+                let Some(i) = next else { break };
+                cursor = i + 1;
+                let entry = &mut archive.members[i];
+                let symbols = entry.symbols.get_or_insert_with(|| {
+                    collect_object_symbol_summary(&entry.data).unwrap_or_default()
+                });
+                if symbols.defined.is_disjoint(unresolved_symbols) {
+                    continue;
+                }
+                entry.selected = true;
+                apply_symbol_summary(symbols, defined_symbols, unresolved_symbols);
+                objects.push(std::mem::take(&mut entry.data));
+                positions.push(entry.position);
+                changed = true;
             }
-            entry.selected = true;
-            apply_symbol_summary(&entry.symbols, defined_symbols, unresolved_symbols);
-            objects.push(std::mem::take(&mut entry.data));
-            positions.push(entry.position);
-            changed = true;
         }
         if !changed {
             break;
@@ -441,7 +493,7 @@ pub fn load_objects_with_positions(
 
     let mut all_objects: Vec<Vec<u8>> = Vec::new();
     let mut positions = Vec::new();
-    let mut archives: Vec<Vec<ArchiveEntry>> = Vec::new();
+    let mut archives: Vec<ArchiveEntries> = Vec::new();
     let mut dylib_paths: Vec<PathBuf> = Vec::new();
     let mut defined_symbols: HashSet<String> = HashSet::default();
     let mut unresolved_symbols: HashSet<String> = entries.iter().cloned().collect();
@@ -689,6 +741,90 @@ mod archive_selection_tests {
             .status()
             .ok()?;
         status.success().then_some(obj)
+    }
+
+    #[test]
+    fn indexed_selection_matches_eager_order_and_leaves_unused_members_unparsed() {
+        let dir = std::env::temp_dir().join(format!("weld-index-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sources = [
+            ("early", ".globl choice\nchoice:\n ret\n"),
+            ("unused", ".globl unused\nunused:\n ret\n"),
+            ("dep", ".globl dep\ndep:\n call choice\n call leaf\n ret\n"),
+            ("late", ".globl choice\nchoice:\n ret\n"),
+            ("leaf", ".globl leaf\nleaf:\n ret\n"),
+        ];
+        let Some(paths) = sources
+            .iter()
+            .map(|(name, src)| assemble(&dir, name, src))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        let lib = dir.join("libindex.a");
+        let _ = std::fs::remove_file(&lib);
+        assert!(
+            Command::new("ar")
+                .arg("rcs")
+                .arg(&lib)
+                .args(&paths)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let data = std::fs::read(&lib).unwrap();
+        let mut indexed = load_archive_entries(&data, 7).unwrap();
+        assert!(indexed.index.is_some());
+        assert!(indexed.members.iter().all(|entry| entry.symbols.is_none()));
+        let mut eager = load_archive_entries(&data, 7).unwrap();
+        eager.index = None;
+        for entry in &mut eager.members {
+            entry.symbols = Some(collect_object_symbol_summary(&entry.data).unwrap());
+        }
+        let select = |archive: &mut ArchiveEntries| {
+            let mut objects = Vec::new();
+            let mut positions = Vec::new();
+            let mut defined = HashSet::default();
+            let mut unresolved = HashSet::from_iter(["dep".to_string()]);
+            select_archive_members(
+                std::slice::from_mut(archive),
+                &mut objects,
+                &mut positions,
+                &mut defined,
+                &mut unresolved,
+            );
+            assert!(unresolved.is_empty());
+            assert_eq!(positions, [7, 7, 7]);
+            objects
+        };
+        let objects = select(&mut indexed);
+        assert_eq!(objects, select(&mut eager));
+        assert_eq!(
+            objects,
+            [2, 3, 4].map(|i| std::fs::read(&paths[i]).unwrap())
+        );
+        assert!(
+            indexed.members[..2]
+                .iter()
+                .all(|entry| entry.symbols.is_none())
+        );
+
+        let unindexed = dir.join("libunindexed.a");
+        let _ = std::fs::remove_file(&unindexed);
+        assert!(
+            Command::new("ar")
+                .arg("rcS")
+                .arg(&unindexed)
+                .args(&paths)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut fallback = load_archive_entries(&std::fs::read(unindexed).unwrap(), 7).unwrap();
+        assert!(fallback.index.is_none());
+        assert!(fallback.members.iter().all(|entry| entry.symbols.is_some()));
+        assert_eq!(objects, select(&mut fallback));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
