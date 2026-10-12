@@ -71,6 +71,70 @@ pub(super) fn reserve_start_section(layout: &mut MergedLayout) {
     });
 }
 
+pub(super) fn layout_segments(layout: &mut MergedLayout, page: u64) -> Vec<(u64, u64, u64)> {
+    let base = layout
+        .sections
+        .iter()
+        .map(|s| s.vaddr)
+        .min()
+        .unwrap_or(page);
+    let old: Vec<_> = layout
+        .sections
+        .iter()
+        .map(|s| (s.vaddr, s.data.len() as u64))
+        .collect();
+    let mut order: Vec<_> = (0..layout.sections.len()).collect();
+    order.sort_by_key(|&i| {
+        let s = &layout.sections[i];
+        (
+            segment_class(s),
+            s.sh_type == SHT_NOBITS,
+            runtime::array_order(&s.name),
+            i,
+        )
+    });
+    let mut end = base;
+    let mut previous = None;
+    for i in order {
+        let section = &mut layout.sections[i];
+        let class = segment_class(section);
+        if previous != Some(class) {
+            end = align_up(end, page);
+        }
+        section.vaddr = align_up(end, section.align);
+        if section.name == ".relro_padding" {
+            section
+                .data
+                .resize((align_up(section.vaddr, page) - section.vaddr) as usize, 0);
+        }
+        end = section.vaddr + section.data.len() as u64;
+        previous = Some(class);
+    }
+    old.into_iter()
+        .zip(&layout.sections)
+        .map(|((start, size), s)| (start, size, s.vaddr))
+        .collect()
+}
+
+pub(crate) fn segment_class(section: &MergedSection) -> u8 {
+    if section.is_relro() {
+        3
+    } else if section.flags & SHF_EXECINSTR != 0 {
+        1
+    } else if section.flags & SHF_WRITE != 0 {
+        4
+    } else if section.name.starts_with(".rodata")
+        || matches!(
+            section.name.as_str(),
+            ".eh_frame" | ".eh_frame_hdr" | ".gcc_except_table"
+        )
+    {
+        2
+    } else {
+        0
+    }
+}
+
 pub(super) fn move_nobits(layout: &mut MergedLayout) {
     let mut end = layout
         .sections
