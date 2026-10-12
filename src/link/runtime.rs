@@ -590,6 +590,21 @@ fn array_kind(name: &str) -> Option<(&'static str, u32)> {
     None
 }
 
+pub(super) fn array_order(name: &str) -> (&str, u32) {
+    if name == ".relro_padding" {
+        return ("~", 0);
+    }
+    array_kind(name).unwrap_or((name, 0))
+}
+
+impl Runtime {
+    pub(super) fn remap(&mut self, address: impl Fn(u64) -> u64) {
+        for (value, _) in self.copies.iter_mut().chain(&mut self.got) {
+            *value = address(*value);
+        }
+    }
+}
+
 pub(super) fn relro(name: &str) -> bool {
     matches!(
         name,
@@ -768,4 +783,73 @@ fn frame_entries(section: &MergedSection) -> Result<Vec<(u64, u64)>, String> {
         off = end;
     }
     Ok(entries)
+}
+
+pub(super) fn remap_generated(layout: &mut MergedLayout, remap: impl Fn(u64) -> u64) {
+    for section in &mut layout.sections {
+        match section.name.as_str() {
+            ".dynamic" => {
+                for record in section.data.chunks_exact_mut(16) {
+                    let tag = u64::from_le_bytes(record[..8].try_into().unwrap());
+                    if matches!(
+                        tag,
+                        3 | 4
+                            | 5
+                            | 6
+                            | 7
+                            | 12
+                            | 13
+                            | 23
+                            | 25
+                            | 26
+                            | 32
+                            | 0x6ffffef5
+                            | 0x6ffffff0
+                            | 0x6ffffffe
+                    ) {
+                        let value = u64::from_le_bytes(record[8..].try_into().unwrap());
+                        record[8..].copy_from_slice(&remap(value).to_le_bytes());
+                    }
+                }
+            }
+            ".rela.plt" => {
+                for record in section.data.chunks_exact_mut(24) {
+                    let value = u64::from_le_bytes(record[..8].try_into().unwrap());
+                    record[..8].copy_from_slice(&remap(value).to_le_bytes());
+                }
+            }
+            ".dynsym" => {
+                for record in section.data.chunks_exact_mut(24) {
+                    let value = u64::from_le_bytes(record[8..16].try_into().unwrap());
+                    if value != 0 {
+                        record[8..16].copy_from_slice(&remap(value).to_le_bytes());
+                    }
+                }
+            }
+            ".got.plt" => {
+                for record in section.data.chunks_exact_mut(8) {
+                    let value = u64::from_le_bytes(record.try_into().unwrap());
+                    if value != 0 {
+                        record.copy_from_slice(&remap(value).to_le_bytes());
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+    if let (Some(&plt), Some(&got)) = (
+        layout.section_by_name.get(".plt"),
+        layout.section_by_name.get(".got.plt"),
+    ) {
+        let got = layout.sections[got].vaddr;
+        let plt = &mut layout.sections[plt];
+        for (off, target) in [(2, got + 8), (8, got + 16)]
+            .into_iter()
+            .chain((0..plt.data.len() / 16 - 1).map(|i| (18 + i * 16, got + 24 + i as u64 * 8)))
+        {
+            plt.data[off..off + 4].copy_from_slice(
+                &((target as i64 - (plt.vaddr + off as u64 + 4) as i64) as i32).to_le_bytes(),
+            );
+        }
+    }
 }

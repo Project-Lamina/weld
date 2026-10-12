@@ -6,6 +6,16 @@ pub(super) struct RelativeRelocations {
     kind: u32,
 }
 
+impl RelativeRelocations {
+    pub(super) fn remap(&mut self, address: impl Fn(u64) -> u64) {
+        for (_, _, addend) in &mut self.slots {
+            if let Some(value) = addend {
+                *value = address(*value as u64) as i64;
+            }
+        }
+    }
+}
+
 pub(super) fn prepare(
     layout: &mut MergedLayout,
     objects: &[ParsedObject],

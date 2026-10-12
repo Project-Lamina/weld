@@ -29,8 +29,9 @@ pub fn align_up_usize(value: usize, align: usize) -> usize {
 pub fn build_segment_buffer(layout: &MergedLayout, default_base: u64) -> (u64, Vec<u8>) {
     let base = layout
         .sections
-        .first()
+        .iter()
         .map(|s| s.vaddr)
+        .min()
         .unwrap_or(default_base);
 
     let end = layout
