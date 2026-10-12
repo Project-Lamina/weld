@@ -24,11 +24,12 @@ pub use dynamic::DynamicLinkInfo;
 use dynamic::{
     DynamicAddrs, build_dynamic_section_content, build_dynamic_sections, build_plt_got_x86_64,
 };
+pub(crate) use merge::segment_class;
 pub use merge::{
     MergedLayout, MergedSection, ObjectSectionContrib, merge_sections_multi_object,
     merge_sections_single_object,
 };
-use merge::{align_up, is_allocatable, move_nobits, reserve_start, reserve_start_section};
+use merge::{align_up, is_allocatable, reserve_start, reserve_start_section};
 pub use resolver::LibraryResolver;
 pub use symbols::{OutputSymbol, resolve_symbols};
 use symbols::{
@@ -99,7 +100,7 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     }
     let mut layout = merge_sections_single_object(data)?;
     reserve_start(&mut layout, &sections, data)?;
-    move_nobits(&mut layout);
+    merge::layout_segments(&mut layout, 4096);
     let (resolved, by_index) = resolve_symbols(data, &layout, &sections, &names)?;
     for (name, symbol) in &resolved {
         if !symbol.is_defined && symbol.address.is_none() {
@@ -560,7 +561,7 @@ fn link_multi_object_parsed(
         }
     }
 
-    let pie_relocations = if opts.pie {
+    let mut pie_relocations = if opts.pie {
         Some(pie::prepare(
             &mut layout,
             parsed,
@@ -571,7 +572,7 @@ fn link_multi_object_parsed(
     } else {
         None
     };
-    let runtime = if let Some(dynamic) = &dynamic_info {
+    let mut runtime = if let Some(dynamic) = &dynamic_info {
         Some(runtime::prepare(
             &mut layout,
             parsed,
@@ -605,7 +606,31 @@ fn link_multi_object_parsed(
     {
         reserve_start_section(&mut layout);
     }
-    move_nobits(&mut layout);
+    let moves = merge::layout_segments(&mut layout, arch.page_align());
+    let remap = |address: u64| {
+        moves
+            .iter()
+            .find(|&&(start, size, _)| start == address && size != 0)
+            .or_else(|| {
+                moves
+                    .iter()
+                    .find(|&&(start, size, _)| address >= start && address < start + size)
+            })
+            .map_or(address, |&(start, _, new)| new + address - start)
+    };
+    for value in global_symbols
+        .values_mut()
+        .chain(got_symbol_map.values_mut())
+    {
+        *value = remap(*value);
+    }
+    if let Some(runtime) = &mut runtime {
+        runtime.remap(remap);
+    }
+    if let Some(pending) = &mut pie_relocations {
+        pending.remap(remap);
+    }
+    runtime::remap_generated(&mut layout, remap);
     for (i, obj) in parsed.iter().enumerate() {
         let Some(table) = obj.sections.iter().find(|s| s.sh_type == SHT_SYMTAB) else {
             continue;
@@ -616,9 +641,11 @@ fn link_multi_object_parsed(
             .enumerate()
         {
             let shndx = u16::from_le_bytes(record[6..8].try_into().unwrap()) as usize;
-            if obj.sections.get(shndx).is_none_or(|s| {
-                s.sh_type != SHT_NOBITS && !(runtime.is_some() && runtime::relro(&obj.names[shndx]))
-            }) {
+            if obj
+                .sections
+                .get(shndx)
+                .is_none_or(|s| s.sh_flags & SHF_ALLOC == 0)
+            {
                 continue;
             }
             let name = &obj.names[shndx];
@@ -632,7 +659,7 @@ fn link_multi_object_parsed(
             let old = resolved_by_index_per_object[i][index].replace(address);
             if symbol.bind != STB_LOCAL
                 && let Some(name) = get_strtab_string(strings, symbol.name_offset)
-                && global_symbols.get(&name).copied() == old
+                && global_symbols.get(&name).copied() == old.map(remap)
             {
                 global_symbols.insert(name, address);
             }

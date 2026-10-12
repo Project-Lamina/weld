@@ -26,7 +26,7 @@ fn elf_tools_agree_with_ld_on_defined_symbols() {
     let dir = std::env::temp_dir().join(format!("weld-elf-tools-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("input.s"), ".file \"input.s\"\n.text\n.globl _start\n.type _start,@function\n_start:\n mov $60,%eax\n xor %edi,%edi\n syscall\n.size _start,.-_start\n.local helper\n.type helper,@function\nhelper: ret\n.size helper,.-helper\n.section .rodata\nmessage: .asciz \"hello\"\n.data\n.globl value\n.type value,@object\nvalue: .quad 42\n.size value,8\n.bss\n.balign 16\n.weak buffer\n.type buffer,@object\nbuffer: .skip 4096\n.size buffer,4096\n.globl absolute\n.set absolute,123\n").unwrap();
-    fs::write(dir.join("layout.ld"), "SECTIONS { . = 0x400000; .text : { *(.text) } .rodata : { *(.rodata) } .data : { *(.data) } .bss : { *(.bss) } }").unwrap();
+    fs::write(dir.join("layout.ld"), "SECTIONS { . = 0x400000; .text : { *(.text) } . = ALIGN(4096); .rodata : { *(.rodata) } . = ALIGN(4096); .data : { *(.data) } .bss : { *(.bss) } }").unwrap();
     run("as", &["input.s", "-o", "input.o"], &dir);
     run(env!("CARGO_BIN_EXE_weld"), &["input.o", "-o", "weld"], &dir);
     run(
@@ -65,7 +65,8 @@ fn elf_tools_agree_with_ld_on_defined_symbols() {
     assert!(run("objdump", &["-d", "weld"], &dir).contains("<_start>:"));
     let data = fs::read(dir.join("weld")).unwrap();
     let number = |offset| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-    assert!(number(64 + 32) < number(64 + 40));
+    let phnum = u16::from_le_bytes(data[56..58].try_into().unwrap()) as usize;
+    assert!((0..phnum).any(|i| number(64 + i * 56 + 32) < number(64 + i * 56 + 40)));
     assert!(Command::new(dir.join("weld")).status().unwrap().success());
     fs::remove_dir_all(dir).unwrap();
 }
@@ -371,6 +372,35 @@ fn as_needed_counts_archive_members_and_retained_dso_references() {
                 .collect();
             assert_eq!(needed, expected);
         }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn load_segments_enforce_wx_for_pie_exec_and_static() {
+    let dir = std::env::temp_dir().join(format!("weld-segments-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("input.s"), ".text\n.globl _start\n_start: mov $60,%eax\n xor %edi,%edi\n syscall\n.section .rodata\n.asciz \"constant\"\n.section .data.rel.ro,\"aw\"\n.quad _start\n.data\n.quad 42\n.bss\n.skip 8192\n").unwrap();
+    run("as", &["input.s", "-o", "input.o"], &dir);
+    for flags in [vec!["-pie", "-lc"], vec!["-no-pie", "-lc"], vec!["-static"]] {
+        let mut args = flags;
+        args.extend(["input.o", "-o", "output"]);
+        run(env!("CARGO_BIN_EXE_weld"), &args, &dir);
+        let bytes = fs::read(dir.join("output")).unwrap();
+        let count = u16::from_le_bytes(bytes[56..58].try_into().unwrap()) as usize;
+        let mut loads = 0;
+        for header in bytes[64..64 + count * 56].chunks_exact(56) {
+            let kind = u32::from_le_bytes(header[..4].try_into().unwrap());
+            let rights = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            if kind == 1 {
+                loads += 1;
+                assert_ne!(rights & 3, 3);
+            }
+        }
+        assert!(loads >= 3);
+        let headers = run("readelf", &["-lW", "output"], &dir);
+        assert!(headers.contains("GNU_RELRO"));
+        assert!(Command::new(dir.join("output")).status().unwrap().success());
     }
     fs::remove_dir_all(dir).unwrap();
 }
