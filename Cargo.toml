@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 rustc-hash = "2.1.2"
+log = "0.4"
 
 [dev-dependencies]
 lamina-platform = { version = "0.1.1" }
