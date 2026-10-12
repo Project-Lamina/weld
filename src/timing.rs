@@ -10,8 +10,8 @@ impl PhaseTimer {
     pub fn mark(&mut self, phase: &str) {
         if let Some(last) = &mut self.0 {
             let now = Instant::now();
-            eprintln!(
-                "[weld] {phase}: {:.3} ms",
+            log::debug!(
+                "{phase}: {:.3} ms",
                 now.duration_since(*last).as_secs_f64() * 1000.0
             );
             *last = now;

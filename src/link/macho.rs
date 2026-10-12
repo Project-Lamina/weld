@@ -464,9 +464,12 @@ fn apply_macho_relocations(
         _ => 0,
     };
     if trace_tls {
-        eprintln!(
+        log::debug!(
             "tls-ranges={:?} tls_base={:?} tls_end={:?} tls_size=0x{:x}",
-            tls_ranges, tls_base, tls_end, tls_size
+            tls_ranges,
+            tls_base,
+            tls_end,
+            tls_size
         );
     }
     for (i, sec) in obj.sections.iter().enumerate() {
@@ -604,7 +607,7 @@ fn apply_macho_relocations(
                 } else {
                     false
                 };
-                eprintln!(
+                log::debug!(
                     "tls-reloc off=0x{:x} mod24={} type={} ext={} def={} pcrel={} sym={} base=0x{:x} addend={} sect={}",
                     off,
                     off % 24,
@@ -628,7 +631,7 @@ fn apply_macho_relocations(
                 } else {
                     "<local-sect>"
                 };
-                eprintln!(
+                log::debug!(
                     "reloc place=0x{:x} type={} extern={} sym={} base=0x{:x} base_rt=0x{:x} extra_addend={} sect={}",
                     place_runtime,
                     r.r_type,
@@ -662,9 +665,13 @@ fn apply_macho_relocations(
                         } else {
                             "<undef-sect>".to_string()
                         };
-                        eprintln!(
+                        log::debug!(
                             "  tlvp detail: sym={} sym_n_type=0x{:02x} sym_sect={} sym_value=0x{:x} sec_info={}",
-                            sym.name, sym.n_type, sym.sect, sym.value, sec_info
+                            sym.name,
+                            sym.n_type,
+                            sym.sect,
+                            sym.value,
+                            sec_info
                         );
                     }
                     if sym.name.starts_with("__MergedGlobals") {
@@ -684,9 +691,12 @@ fn apply_macho_relocations(
                         } else {
                             "<undef-sect>".to_string()
                         };
-                        eprintln!(
+                        log::debug!(
                             "  mergedglobals detail: sym_n_type=0x{:02x} sym_sect={} sym_value=0x{:x} sec_info={}",
-                            sym.n_type, sym.sect, sym.value, sec_info
+                            sym.n_type,
+                            sym.sect,
+                            sym.value,
+                            sec_info
                         );
                     }
                 }
@@ -1140,7 +1150,7 @@ pub fn link_macho_multi_object(
                 if slot_off + 8 <= got_data.len() {
                     got_data[slot_off..slot_off + 8].copy_from_slice(&runtime_addr.to_le_bytes());
                     if trace_relocs && sym.contains("thread7current2id2ID") {
-                        eprintln!(
+                        log::debug!(
                             "got prefill: sym={} layout_addr=0x{:x} runtime_addr=0x{:x} slot=0x{:x}",
                             sym,
                             addr,
@@ -1191,7 +1201,7 @@ pub fn link_macho_multi_object(
                 .iter()
                 .filter(|s| s.as_str() == "__tlv_bootstrap")
                 .count();
-            eprintln!(
+            log::debug!(
                 "weld undefined count={} tlv_bootstrap_count={}",
                 plt_symbols.len(),
                 tlv_bootstrap_count
@@ -1207,11 +1217,14 @@ pub fn link_macho_multi_object(
         direct_binds.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         direct_binds.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3);
         if std::env::var("WELD_TRACE_BINDS").ok().as_deref() == Some("1") {
-            eprintln!("weld direct_binds: {}", direct_binds.len());
+            log::debug!("direct_binds: {}", direct_binds.len());
             for (addr, sym, weak, addend) in direct_binds.iter().take(32) {
-                eprintln!(
+                log::debug!(
                     "  bind addr=0x{:x} sym={} weak={} addend={}",
-                    addr, sym, weak, addend
+                    addr,
+                    sym,
+                    weak,
+                    addend
                 );
             }
         }

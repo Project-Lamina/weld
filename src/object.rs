@@ -384,22 +384,16 @@ fn load_archive_entries(data: Vec<u8>, position: usize) -> Option<ArchiveEntries
             entry.symbols = Some(collect_object_symbol_summary(body).unwrap_or_default());
         }
     }
-    if trace_archive() {
-        eprintln!(
-            "[weld] archive members={} indexed={}",
-            members.len(),
-            index.is_some()
-        );
-    }
+    log::trace!(
+        "archive members={} indexed={}",
+        members.len(),
+        index.is_some()
+    );
     Some(ArchiveEntries {
         buffer: data,
         members,
         index,
     })
-}
-
-fn trace_archive() -> bool {
-    std::env::var("WELD_TRACE_ARCHIVE").ok().as_deref() == Some("1")
 }
 
 fn select_archive_members(
@@ -461,9 +455,7 @@ fn select_archive_members(
                     continue;
                 }
                 entry.selected = true;
-                if trace_archive() {
-                    eprintln!("[weld] archive select member {i} at position {}", entry.position);
-                }
+                log::trace!("archive select member {i} at position {}", entry.position);
                 let position = entry.position;
                 let symbols = entry.symbols.clone().expect("summary just set");
                 apply_symbol_summary(&symbols, defined_symbols, unresolved_symbols);

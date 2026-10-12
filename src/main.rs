@@ -509,7 +509,33 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
     }
 }
 
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_logging() {
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(log::LevelFilter::Warn);
+    log::set_max_level(level);
+    let _ = log::set_logger(&StderrLogger);
+}
+
 fn main() {
+    init_logging();
     let argv: Vec<String> = env::args().collect();
     let link_args: Vec<String> = argv.get(1..).unwrap_or(&[]).to_vec();
 
@@ -521,7 +547,7 @@ fn main() {
             match try_weld_link(&args) {
                 Some(0) => {
                     if args.verbose {
-                        eprintln!("[weld] linked");
+                        log::info!("linked");
                     }
                     std::process::exit(0);
                 }
