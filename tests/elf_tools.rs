@@ -404,3 +404,57 @@ fn load_segments_enforce_wx_for_pie_exec_and_static() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn subsection_mapping_preserves_relocations_and_relro() {
+    let dir = std::env::temp_dir().join(format!("weld-subsections-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("input.s"),
+        r#"
+.section .text.startup,"ax"
+.globl _start
+_start:
+    call helper
+    mov %eax,%edi
+    mov $60,%eax
+    syscall
+.section .text.helper,"ax"
+helper:
+    mov value(%rip),%eax
+    sub constant(%rip),%eax
+    ret
+.section .rodata.cst4,"aM",@progbits,4
+constant: .long 42
+.section .data.rel.local,"aw"
+value: .long 42
+.section .data.rel.ro.local,"aw"
+.quad helper
+.section .bss.buffer,"aw",@nobits
+.skip 8192
+"#,
+    )
+    .unwrap();
+    run("as", &["input.s", "-o", "input.o"], &dir);
+    run(
+        env!("CARGO_BIN_EXE_weld"),
+        &["input.o", "-o", "output"],
+        &dir,
+    );
+    let sections = run("readelf", &["-SW", "output"], &dir);
+    for name in [
+        ".text.startup",
+        ".text.helper",
+        ".rodata.cst4",
+        ".data.rel.local",
+        ".data.rel.ro.local",
+        ".bss.buffer",
+    ] {
+        assert!(!sections.contains(name), "{sections}");
+    }
+    for name in [".text ", ".rodata ", ".data ", ".data.rel.ro ", ".bss "] {
+        assert!(sections.contains(name), "{sections}");
+    }
+    assert!(Command::new(dir.join("output")).status().unwrap().success());
+    fs::remove_dir_all(dir).unwrap();
+}
