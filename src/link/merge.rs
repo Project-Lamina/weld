@@ -323,6 +323,104 @@ pub fn merge_object_file(path: &Path) -> Result<MergedLayout, String> {
 pub struct ObjectSectionContrib {
     pub offset_in_merged: u64,
     pub size: u64,
+    pub elements: Vec<(u64, u64)>,
+}
+
+impl ObjectSectionContrib {
+    fn mapped_offset(&self, offset: u64) -> u64 {
+        let index = self.elements.partition_point(|&(old, _)| old <= offset);
+        if index == 0 {
+            return self.offset_in_merged + offset;
+        }
+        let (old, new) = self.elements[index - 1];
+        new + offset - old
+    }
+}
+
+fn merge_elements(
+    data: &[u8],
+    entsize: usize,
+    strings: bool,
+) -> Result<Vec<(usize, &[u8])>, String> {
+    if entsize == 0 || !data.len().is_multiple_of(entsize) {
+        return Err("invalid SHF_MERGE entry size".into());
+    }
+    let mut result = Vec::new();
+    let mut start = 0;
+    while start < data.len() {
+        let size = if strings {
+            data[start..]
+                .chunks_exact(entsize)
+                .position(|c| c.iter().all(|&b| b == 0))
+                .map(|n| (n + 1) * entsize)
+                .ok_or("unterminated SHF_STRINGS element")?
+        } else {
+            entsize
+        };
+        result.push((start, &data[start..start + size]));
+        start += size;
+    }
+    Ok(result)
+}
+
+pub(super) fn remap_merge_offsets(
+    objects: &mut [super::ParsedObject],
+    contributions: &[HashMap<String, ObjectSectionContrib>],
+) -> Result<(), String> {
+    for (obj, contributions) in objects.iter_mut().zip(contributions) {
+        let Some(table) = obj.sections.iter().find(|s| s.sh_type == 2) else {
+            continue;
+        };
+        let symbols = crate::elf::parse_symtab(&obj.data, table)?;
+        let contribution = |section: usize| {
+            obj.names
+                .get(section)
+                .and_then(|name| contributions.get(name))
+                .filter(|c| !c.elements.is_empty())
+        };
+        for relocation_section in obj.sections.iter().filter(|s| s.sh_type == 4) {
+            let target = contribution(relocation_section.sh_info as usize);
+            for off in (relocation_section.sh_offset as usize
+                ..(relocation_section.sh_offset + relocation_section.sh_size) as usize)
+                .step_by(24)
+            {
+                let relocation = crate::elf::parse_rela_entry(&obj.data[off..off + 24], 0)?;
+                if let Some(target) = target {
+                    let mapped = target.mapped_offset(relocation.r_offset);
+                    obj.data[off..off + 8].copy_from_slice(&mapped.to_le_bytes());
+                }
+                let Some(symbol) = symbols.get(relocation.r_sym as usize) else {
+                    return Err("invalid merge relocation symbol".into());
+                };
+                if let Some(source) = contribution(symbol.st_shndx as usize) {
+                    let bias = if obj.header.e_machine == 62
+                        && matches!(relocation.r_type, 2 | 4 | 9 | 41 | 42)
+                    {
+                        4
+                    } else {
+                        0
+                    };
+                    let old = symbol
+                        .st_value
+                        .wrapping_add_signed(relocation.r_addend.wrapping_add(bias));
+                    if old <= source.size {
+                        let addend = source.mapped_offset(old) as i64
+                            - source.mapped_offset(symbol.st_value) as i64
+                            - bias;
+                        obj.data[off + 16..off + 24].copy_from_slice(&addend.to_le_bytes());
+                    }
+                }
+            }
+        }
+        for (index, symbol) in symbols.iter().enumerate() {
+            if let Some(source) = contribution(symbol.st_shndx as usize) {
+                let off = table.sh_offset as usize + index * 24 + 8;
+                obj.data[off..off + 8]
+                    .copy_from_slice(&source.mapped_offset(symbol.st_value).to_le_bytes());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Merge sections from multiple objects. Same e_machine required.
@@ -344,6 +442,7 @@ pub fn merge_sections_multi_object(
     let mut section_types = HashMap::default();
     let mut section_flags: HashMap<String, u64> = HashMap::default();
 
+    let mut elements: HashMap<(String, u64, bool, Vec<u8>), Vec<u64>> = HashMap::default();
     for obj_data in objects {
         let (header, sections, names) = parse_elf64_slice(obj_data)?;
         if header.e_machine != e_machine {
@@ -363,13 +462,56 @@ pub fn merge_sections_multi_object(
 
             let size = sh.sh_size;
             let align = sh.sh_addralign.max(1);
-            // Each contribution starts at its own alignment, not wherever the previous
-            // one happened to end. Without the pad an object promising 16-byte data can
-            // land at an odd offset and no error says so.
+            let mergeable = sh.sh_flags & 0x10 != 0
+                && sh.sh_type == SHT_PROGBITS
+                && !sections.iter().any(|r| {
+                    r.sh_type == 4
+                        && names.get(r.sh_info as usize) == Some(&input_name)
+                        && r.sh_size != 0
+                });
+            let mut element_offsets = Vec::new();
             let raw = *section_cumul.get(&name).unwrap_or(&0);
-            let offset_in_merged = align_up(raw, align);
-            let pad = offset_in_merged - raw;
-            section_cumul.insert(name.clone(), offset_in_merged + size);
+            let offset_in_merged;
+            let entry = merged_data.entry(name.clone()).or_default();
+            if mergeable {
+                offset_in_merged = 0;
+                let mut end = raw;
+                let strings = sh.sh_flags & 0x20 != 0;
+                for (old, bytes) in merge_elements(&data_slice, sh.sh_entsize as usize, strings)? {
+                    let required = if old == 0 {
+                        align
+                    } else {
+                        align.min(1u64 << old.trailing_zeros())
+                    };
+                    let key = (name.clone(), sh.sh_entsize, strings, bytes.to_vec());
+                    let candidates = elements.entry(key).or_default();
+                    let new = if let Some(&offset) = candidates
+                        .iter()
+                        .find(|&&offset| offset.is_multiple_of(required))
+                    {
+                        offset
+                    } else {
+                        let offset = align_up(end, required);
+                        if offset > end {
+                            entry.push((vec![0; (offset - end) as usize], offset - end));
+                        }
+                        entry.push((bytes.to_vec(), bytes.len() as u64));
+                        end = offset + bytes.len() as u64;
+                        candidates.push(offset);
+                        offset
+                    };
+                    element_offsets.push((old as u64, new));
+                }
+                section_cumul.insert(name.clone(), end);
+            } else {
+                offset_in_merged = align_up(raw, align);
+                let pad = offset_in_merged - raw;
+                if pad > 0 {
+                    entry.push((vec![0u8; pad as usize], pad));
+                }
+                entry.push((data_slice, size));
+                section_cumul.insert(name.clone(), offset_in_merged + size);
+            }
 
             section_aligns
                 .entry(name.clone())
@@ -381,17 +523,12 @@ pub fn merge_sections_multi_object(
                 .and_modify(|f| *f |= sh.sh_flags)
                 .or_insert(sh.sh_flags);
 
-            let entry = merged_data.entry(name.clone()).or_default();
-            if pad > 0 {
-                entry.push((vec![0u8; pad as usize], pad));
-            }
-            entry.push((data_slice, size));
-
             obj_contribs.insert(
                 input_name,
                 ObjectSectionContrib {
                     offset_in_merged,
                     size,
+                    elements: element_offsets,
                 },
             );
         }
