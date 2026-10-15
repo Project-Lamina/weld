@@ -162,6 +162,32 @@ pub(super) fn is_allocatable(flags: u64) -> bool {
     (flags & SHF_ALLOC) != 0
 }
 
+pub(super) fn output_section_name(name: &str) -> &str {
+    for base in [
+        ".data.rel.ro",
+        ".text",
+        ".rodata",
+        ".data",
+        ".bss",
+        ".sdata",
+        ".sbss",
+        ".tdata",
+        ".tbss",
+        ".gcc_except_table",
+        ".init",
+        ".fini",
+    ] {
+        if name == base
+            || name
+                .strip_prefix(base)
+                .is_some_and(|tail| tail.starts_with('.'))
+        {
+            return base;
+        }
+    }
+    name
+}
+
 pub(super) fn section_merge_order(name: &str) -> usize {
     match name {
         ".text" => 0,
@@ -330,6 +356,8 @@ pub fn merge_sections_multi_object(
         let mut obj_contribs = HashMap::default();
 
         for (name, sh) in collect_mergeable_sections(&sections, &names) {
+            let input_name = name;
+            let name = output_section_name(&input_name).to_string();
             section_types.insert(name.clone(), (sh.sh_type, sh.sh_entsize));
             let data_slice = read_section_data(obj_data, sh);
 
@@ -360,7 +388,7 @@ pub fn merge_sections_multi_object(
             entry.push((data_slice, size));
 
             obj_contribs.insert(
-                name,
+                input_name,
                 ObjectSectionContrib {
                     offset_in_merged,
                     size,
@@ -412,6 +440,14 @@ pub fn merge_sections_multi_object(
 
     for section in &mut layout.sections {
         (section.sh_type, section.entsize) = section_types[&section.name];
+        section.flags &= !0x30;
+        section.entsize = 0;
+    }
+    for contributions in &section_contribs {
+        for name in contributions.keys() {
+            let index = layout.section_by_name[output_section_name(name)];
+            layout.section_by_name.insert(name.clone(), index);
+        }
     }
     Ok((layout, section_contribs))
 }

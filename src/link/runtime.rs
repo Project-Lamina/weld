@@ -16,6 +16,7 @@ pub(super) struct Runtime {
 struct PendingRelocation {
     object: usize,
     section: usize,
+    input_name: String,
     offset: u64,
     symbol: u32,
     kind: u32,
@@ -236,6 +237,7 @@ pub(super) fn prepare(
                 relocations.push(PendingRelocation {
                     object,
                     section: target,
+                    input_name: obj.names[section.sh_info as usize].clone(),
                     offset: relocation.r_offset,
                     symbol,
                     kind,
@@ -633,7 +635,8 @@ pub(super) fn finish(
     }
     for relocation in &runtime.relocations {
         let section = &layout.sections[relocation.section];
-        let base = section.vaddr + contributions[relocation.object][&section.name].offset_in_merged;
+        let base = section.vaddr
+            + contributions[relocation.object][&relocation.input_name].offset_in_merged;
         rela(
             &mut bytes,
             base + relocation.offset,
