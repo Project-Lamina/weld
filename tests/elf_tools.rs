@@ -648,3 +648,49 @@ fn build_ids_hash_output_and_notes_survive_stripping() {
     assert!(!result.status.success() && !dir.join("bad").exists());
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn output_locals_match_ld_for_merge_labels_and_section_symbols() {
+    let dir = std::env::temp_dir().join(format!("weld-output-locals-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("input.s"),
+        r#"
+.file "input.s"
+.text
+.globl _start
+_start: mov $60,%eax
+    xor %edi,%edi
+    syscall
+.Ltext: .byte 0
+.section .rodata
+.Lro: .asciz "normal"
+.section .rodata.str1.1,"aMS",@progbits,1
+.Lmerge: .asciz "merged"
+named: .asciz "named"
+.data
+.quad .rodata
+.Ldata: .quad 0
+"#,
+    )
+    .unwrap();
+    run("as", &["-L", "input.s", "-o", "input.o"], &dir);
+    for (linker, output) in [(env!("CARGO_BIN_EXE_weld"), "output"), ("ld", "reference")] {
+        run(linker, &["input.o", "-o", output], &dir);
+    }
+    let locals = |file| {
+        let text = run("readelf", &["-sW", file], &dir);
+        let mut result: Vec<_> = text
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                (fields.len() == 8 && fields[4] == "LOCAL")
+                    .then(|| (fields[3].to_owned(), fields[7].to_owned()))
+            })
+            .collect();
+        result.sort();
+        result
+    };
+    assert_eq!(locals("output"), locals("reference"));
+    fs::remove_dir_all(dir).unwrap();
+}

@@ -49,6 +49,15 @@ pub(super) fn collect_output_symbols(
             continue;
         }
         let name = get_strtab_string(strtab, sym.name_offset).ok_or("invalid symbol name")?;
+        if sym.bind == STB_LOCAL
+            && (sym.sym_type == 3
+                || (name.starts_with(".L")
+                    && sections
+                        .get(sym.st_shndx as usize)
+                        .is_some_and(|s| s.sh_flags & 0x10 != 0)))
+        {
+            continue;
+        }
         let (shndx, value) = if sym.st_shndx == SHN_ABS {
             (SHN_ABS, sym.st_value)
         } else {
