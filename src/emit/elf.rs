@@ -98,12 +98,40 @@ fn emit(
     symbols: Option<&[OutputSymbol]>,
     out: &mut impl Write,
 ) -> Result<()> {
+    if layout.section_by_name.contains_key(".note.gnu.build-id") {
+        let mut bytes = Vec::new();
+        emit_image(layout, arch, entry, os_abi, dynamic, symbols, &mut bytes)?;
+        let (_, sections, names) = crate::elf::parse_elf64_slice(&bytes)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        let index = names
+            .iter()
+            .position(|n| n == ".note.gnu.build-id")
+            .unwrap();
+        let offset = sections[index].sh_offset as usize + 16;
+        let digest = super::build_id::sha1(&bytes);
+        bytes[offset..offset + 20].copy_from_slice(&digest);
+        out.write_all(&bytes)
+    } else {
+        emit_image(layout, arch, entry, os_abi, dynamic, symbols, out)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_image(
+    layout: &MergedLayout,
+    arch: TargetArch,
+    entry: u64,
+    os_abi: u8,
+    dynamic: Option<&DynamicLinkInfo>,
+    symbols: Option<&[OutputSymbol]>,
+    out: &mut impl Write,
+) -> Result<()> {
     let page = arch.page_align();
     let (base, mut buffer) = build_segment_buffer(layout, arch.default_load_base());
     let file_size = layout
         .sections
         .iter()
-        .filter(|s| s.sh_type != 8)
+        .filter(|s| s.sh_type != 8 && s.flags & 2 != 0)
         .map(|s| s.vaddr - base + s.data.len() as u64)
         .max()
         .unwrap_or(0);
@@ -113,7 +141,9 @@ fn emit(
         let sections: Vec<_> = layout
             .sections
             .iter()
-            .filter(|s| crate::link::segment_class(s) == class && !s.data.is_empty())
+            .filter(|s| {
+                crate::link::segment_class(s) == class && !s.data.is_empty() && s.flags & 2 != 0
+            })
             .collect();
         if sections.is_empty() {
             continue;
@@ -126,7 +156,7 @@ fn emit(
             .unwrap();
         let file_end = sections
             .iter()
-            .filter(|s| s.sh_type != 8)
+            .filter(|s| s.sh_type != 8 && s.flags & 2 != 0)
             .map(|s| s.vaddr + s.data.len() as u64)
             .max()
             .unwrap_or(start);
@@ -150,7 +180,19 @@ fn emit(
         .get(".eh_frame_hdr")
         .map(|&i| &layout.sections[i]);
     let combine_headers = groups.first().is_some_and(|g| g.3 == PF_R && g.0 == base);
+    let notes: Vec<_> = layout
+        .sections
+        .iter()
+        .filter(|s| s.sh_type == 7 && s.flags & 2 != 0 && !s.data.is_empty())
+        .collect();
+    let property = layout
+        .section_by_name
+        .get(".note.gnu.property")
+        .map(|&i| &layout.sections[i])
+        .filter(|s| !s.data.is_empty());
     let phnum = 2 - u16::from(combine_headers)
+        + notes.len() as u16
+        + u16::from(property.is_some())
         + groups.len() as u16
         + if dynamic.is_some() { 3 } else { 0 }
         + u16::from(!protected.is_empty())
@@ -287,6 +329,28 @@ fn emit(
             4,
         )?;
     }
+    for section in notes {
+        header(
+            4,
+            PF_R,
+            segment_offset + section.vaddr - base,
+            section.vaddr,
+            section.data.len() as u64,
+            section.data.len() as u64,
+            section.align,
+        )?;
+    }
+    if let Some(section) = property {
+        header(
+            0x6474e553,
+            PF_R,
+            segment_offset + section.vaddr - base,
+            section.vaddr,
+            section.data.len() as u64,
+            section.data.len() as u64,
+            8,
+        )?;
+    }
     if let Some(start) = protected.iter().map(|s| s.vaddr).min() {
         let end = align_up_u64(
             protected
@@ -379,12 +443,20 @@ impl SectionMetadata {
                 ".plt" => (1, 0, 0, 16),
                 _ => (section.sh_type, 0, 0, section.entsize),
             };
+            let (address, offset) = if section.flags & 2 != 0 {
+                (section.vaddr, segment_offset + section.vaddr - base)
+            } else {
+                let offset = align_up_u64(start + bytes.len() as u64, section.align);
+                bytes.resize((offset - start) as usize, 0);
+                bytes.extend_from_slice(&section.data);
+                (0, offset)
+            };
             headers.push(SectionHeader {
                 name_offset,
                 sh_type: kind,
                 sh_flags: section.flags,
-                sh_addr: section.vaddr,
-                sh_offset: segment_offset + section.vaddr - base,
+                sh_addr: address,
+                sh_offset: offset,
                 sh_size: section.data.len() as u64,
                 sh_link: link,
                 sh_info: info,

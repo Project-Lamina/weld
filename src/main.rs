@@ -40,6 +40,7 @@ const ELFOSABI_FREEBSD: u8 = 9;
 fn link_options(args: &ParsedArgs) -> LinkOptions {
     LinkOptions {
         pie: args.pie,
+        build_id: args.build_id,
         static_link: args.static_link,
         interpreter: args.dynamic_linker.clone(),
         search_paths: args.search_paths.clone(),

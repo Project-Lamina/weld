@@ -30,6 +30,7 @@ pub fn build_segment_buffer(layout: &MergedLayout, default_base: u64) -> (u64, V
     let base = layout
         .sections
         .iter()
+        .filter(|s| s.flags & 2 != 0)
         .map(|s| s.vaddr)
         .min()
         .unwrap_or(default_base);
@@ -37,6 +38,7 @@ pub fn build_segment_buffer(layout: &MergedLayout, default_base: u64) -> (u64, V
     let end = layout
         .sections
         .iter()
+        .filter(|s| s.flags & 2 != 0)
         .map(|s| s.vaddr + s.data.len() as u64)
         .max()
         .unwrap_or(base);
@@ -44,7 +46,7 @@ pub fn build_segment_buffer(layout: &MergedLayout, default_base: u64) -> (u64, V
     let seg_size = (end - base) as usize;
     let mut buf = vec![0u8; seg_size];
 
-    for sec in &layout.sections {
+    for sec in layout.sections.iter().filter(|s| s.flags & 2 != 0) {
         let off = (sec.vaddr - base) as usize;
         let len = sec.data.len().min(seg_size.saturating_sub(off));
         buf[off..off + len].copy_from_slice(&sec.data[..len]);

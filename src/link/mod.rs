@@ -12,6 +12,7 @@ mod dynamic;
 mod gc;
 pub mod macho;
 mod merge;
+mod notes;
 mod pie;
 pub mod resolver;
 mod riscv;
@@ -104,6 +105,7 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
 #[derive(Debug, Default, Clone)]
 pub struct LinkOptions {
     pub pie: bool,
+    pub build_id: bool,
     pub static_link: bool,
     /// `ld --dynamic-linker`.
     pub interpreter: Option<String>,
@@ -138,7 +140,13 @@ pub fn link_elf_objects(
     if objects.is_empty() {
         return Err("no objects to link".into());
     }
-    if objects.len() == 1 && libs.is_none() && !opts.gc_sections && !opts.pie && !opts.static_link {
+    if objects.len() == 1
+        && libs.is_none()
+        && !opts.gc_sections
+        && !opts.pie
+        && !opts.static_link
+        && !opts.build_id
+    {
         return link_single_object(&objects[0]);
     }
     let mut timer = crate::timing::PhaseTimer::new();
@@ -207,6 +215,7 @@ fn link_multi_object_parsed(
     let mut timer = crate::timing::PhaseTimer::new();
     let objects: Vec<&[u8]> = parsed.iter().map(|p| p.data.as_slice()).collect();
     let (mut layout, section_contribs) = merge_sections_multi_object(&objects)?;
+    notes::merge_properties(&mut layout, parsed)?;
     merge::remap_merge_offsets(parsed, &section_contribs)?;
     let e_machine = parsed[0].header.e_machine;
     let arch = TargetArch::from_elf_machine(e_machine)
@@ -551,6 +560,32 @@ fn link_multi_object_parsed(
         && (global_symbols.contains_key("main") || global_symbols.contains_key("_main"))
     {
         reserve_start_section(&mut layout);
+    }
+    if opts.build_id {
+        let mut data = Vec::new();
+        for value in [4u32, 20, 3] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(b"GNU\0");
+        data.resize(36, 0);
+        let end = layout
+            .sections
+            .iter()
+            .map(|s| s.vaddr + s.data.len() as u64)
+            .max()
+            .unwrap_or(arch.page_align());
+        layout
+            .section_by_name
+            .insert(".note.gnu.build-id".into(), layout.sections.len());
+        layout.sections.push(MergedSection {
+            name: ".note.gnu.build-id".into(),
+            data,
+            vaddr: align_up(end, 4),
+            align: 4,
+            flags: SHF_ALLOC,
+            sh_type: 7,
+            entsize: 0,
+        });
     }
     let moves = merge::layout_segments(&mut layout, arch.page_align());
     let remap = |address: u64| {
