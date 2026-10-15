@@ -546,3 +546,105 @@ exit: mov $60,%eax
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn build_ids_hash_output_and_notes_survive_stripping() {
+    let dir = std::env::temp_dir().join(format!("weld-notes-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    for (name, features) in [("first", 3), ("second", 1)] {
+        let text = if name == "first" {
+            ".text\n.globl _start\n_start: endbr64\n mov $60,%eax\n xor %edi,%edi\n syscall\n"
+        } else {
+            ""
+        };
+        fs::write(
+            dir.join(format!("{name}.s")),
+            format!(
+                r#"
+{text}
+.ident "compiler {name}"
+.section .note.gnu.property,"a",@note
+.balign 8
+.long 4,32,5
+.asciz "GNU"
+.long 0xc0000002,4,{features},0
+.long 0xc0008002,4,1,0
+.section .note.ABI-tag,"a",@note
+.balign 4
+.long 4,16,1
+.asciz "GNU"
+.long 0,3,2,0
+"#
+            ),
+        )
+        .unwrap();
+        run(
+            "as",
+            &[&format!("{name}.s"), "-o", &format!("{name}.o")],
+            &dir,
+        );
+    }
+    let args = ["--build-id", "-s", "first.o", "second.o", "-o", "output"];
+    run(env!("CARGO_BIN_EXE_weld"), &args, &dir);
+    let original = fs::read(dir.join("output")).unwrap();
+    run(env!("CARGO_BIN_EXE_weld"), &args, &dir);
+    assert_eq!(original, fs::read(dir.join("output")).unwrap());
+    let notes = run("readelf", &["-nW", "output"], &dir);
+    assert!(notes.contains("NT_GNU_ABI_TAG") && notes.contains("NT_GNU_BUILD_ID"));
+    assert!(notes.contains("x86 feature: IBT") && !notes.contains("SHSTK"));
+    let comments = run("readelf", &["-p", ".comment", "output"], &dir);
+    assert!(comments.contains("compiler first") && comments.contains("compiler second"));
+    let headers = run("readelf", &["-lW", "output"], &dir);
+    assert!(headers.contains("GNU_PROPERTY"));
+    let sections = run("readelf", &["-SW", "output"], &dir);
+    assert!(!sections.contains(".symtab"));
+    let id = notes
+        .lines()
+        .find_map(|line| line.split_once("Build ID: ").map(|(_, id)| id.trim()))
+        .unwrap();
+    assert_eq!(id.len(), 40);
+    let mut zeroed = original.clone();
+    let descriptor: Vec<_> = (0..20)
+        .map(|i| u8::from_str_radix(&id[i * 2..i * 2 + 2], 16).unwrap())
+        .collect();
+    let offset = zeroed.windows(20).position(|v| v == descriptor).unwrap();
+    zeroed[offset..offset + 20].fill(0);
+    fs::write(dir.join("zeroed"), zeroed).unwrap();
+    assert_eq!(
+        run("sha1sum", &["zeroed"], &dir)
+            .split_whitespace()
+            .next()
+            .unwrap(),
+        id
+    );
+    assert!(Command::new(dir.join("output")).status().unwrap().success());
+    fs::write(dir.join("bare.s"), ".data\n.quad 42\n").unwrap();
+    run("as", &["bare.s", "-o", "bare.o"], &dir);
+    run(
+        env!("CARGO_BIN_EXE_weld"),
+        &[
+            "--build-id=sha1",
+            "first.o",
+            "second.o",
+            "bare.o",
+            "-o",
+            "output",
+        ],
+        &dir,
+    );
+    let changed = run("readelf", &["-nW", "output"], &dir);
+    assert!(!changed.contains(id) && !changed.contains("x86 feature:"));
+    run(
+        env!("CARGO_BIN_EXE_weld"),
+        &["--build-id", "--build-id=none", "first.o", "-o", "output"],
+        &dir,
+    );
+    assert!(!run("readelf", &["-nW", "output"], &dir).contains("NT_GNU_BUILD_ID"));
+    let result = Command::new(env!("CARGO_BIN_EXE_weld"))
+        .args(["--build-id=unsupported", "first.o", "-o", "bad"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(!result.status.success() && !dir.join("bad").exists());
+    fs::remove_dir_all(dir).unwrap();
+}

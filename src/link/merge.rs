@@ -75,6 +75,7 @@ pub(super) fn layout_segments(layout: &mut MergedLayout, page: u64) -> Vec<(u64,
     let base = layout
         .sections
         .iter()
+        .filter(|s| is_allocatable(s.flags))
         .map(|s| s.vaddr)
         .min()
         .unwrap_or(page);
@@ -83,7 +84,9 @@ pub(super) fn layout_segments(layout: &mut MergedLayout, page: u64) -> Vec<(u64,
         .iter()
         .map(|s| (s.vaddr, s.data.len() as u64))
         .collect();
-    let mut order: Vec<_> = (0..layout.sections.len()).collect();
+    let mut order: Vec<_> = (0..layout.sections.len())
+        .filter(|&i| is_allocatable(layout.sections[i].flags))
+        .collect();
     order.sort_by_key(|&i| {
         let s = &layout.sections[i];
         (
@@ -205,9 +208,10 @@ pub(super) fn collect_mergeable_sections<'a>(
     let mut to_merge: Vec<(String, &SectionHeader)> = sections
         .iter()
         .enumerate()
-        .filter(|(_, sh)| {
-            (matches!(sh.sh_type, SHT_PROGBITS | SHT_NOBITS | 14..=16))
-                && is_allocatable(sh.sh_flags)
+        .filter(|(i, sh)| {
+            (matches!(sh.sh_type, SHT_PROGBITS | SHT_NOBITS | 7 | 14..=16)
+                && is_allocatable(sh.sh_flags))
+                || (sh.sh_type == SHT_PROGBITS && names.get(*i).is_some_and(|n| n == ".comment"))
         })
         .map(|(i, sh)| (names.get(i).cloned().unwrap_or_default(), sh))
         .collect();
@@ -221,7 +225,7 @@ pub(super) fn read_section_data(data: &[u8], sh: &SectionHeader) -> Vec<u8> {
         return Vec::new();
     }
     match sh.sh_type {
-        SHT_PROGBITS | 14..=16 => {
+        SHT_PROGBITS | 7 | 14..=16 => {
             let start = sh.sh_offset as usize;
             let end = start + sh.sh_size as usize;
             data.get(start..end).unwrap_or(&[]).to_vec()
