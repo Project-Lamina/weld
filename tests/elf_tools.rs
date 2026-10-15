@@ -380,7 +380,7 @@ fn as_needed_counts_archive_members_and_retained_dso_references() {
 fn load_segments_enforce_wx_for_pie_exec_and_static() {
     let dir = std::env::temp_dir().join(format!("weld-segments-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("input.s"), ".text\n.globl _start\n_start: mov $60,%eax\n xor %edi,%edi\n syscall\n.section .rodata\n.asciz \"constant\"\n.section .data.rel.ro,\"aw\"\n.quad _start\n.data\n.quad 42\n.bss\n.skip 8192\n").unwrap();
+    fs::write(dir.join("input.s"), ".text\n.globl _start\n_start: mov $60,%eax\n xor %edi,%edi\n syscall\n.section .init,\"ax\"\nret\n.section .fini,\"ax\"\nret\n.section .rodata\n.asciz \"constant\"\n.section .data.rel.ro,\"aw\"\n.quad _start\n.data\n.quad 42\n.bss\n.skip 8192\n").unwrap();
     run("as", &["input.s", "-o", "input.o"], &dir);
     for flags in [vec!["-pie", "-lc"], vec!["-no-pie", "-lc"], vec!["-static"]] {
         let mut args = flags;
@@ -400,6 +400,25 @@ fn load_segments_enforce_wx_for_pie_exec_and_static() {
         assert!(loads >= 3);
         let headers = run("readelf", &["-lW", "output"], &dir);
         assert!(headers.contains("GNU_RELRO"));
+        let sections = run("readelf", &["-SW", "output"], &dir);
+        let address = |name: &str| {
+            let row = sections
+                .lines()
+                .find(|line| line.split_whitespace().any(|field| field == name))
+                .unwrap();
+            let fields: Vec<_> = row.split_whitespace().collect();
+            let position = fields.iter().position(|&field| field == name).unwrap();
+            u64::from_str_radix(fields[position + 2], 16).unwrap()
+        };
+        assert!(address(".init") < address(".text"));
+        assert!(address(".text") < address(".fini"));
+        if sections
+            .lines()
+            .any(|line| line.split_whitespace().any(|field| field == ".plt"))
+        {
+            assert!(address(".init") < address(".plt") && address(".plt") < address(".text"));
+        }
+
         assert!(Command::new(dir.join("output")).status().unwrap().success());
     }
     fs::remove_dir_all(dir).unwrap();

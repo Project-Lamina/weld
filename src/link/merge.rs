@@ -92,6 +92,7 @@ pub(super) fn layout_segments(layout: &mut MergedLayout, page: u64) -> Vec<(u64,
         (
             segment_class(s),
             s.sh_type == SHT_NOBITS,
+            section_rank(&s.name),
             runtime::array_order(&s.name),
             i,
         )
@@ -117,6 +118,34 @@ pub(super) fn layout_segments(layout: &mut MergedLayout, page: u64) -> Vec<(u64,
         .zip(&layout.sections)
         .map(|((start, size), s)| (start, size, s.vaddr))
         .collect()
+}
+
+fn section_rank(name: &str) -> u8 {
+    match name {
+        n if n.starts_with(".note") => 0,
+        ".gnu.hash" | ".hash" => 1,
+        ".dynsym" => 2,
+        ".dynstr" => 3,
+        n if n.starts_with(".gnu.version") => 4,
+        n if n.starts_with(".rela") => 5,
+        ".init" => 0,
+        ".plt" => 1,
+        n if n.starts_with(".text") => 2,
+        ".fini" => 3,
+        n if n.starts_with(".rodata") => 0,
+        ".gcc_except_table" => 1,
+        ".eh_frame_hdr" => 2,
+        ".eh_frame" => 3,
+        n if n.starts_with(".preinit_array") => 0,
+        n if n.starts_with(".init_array") => 1,
+        n if n.starts_with(".fini_array") => 2,
+        n if n.starts_with(".data.rel.ro") => 3,
+        ".dynamic" => 4,
+        ".got" => 5,
+        ".got.plt" => 6,
+        ".relro_padding" => u8::MAX,
+        _ => 7,
+    }
 }
 
 pub(crate) fn segment_class(section: &MergedSection) -> u8 {
