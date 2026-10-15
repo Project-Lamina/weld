@@ -29,9 +29,9 @@ pub use merge::{
     MergedLayout, MergedSection, ObjectSectionContrib, merge_sections_multi_object,
     merge_sections_single_object,
 };
-use merge::{align_up, is_allocatable, reserve_start, reserve_start_section};
+use merge::{align_up, is_allocatable, reserve_start_section};
 pub use resolver::LibraryResolver;
-pub use symbols::{OutputSymbol, resolve_symbols};
+pub use symbols::OutputSymbol;
 use symbols::{
     collect_gotpcrel_symbol_names, collect_output_symbols, parse_symtab_view,
     resolve_symbols_for_object, symbol_names_by_index,
@@ -94,60 +94,8 @@ pub struct LinkResult {
 /// Fully link a single ELF64 object: merge sections, resolve symbols, and
 /// apply relocations.
 pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
-    let (header, sections, names) = parse_elf64_slice(data)?;
-    if header.e_type == 1 && names.iter().any(|name| name.starts_with(".gnu.lto_")) {
-        return Err("GCC LTO is not supported".into());
-    }
-    let mut layout = merge_sections_single_object(data)?;
-    reserve_start(&mut layout, &sections, data)?;
-    merge::layout_segments(&mut layout, 4096);
-    let (resolved, by_index) = resolve_symbols(data, &layout, &sections, &names)?;
-    for (name, symbol) in &resolved {
-        if !symbol.is_defined && symbol.address.is_none() {
-            let strong = parse_symtab_view(data, &sections)?.is_some_and(|(symbols, strings)| {
-                symbols.iter().any(|s| {
-                    s.bind == STB_GLOBAL
-                        && s.st_shndx == SHN_UNDEF
-                        && get_strtab_string(strings, s.name_offset).as_ref() == Some(name)
-                })
-            });
-            if strong {
-                return Err(format!("undefined symbol {name}"));
-            }
-        }
-    }
-    let arch = TargetArch::from_elf_machine(header.e_machine)
-        .ok_or_else(|| format!("unsupported machine {}", header.e_machine))?;
-    apply_relocations(
-        arch,
-        &mut layout,
-        &RelocInputs {
-            data,
-            sections: &sections,
-            names: &names,
-            symbol_addrs: &by_index,
-            got_entries: &[],
-            section_offset: None,
-        },
-    )?;
-    let symbol_addrs: HashMap<String, u64> = resolved
-        .into_iter()
-        .filter_map(|(name, r)| r.address.map(|a| (name, a)))
-        .collect();
-    Ok(LinkResult {
-        symbols: collect_output_symbols(
-            data,
-            &sections,
-            &names,
-            &layout,
-            |_| Some(0),
-            &symbol_addrs,
-        )?,
-        layout,
-        e_machine: header.e_machine,
-        symbol_addrs,
-        dynamic: None,
-    })
+    let object = parse_object(data.to_vec())?;
+    link_multi_object_parsed(&LinkOptions::default(), &[object], None)
 }
 
 /// Link multiple object files. Same e_machine required.
@@ -220,9 +168,6 @@ fn link_multi_object_parsed(
 ) -> Result<LinkResult, String> {
     if parsed.is_empty() {
         return Err("no objects to link".to_string());
-    }
-    if parsed.len() == 1 && libs.is_none() && !opts.gc_sections && !opts.pie && !opts.static_link {
-        return link_single_object(&parsed[0].data);
     }
 
     if opts.static_link {
