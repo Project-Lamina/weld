@@ -465,6 +465,7 @@ impl SectionMetadata {
             });
         }
         let mut strtab = vec![0];
+        let mut symbol_names = crate::collections::HashMap::default();
         let mut symtab = vec![0; 24];
         let mut first_global = 1;
         for local in [true, false] {
@@ -476,10 +477,12 @@ impl SectionMetadata {
                 let name = if symbol.name.is_empty() {
                     0
                 } else {
-                    let offset = strtab.len() as u32;
-                    strtab.extend_from_slice(symbol.name.as_bytes());
-                    strtab.push(0);
-                    offset
+                    *symbol_names.entry(symbol.name.as_str()).or_insert_with(|| {
+                        let offset = strtab.len() as u32;
+                        strtab.extend_from_slice(symbol.name.as_bytes());
+                        strtab.push(0);
+                        offset
+                    })
                 };
                 symtab.extend_from_slice(&name.to_le_bytes());
                 symtab.extend_from_slice(&[symbol.info, 0]);
