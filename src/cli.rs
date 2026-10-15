@@ -15,6 +15,7 @@ pub struct ParsedArgs {
     pub verbose: bool,
     pub gc_sections: bool,
     pub strip_all: bool,
+    pub build_id: bool,
     pub pie: bool,
     pub static_link: bool,
     pub map_file: Option<PathBuf>,
@@ -232,8 +233,11 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             }
             "-pie" | "--pie" => args.pie = true,
             "-no-pie" | "--no-pie" => args.pie = false,
-            "--eh-frame-hdr" | "--no-eh-frame-hdr" | "--build-id" => {}
-            s if s.starts_with("--hash-style=") || s.starts_with("--build-id=") => {}
+            "--eh-frame-hdr" | "--no-eh-frame-hdr" => {}
+            "--build-id" | "--build-id=sha1" => args.build_id = true,
+            "--build-id=none" => args.build_id = false,
+            s if s.starts_with("--build-id=") => return Err(format!("unsupported build ID style: {s}")),
+            s if s.starts_with("--hash-style=") => {}
             s if s.starts_with("-plugin-opt=") || s.starts_with("--plugin-opt=") => {}
             "-plugin" | "--plugin" => {
                 skip_args(argv, &mut i, 1);
