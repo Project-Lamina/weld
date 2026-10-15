@@ -95,7 +95,7 @@ pub struct LinkResult {
 /// apply relocations.
 pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let object = parse_object(data.to_vec())?;
-    link_multi_object_parsed(&LinkOptions::default(), &[object], None)
+    link_multi_object_parsed(&LinkOptions::default(), &mut [object], None)
 }
 
 /// Link multiple object files. Same e_machine required.
@@ -158,12 +158,12 @@ pub fn link_elf_objects(
             }
         }
     }
-    link_multi_object_parsed(opts, &parsed, libs)
+    link_multi_object_parsed(opts, &mut parsed, libs)
 }
 
 fn link_multi_object_parsed(
     opts: &LinkOptions,
-    parsed: &[ParsedObject],
+    parsed: &mut [ParsedObject],
     libs: Option<&[String]>,
 ) -> Result<LinkResult, String> {
     if parsed.is_empty() {
@@ -174,7 +174,7 @@ fn link_multi_object_parsed(
         if opts.pie {
             return Err("static PIE is not supported".into());
         }
-        for obj in parsed {
+        for obj in parsed.iter() {
             if obj.header.e_type != 1 {
                 return Err(
                     "static links require ELF relocatable inputs; shared objects are not supported"
@@ -207,6 +207,7 @@ fn link_multi_object_parsed(
     let mut timer = crate::timing::PhaseTimer::new();
     let objects: Vec<&[u8]> = parsed.iter().map(|p| p.data.as_slice()).collect();
     let (mut layout, section_contribs) = merge_sections_multi_object(&objects)?;
+    merge::remap_merge_offsets(parsed, &section_contribs)?;
     let e_machine = parsed[0].header.e_machine;
     let arch = TargetArch::from_elf_machine(e_machine)
         .ok_or_else(|| format!("unsupported machine {}", e_machine))?;

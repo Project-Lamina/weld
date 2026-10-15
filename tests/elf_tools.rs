@@ -458,3 +458,91 @@ value: .long 42
     assert!(Command::new(dir.join("output")).status().unwrap().success());
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn merge_elements_deduplicate_strings_constants_and_interior_references() {
+    let dir = std::env::temp_dir().join(format!("weld-merge-elements-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    for (name, prefix) in [("first", ".asciz \"unique\"\n"), ("second", "")] {
+        fs::write(
+            dir.join(format!("{name}.s")),
+            format!(
+                r#"
+.section .rodata.str1.1,"aMS",@progbits,1
+{prefix}.globl {name}_string
+{name}_string: .asciz "repeated string"
+.Lduplicate: .asciz "repeated string"
+.section .rodata.cst4,"aM",@progbits,4
+.balign 4
+.globl {name}_constant
+{name}_constant: .long 123456
+.long 123456
+.section .rodata.str2.2,"aMS",@progbits,2
+.balign 2
+.globl {name}_wide
+{name}_wide: .short 65,66,0
+.section .data.rel.ro.{name},"aw"
+.globl {name}_pointer
+{name}_pointer: .quad .Lduplicate + 3
+"#
+            ),
+        )
+        .unwrap();
+        run(
+            "as",
+            &[&format!("{name}.s"), "-o", &format!("{name}.o")],
+            &dir,
+        );
+    }
+    fs::write(
+        dir.join("start.s"),
+        r#"
+.text
+.globl _start
+_start:
+    lea first_string(%rip),%rax
+    lea second_string(%rip),%rdx
+    cmp %rax,%rdx
+    jne fail
+    add $3,%rax
+    cmp first_pointer(%rip),%rax
+    jne fail
+    cmp second_pointer(%rip),%rax
+    jne fail
+    cmpb $101,(%rax)
+    jne fail
+    lea first_constant(%rip),%rax
+    lea second_constant(%rip),%rdx
+    cmp %rax,%rdx
+    jne fail
+    cmpl $123456,(%rax)
+    jne fail
+    lea first_wide(%rip),%rax
+    lea second_wide(%rip),%rdx
+    cmp %rax,%rdx
+    jne fail
+    cmpw $66,2(%rax)
+    jne fail
+    xor %edi,%edi
+    jmp exit
+fail: mov $1,%edi
+exit: mov $60,%eax
+    syscall
+"#,
+    )
+    .unwrap();
+    run("as", &["start.s", "-o", "start.o"], &dir);
+    for flags in [vec!["-pie", "-lc"], vec!["-no-pie", "-lc"], vec!["-static"]] {
+        let mut args = flags;
+        args.extend(["start.o", "first.o", "second.o", "-o", "output"]);
+        run(env!("CARGO_BIN_EXE_weld"), &args, &dir);
+        assert!(Command::new(dir.join("output")).status().unwrap().success());
+        let sections = run("readelf", &["-SW", "output"], &dir);
+        let rodata = sections
+            .lines()
+            .find(|line| line.contains(".rodata "))
+            .unwrap();
+        assert!(rodata.contains("000022"), "{rodata}");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

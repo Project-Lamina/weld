@@ -1456,6 +1456,7 @@ fn merge_macho_sections_multi(
             section_contribs[obj_idx].insert(
                 sect_idx,
                 ObjectSectionContrib {
+                    elements: Vec::new(),
                     offset_in_merged,
                     size,
                 },
