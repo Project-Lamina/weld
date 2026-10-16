@@ -67,12 +67,7 @@ fn skip_args(argv: &[String], i: &mut usize, count: usize) {
     *i += remaining.min(count);
 }
 
-/// Parse a weld command-line argument vector into a `ParseAction`.
-///
-/// Handles the GCC/Clang linker driver flags that weld may receive when invoked
-/// via `-fuse-ld=weld`. Unknown flags starting with `-` are silently ignored;
-/// non-flag arguments are collected as input files.
-/// Expand `@file` response files and split `-Wl,a,b` into separate arguments.
+/// Parse a weld argument vector into a `ParseAction`. Expands `@file` response files and splits `-Wl,a,b`. Unknown flags are ignored; other arguments become input files.
 fn expand_argv(argv: &[String], depth: usize) -> Result<Vec<String>, String> {
     const MAX_RESPONSE_DEPTH: usize = 8;
     let mut out = Vec::with_capacity(argv.len());
@@ -208,8 +203,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "--version" => return Ok(ParseAction::Version),
             s if s.starts_with("-mmacosx-version-min") || s.starts_with("-mios") => {}
             "-nodefaultlibs" | "-nostdlib" => {}
-            // Driver flags weld has no work for: LTO plugins, linker state
-            // stack, and hints about output it already does one way.
+            // LTO plugin and linker state flags have no effect in weld.
             "--strip-all" | "-s" => args.strip_all = true,
             "--Map" | "-Map" => {
                 args.map_file = Some(PathBuf::from(take_required_arg(argv, &mut i, a)?))
@@ -269,7 +263,6 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             }
             s if s.starts_with("-B") && s.len() > 2 => {}
             s if s.starts_with("-F") && s.len() > 2 => {}
-            // Output kinds weld cannot produce yet.
             "-shared" | "--shared" | "-dylib" | "-r" | "--relocatable" => {
                 return Err(format!("{a} is not supported yet"));
             }

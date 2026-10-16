@@ -62,9 +62,7 @@ fn os_abi_for_target(target_os: Option<&str>) -> u8 {
     }
 }
 
-/// Create the output, unlinking any previous file first. Truncating in place makes the
-/// kernel write back the old inode's pages, which cost 88 ms on one relink in five, and
-/// it is also what returns ETXTBSY when relinking a binary that is still running.
+/// Create the output, unlinking any previous file first. Truncating in place returns ETXTBSY when relinking a binary that is still running.
 fn create_output(path: &Path) -> std::io::Result<std::fs::File> {
     let _ = std::fs::remove_file(path);
     std::fs::File::create(path)
@@ -126,12 +124,9 @@ fn select_entry(args: &ParsedArgs, result: &LinkResult) -> Option<u64> {
         })
 }
 
-/// True when no real `_start` is defined, so weld must provide program startup
-/// itself. This applies to both static and dynamic links: when we don't link a
-/// C runtime (crt1.o), nothing defines `_start`, and entering directly at `main`
-/// would `ret` into `argc` on the initial stack. The synthetic stub calls `main`
-/// and then issues the `exit` syscall. For dynamic links the PLT/GOT are already
-/// resolved by the interpreter (BIND_NOW) before `_start` runs.
+/// True when no real `_start` is defined, so weld must supply startup itself:
+/// entering at `main` would `ret` into `argc`. The stub calls `main` then issues
+/// `exit`. Dynamic links rely on BIND_NOW to have resolved the PLT/GOT before it runs.
 fn needs_synthetic_start(result: &LinkResult) -> bool {
     !result.symbol_addrs.contains_key("_start")
 }
@@ -173,23 +168,23 @@ fn synthesize_elf_start_x86_64(result: &mut LinkResult, freebsd_abi: bool) -> Op
     let exit_addr = result.symbol_addrs.get("exit").copied();
 
     let mut code = Vec::new();
-    code.push(0xe8); // call rel32 -> main
+    code.push(0xe8);
     let call_next = start_vaddr + 5;
     let rel = i32::try_from(main_addr as i64 - call_next as i64).ok()?;
     code.extend_from_slice(&rel.to_le_bytes());
-    code.extend_from_slice(&[0x89, 0xc7]); // movl %eax, %edi
+    code.extend_from_slice(&[0x89, 0xc7]);
     match exit_addr {
         Some(addr) => {
-            code.push(0xe8); // call rel32 -> exit@plt
+            code.push(0xe8);
             let next = start_vaddr + code.len() as u64 + 4;
             let rel = i32::try_from(addr as i64 - next as i64).ok()?;
             code.extend_from_slice(&rel.to_le_bytes());
             code.push(0xcc);
         }
         None => {
-            code.push(0xb8); // movl $SYS_exit, %eax
+            code.push(0xb8);
             code.extend_from_slice(&sys_exit.to_le_bytes());
-            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+            code.extend_from_slice(&[0x0f, 0x05]);
         }
     }
 
@@ -208,7 +203,7 @@ fn synthesize_elf_start_x86_64(result: &mut LinkResult, freebsd_abi: bool) -> Op
         name: ".text.__weld_start".to_string(),
         data: code,
         vaddr: start_vaddr,
-        flags: 2 | 4, // SHF_ALLOC | SHF_EXECINSTR
+        flags: 2 | 4,
         align: 16,
     });
 
@@ -417,9 +412,7 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
 }
 
 fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
-    // Accept both COFF object files and (legacy) ELF objects. For COFF, use the
-    // direct COFF→PE linker. For ELF (rare on Windows), fall through to the
-    // original path.
+    // COFF objects take the direct COFF to PE path; ELF objects fall through to the legacy path.
     if let Some(first) = args.input_files.first() {
         let data = std::fs::read(first).ok()?;
         let is_coff = object::is_coff_object(&data);
@@ -433,7 +426,6 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
         }
     }
 
-    // Legacy ELF-based path (kept for compatibility).
     let obj_data_list = object::load_elf_objects(
         &args.input_files,
         &static_library_paths(args),
@@ -651,7 +643,6 @@ mod tests {
         );
 
         let start = &result.layout.sections[result.layout.sections.len() - 1];
-        // call rel32 (5) + mov %eax,%edi (2) + mov $60,%eax (5) + syscall (2).
         assert_eq!(start.data.len(), 14);
         assert_eq!(start.data[0], 0xe8);
         assert_eq!(&start.data[12..14], &[0x0f, 0x05]);
@@ -664,7 +655,6 @@ mod tests {
         let entry = synthesize_elf_start_x86_64(&mut result, false).expect("start synthesized");
 
         let start = result.layout.sections.last().expect("start section");
-        // call rel32 (5) + mov %eax,%edi (2) + call rel32 (5) + int3 (1).
         assert_eq!(start.data.len(), 13);
         assert_eq!(start.data[7], 0xe8);
         let rel = i32::from_le_bytes(start.data[8..12].try_into().unwrap());
