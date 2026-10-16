@@ -142,27 +142,20 @@ impl LibraryResolver {
         }
     }
 
-    // -----------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------
-
     fn candidates(&self, lib_name: &str) -> Vec<(String, String, bool)> {
         // (filename_to_probe, soname_for_DT_NEEDED, is_static)
         match self.platform {
             TargetPlatform::Linux => {
                 let mut v: Vec<(String, String, bool)> = Vec::new();
-                // Versioned shared objects (most common first).
                 for version in [6, 5, 2, 1, 0u8] {
                     let name = format!("lib{}.so.{}", lib_name, version);
                     v.push((name.clone(), name, false));
                 }
-                // Unversioned symlink (linker stubs / sysroot).
                 v.push((
                     format!("lib{}.so", lib_name),
                     format!("lib{}.so", lib_name),
                     false,
                 ));
-                // Static fallback.
                 v.push((
                     format!("lib{}.a", lib_name),
                     format!("lib{}.a", lib_name),
@@ -212,10 +205,6 @@ impl LibraryResolver {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Platform-default search paths
-// ---------------------------------------------------------------------------
-
 fn is_elf_file(path: &Path) -> bool {
     use std::io::Read;
     let mut magic = [0u8; 4];
@@ -252,7 +241,6 @@ fn linux_search_paths(arch: TargetArch) -> Vec<PathBuf> {
         paths.push(PathBuf::from(p));
     }
 
-    // Generic paths present on all Linux systems.
     for p in ["/lib", "/usr/lib", "/usr/local/lib"] {
         paths.push(PathBuf::from(p));
     }
@@ -267,7 +255,6 @@ fn macos_search_paths() -> Vec<PathBuf> {
         PathBuf::from("/opt/homebrew/lib"),
     ];
 
-    // Include Homebrew opt sub-directories if present.
     if let Ok(entries) = std::fs::read_dir("/opt/homebrew/opt") {
         let mut opt_paths: Vec<PathBuf> = entries
             .flatten()
@@ -294,7 +281,6 @@ fn macos_search_paths() -> Vec<PathBuf> {
 fn windows_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    // Windows SDK and MSVC search paths from common environment variables.
     if let Ok(sdk_root) = std::env::var("WindowsSdkDir") {
         let sdk_lib = Path::new(&sdk_root).join("Lib");
         if sdk_lib.is_dir() {
@@ -308,7 +294,6 @@ fn windows_search_paths() -> Vec<PathBuf> {
         }
     }
 
-    // System32 is always available.
     if let Ok(sysroot) = std::env::var("SystemRoot") {
         paths.push(Path::new(&sysroot).join("System32"));
     } else {
@@ -318,10 +303,6 @@ fn windows_search_paths() -> Vec<PathBuf> {
     paths
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,7 +311,6 @@ mod tests {
     fn test_candidates_linux() {
         let r = LibraryResolver::new(TargetArch::X86_64, TargetPlatform::Linux);
         let cands = r.candidates("c");
-        // Should have versioned entries and a static fallback.
         assert!(cands.iter().any(|(f, _, s)| f == "libc.so.6" && !s));
         assert!(cands.iter().any(|(f, _, s)| f == "libc.a" && *s));
     }
@@ -364,19 +344,16 @@ mod tests {
     fn test_candidates_windows() {
         let r = LibraryResolver::new(TargetArch::X86_64, TargetPlatform::Windows);
         let cands = r.candidates("kernel32");
-        // Primary candidate: kernel32.lib (import library)
         assert!(
             cands
                 .iter()
                 .any(|(f, soname, _)| f == "kernel32.lib" && soname == "kernel32.dll"),
             "expected kernel32.lib -> kernel32.dll"
         );
-        // libkernel32.lib alternative form
         assert!(
             cands.iter().any(|(f, _, _)| f == "libkernel32.lib"),
             "expected libkernel32.lib candidate"
         );
-        // Bare DLL fallback
         assert!(
             cands.iter().any(|(f, _, _)| f == "kernel32.dll"),
             "expected kernel32.dll candidate"

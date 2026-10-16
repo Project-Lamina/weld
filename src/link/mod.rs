@@ -99,8 +99,6 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
     link_multi_object_parsed(&LinkOptions::default(), &mut [object], None)
 }
 
-/// Link multiple object files. Same e_machine required.
-/// When libs is Some and contains "c" or "System", adds PLT/GOT for undefined symbols.
 /// Link settings that come from the command line rather than the objects.
 #[derive(Debug, Default, Clone)]
 pub struct LinkOptions {
@@ -461,8 +459,6 @@ fn link_multi_object_parsed(
                 .interpreter
                 .clone()
                 .unwrap_or_else(|| "/lib64/ld-linux-x86-64.so.2".to_string());
-            // Build DT_NEEDED entries from the requested libraries, resolving
-            // each name to its real soname via LibraryResolver.
             dynamic_info = Some(DynamicLinkInfo {
                 pie: opts.pie,
                 needed: needed.clone(),
@@ -475,7 +471,6 @@ fn link_multi_object_parsed(
         }
     }
 
-    // Build .got section for R_X86_64_GOTPCREL relocations.
     // Pre-scan all objects to find referenced symbol names, assign a GOT slot per
     // unique name, then fill each slot once global_symbols is final (PLT entries
     // included). For external symbols without a definition, the slot stays 0.
@@ -647,8 +642,7 @@ fn link_multi_object_parsed(
         }
     }
 
-    // Fill .got entries with resolved addresses (local symbols + PLT stubs for
-    // external functions).
+    // Local symbols and PLT stubs for external functions get their resolved addresses here.
     if let Some(&got_idx) = layout.section_by_name.get(".got") {
         let got_base = layout.sections[got_idx].vaddr;
         for (name, &got_entry_vaddr) in &got_symbol_map {
