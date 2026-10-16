@@ -1,5 +1,4 @@
 //! RISC-V relocation application (ELF psABI).
-//!
 //! Covers the relocations produced by a standard RISC-V toolchain:
 //! absolute, PC-relative, AUIPC+JALR call pairs, and branch/JAL.
 
@@ -7,10 +6,6 @@ use crate::collections::HashMap;
 use crate::elf::reloc_type;
 use crate::elf::{SectionHeader, parse_rela_section};
 use crate::link::MergedLayout;
-
-// ---------------------------------------------------------------------------
-// Raw read/write helpers
-// ---------------------------------------------------------------------------
 
 fn read_u32_le(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
@@ -23,10 +18,6 @@ fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
 fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
     buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
 }
-
-// ---------------------------------------------------------------------------
-// Instruction-level field patching
-// ---------------------------------------------------------------------------
 
 /// Patch the 20-bit upper immediate in a U-type instruction (LUI / AUIPC).
 /// `imm20` is the value to place in bits [31:12].
@@ -68,10 +59,6 @@ fn patch_j_type(instr: u32, offset: i32) -> u32 {
     let imm10_1 = (o >> 1) & 0x3FF;
     (instr & 0x0000_0FFF) | (imm20 << 31) | (imm10_1 << 21) | (imm11 << 20) | (imm19_12 << 12)
 }
-
-// ---------------------------------------------------------------------------
-// Main relocation handler
-// ---------------------------------------------------------------------------
 
 /// Apply all RISC-V `SHT_RELA` relocations from `data` into `layout`.
 ///
@@ -125,7 +112,6 @@ pub fn apply_relocations(
                 .and_then(|o| *o)
                 .map(|v| v as i64);
 
-            // Helper: require a defined symbol
             let require_sym = |sym_addr: Option<i64>| -> Result<i64, String> {
                 sym_addr.ok_or_else(|| {
                     format!("undefined symbol index {} for RISC-V relocation", rel.r_sym)
