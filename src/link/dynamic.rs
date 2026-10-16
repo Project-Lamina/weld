@@ -23,15 +23,14 @@ pub(super) fn elf_hash(name: &[u8]) -> u32 {
 /// `sym_names[i]` is the name of dynsym entry `i + 1` (entry 0 is the reserved
 /// null symbol). The dynamic linker requires this to resolve symbols by name.
 pub(super) fn build_sysv_hash(sym_names: &[&str]) -> Vec<u8> {
-    let nchain = (sym_names.len() + 1) as u32; // +1 for STN_UNDEF at index 0
+    let nchain = (sym_names.len() + 1) as u32;
     let nbucket = nchain.max(1);
     let mut buckets = vec![0u32; nbucket as usize];
     let mut chains = vec![0u32; nchain as usize];
 
     for (i, name) in sym_names.iter().enumerate() {
-        let sym_idx = (i + 1) as u32; // real symbols start at dynsym index 1
+        let sym_idx = (i + 1) as u32;
         let b = (elf_hash(name.as_bytes()) % nbucket) as usize;
-        // Prepend into the bucket's chain.
         chains[sym_idx as usize] = buckets[b];
         buckets[b] = sym_idx;
     }
@@ -95,9 +94,9 @@ pub(super) fn build_dynamic_sections(
     let mut dynsym = vec![0u8; 24];
     for &off in &str_offsets {
         dynsym.extend_from_slice(&off.to_le_bytes());
-        dynsym.push((1 << 4) | 2); // STB_GLOBAL | STT_FUNC
+        dynsym.push((1 << 4) | 2);
         dynsym.push(0);
-        dynsym.extend_from_slice(&0u16.to_le_bytes()); // st_shndx = SHN_UNDEF
+        dynsym.extend_from_slice(&0u16.to_le_bytes());
         dynsym.extend_from_slice(&0u64.to_le_bytes());
         dynsym.extend_from_slice(&0u64.to_le_bytes());
     }
@@ -106,7 +105,7 @@ pub(super) fn build_dynamic_sections(
     for (i, _) in plt_symbols.iter().enumerate() {
         let r_offset = got_plt_vaddr + 24 + (i as u64) * 8;
         // r_sym = i + 1 because dynsym index 0 is the reserved null entry.
-        let r_info = (((i + 1) as u64) << 32) | 7u64; // r_sym, R_X86_64_JUMP_SLOT
+        let r_info = (((i + 1) as u64) << 32) | 7u64;
         rela_plt.extend_from_slice(&r_offset.to_le_bytes());
         rela_plt.extend_from_slice(&r_info.to_le_bytes());
         rela_plt.extend_from_slice(&0i64.to_le_bytes());
@@ -165,12 +164,12 @@ pub(super) fn build_dynamic_section_content(
         content.extend_from_slice(&tag.to_le_bytes());
         content.extend_from_slice(&val.to_le_bytes());
     }
-    push_dyn(&mut content, 4, hash_vaddr); // DT_HASH
+    push_dyn(&mut content, 4, hash_vaddr);
     for &off in needed_offsets {
         push_dyn(&mut content, 1, off as u64);
     }
     if let Some(off) = runpath_offset {
-        push_dyn(&mut content, 29, off as u64); // DT_RUNPATH
+        push_dyn(&mut content, 29, off as u64);
     }
     push_dyn(&mut content, 5, dynstr_vaddr);
     push_dyn(&mut content, 6, dynsym_vaddr);
@@ -183,13 +182,13 @@ pub(super) fn build_dynamic_section_content(
     // Force eager binding: loader resolves all JUMP_SLOT relocs at startup and
     // writes the final symbol address into each GOT slot. Avoids needing lazy
     // PLT trampoline state (GOT[0]=_DYNAMIC, GOT slot back-pointers).
-    push_dyn(&mut content, 24, 0); // DT_BIND_NOW
-    push_dyn(&mut content, 30, 0x8); // DT_FLAGS = DF_BIND_NOW
+    push_dyn(&mut content, 24, 0);
+    push_dyn(&mut content, 30, 0x8);
     push_dyn(
         &mut content,
         0x6ffffffb,
         0x1 | if pie { 0x08000000 } else { 0 },
-    ); // DT_FLAGS_1 = DF_1_NOW
+    );
     if pie {
         push_dyn(&mut content, 0x6ffffff9, 0);
     }
@@ -212,10 +211,10 @@ pub(super) fn build_plt_got_x86_64(
     let got_plt_vaddr = align_up(vaddr + plt_size, 8);
 
     let mut plt = Vec::new();
-    plt.extend_from_slice(&[0xff, 0x35]); // pushq rel32
+    plt.extend_from_slice(&[0xff, 0x35]);
     let disp_push = (got_plt_vaddr as i64 + 8 - (plt0_vaddr as i64 + 6)) as i32;
     plt.extend_from_slice(&disp_push.to_le_bytes());
-    plt.extend_from_slice(&[0xff, 0x25]); // jmpq *rel32
+    plt.extend_from_slice(&[0xff, 0x25]);
     let disp_jmp = (got_plt_vaddr as i64 + 16 - (plt0_vaddr as i64 + 12)) as i32;
     plt.extend_from_slice(&disp_jmp.to_le_bytes());
     // Pad PLT0 to the full 16-byte stride. PLT[i] entries are addressed at
