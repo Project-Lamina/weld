@@ -1,7 +1,6 @@
 //! Mach-O object linking for macOS.
 //!
 //! Merges sections, resolves symbols, applies relocations.
-//! Supports single-object no-libc (ret42-style) initially.
 
 use crate::collections::{HashMap, HashSet};
 use crate::{

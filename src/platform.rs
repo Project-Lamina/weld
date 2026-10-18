@@ -1,9 +1,4 @@
-//! Target platform support ordering.
-//!
-//! Priority: Linux and macOS first, Windows later.
-//! - Linux: ELF native linking (done)
-//! - macOS: Mach-O native linking (done)
-//! - Windows: PE support planned
+//! Target platform support.
 
 #![allow(dead_code)]
 
