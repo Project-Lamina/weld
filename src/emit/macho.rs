@@ -558,8 +558,7 @@ fn build_export_trie(exports: &[(String, u64)]) -> Vec<u8> {
     out
 }
 
-// Parameters mirror the dyld chained-fixups payload layout, which requires all
-// segment/import details simultaneously. Splitting further would hurt readability.
+// Parameters mirror the dyld chained-fixups payload layout, which needs all segment and import details at once.
 #[allow(clippy::too_many_arguments)]
 fn build_chained_fixups_payload(
     seg_count: u32,

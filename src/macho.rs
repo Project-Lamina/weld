@@ -1,7 +1,5 @@
-//! Minimal Mach-O 64-bit reader skeleton.
-//!
+//! Mach-O 64-bit object reader.
 //! Parses header, LC_SEGMENT_64 with sections, LC_SYMTAB for object files.
-//! Used for native Mach-O linking (Phase 6.2).
 
 #![allow(dead_code)]
 
