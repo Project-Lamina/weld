@@ -1,7 +1,5 @@
-//! Target architecture abstraction for parallel multi-arch support.
-//!
-//! Each architecture has its own relocation handling; link and emit
-//! dispatch by TargetArch. New arches (AArch64, RISC-V) can be added here.
+//! Target architecture abstraction.
+//! Each architecture has its own relocation handling. Link and emit dispatch by `TargetArch`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetArch {
@@ -11,8 +9,7 @@ pub enum TargetArch {
 }
 
 impl TargetArch {
-    /// Convert an ELF `e_machine` value to the corresponding `TargetArch`, or
-    /// `None` for unrecognised machine types.
+    /// Convert an ELF `e_machine` value to a `TargetArch`, or `None` if unrecognised.
     pub fn from_elf_machine(machine: u16) -> Option<Self> {
         match machine {
             62 => Some(Self::X86_64),
@@ -64,8 +61,7 @@ impl TargetArch {
         }
     }
 
-    /// Convert a Mach-O `cpu_type_t` to the corresponding `TargetArch`, or
-    /// `None` for unrecognised CPU types.
+    /// Convert a Mach-O `cpu_type_t` to a `TargetArch`, or `None` if unrecognised.
     pub fn from_macho_cputype(cputype: u32) -> Option<Self> {
         match cputype {
             0x01000007 => Some(Self::X86_64),

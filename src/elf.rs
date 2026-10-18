@@ -1,5 +1,4 @@
 //! Minimal ELF64 parser for relocatable object files.
-//! No external crate; manual byte parsing.
 
 #![allow(dead_code)]
 
