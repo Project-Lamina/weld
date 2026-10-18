@@ -27,7 +27,6 @@ const COFF_MACHINE_ARM: u16 = 0x01C0;
 const COFF_MACHINE_RISCV32: u16 = 0x5032;
 const COFF_MACHINE_RISCV64: u16 = 0x5064;
 
-// COFF symbol table constants
 const IMAGE_SYM_UNDEFINED: i16 = 0;
 const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
 
@@ -652,35 +651,29 @@ mod tests {
     /// inline in the 8-byte name field, and one external-undefined symbol ("_bar")
     /// stored via the string table.
     fn make_minimal_coff() -> Vec<u8> {
-        // Two 18-byte symbol records + a string table with "_bar\0".
-        // Header: 20 bytes. Symbol table starts right after header (no sections).
         let sym_table_off: u32 = 20;
         let sym_count: u32 = 2;
-        let strtab_content = b"\x0d\x00\x00\x00_bar\0"; // 4-byte size + "_bar\0"
+        let strtab_content = b"\x0d\x00\x00\x00_bar\0";
         let strtab_size = strtab_content.len();
 
         let mut data = vec![0u8; 20 + (sym_count as usize) * 18 + strtab_size];
 
-        // COFF header
         write_u16_le_at(&mut data, 0, COFF_MACHINE_AMD64);
-        write_u16_le_at(&mut data, 2, 0); // section count
+        write_u16_le_at(&mut data, 2, 0);
         write_u32_le_at(&mut data, 8, sym_table_off);
         write_u32_le_at(&mut data, 12, sym_count);
 
-        // Symbol 0: "_foo" inline, section 1 (defined), class = external
         let s0 = 20usize;
         data[s0..s0 + 4].copy_from_slice(b"_foo");
-        data[s0 + 12..s0 + 14].copy_from_slice(&1i16.to_le_bytes()); // section number
+        data[s0 + 12..s0 + 14].copy_from_slice(&1i16.to_le_bytes());
         data[s0 + 17] = IMAGE_SYM_CLASS_EXTERNAL;
 
-        // Symbol 1: "_bar" via strtab at offset 4, section 0 (undefined), class = external
         let s1 = 20 + 18;
-        data[s1..s1 + 4].copy_from_slice(&[0, 0, 0, 0]); // zeroes -> use offset
-        data[s1 + 4..s1 + 8].copy_from_slice(&4u32.to_le_bytes()); // strtab offset
-        data[s1 + 12..s1 + 14].copy_from_slice(&0i16.to_le_bytes()); // undefined
+        data[s1..s1 + 4].copy_from_slice(&[0, 0, 0, 0]);
+        data[s1 + 4..s1 + 8].copy_from_slice(&4u32.to_le_bytes());
+        data[s1 + 12..s1 + 14].copy_from_slice(&0i16.to_le_bytes());
         data[s1 + 17] = IMAGE_SYM_CLASS_EXTERNAL;
 
-        // String table
         let st_off = 20 + (sym_count as usize) * 18;
         data[st_off..st_off + strtab_size].copy_from_slice(strtab_content);
 
@@ -691,7 +684,7 @@ mod tests {
     fn coff_detection_rejects_elf_and_pe() {
         assert!(!is_coff(&ELF_MAGIC));
         assert!(!is_coff(b"MZ\x90\x00"));
-        assert!(!is_coff(b"\xcf\xfa\xed\xfe")); // Mach-O LE
+        assert!(!is_coff(b"\xcf\xfa\xed\xfe"));
     }
 
     #[test]
@@ -735,14 +728,12 @@ mod tests {
         write_u32_be(&mut data, 0, FAT_MAGIC);
         write_u32_be(&mut data, 4, 2);
 
-        // Entry 0: x86_64
         write_u32_be(&mut data, 8, CPU_TYPE_X86_64);
         write_u32_be(&mut data, 12, 3);
         write_u32_be(&mut data, 16, first_off as u32);
         write_u32_be(&mut data, 20, first_slice.len() as u32);
         write_u32_be(&mut data, 24, 0);
 
-        // Entry 1: arm64
         write_u32_be(&mut data, 28, CPU_TYPE_ARM64);
         write_u32_be(&mut data, 32, 0);
         write_u32_be(&mut data, 36, second_off as u32);
