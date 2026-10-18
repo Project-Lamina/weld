@@ -189,7 +189,6 @@ mod tests {
             let patched = encode_adrp_page_delta(insn, pages * 4096).expect("in range");
             assert_eq!(decode_pages(patched), pages, "for {pages} pages");
         }
-        // One page forward is `adrp x0, #4096`.
         assert_eq!(
             encode_adrp_page_delta(insn, 4096).expect("in range"),
             0xB000_0000

@@ -645,7 +645,6 @@ mod nobits_tests {
     #[test]
     fn nobits_contributes_its_size_so_bss_stays_mapped() {
         // Layout advances vaddr by sh_size while the segment's file size comes from
-        // data.len(). An empty vector here left .bss outside the LOAD segment.
         let bss = read_section_data(&[], &header(SHT_NOBITS, 8));
         assert_eq!(bss, vec![0u8; 8]);
     }
