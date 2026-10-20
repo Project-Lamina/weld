@@ -94,7 +94,7 @@ fn build_import_section(
         let mut sym_offs = Vec::with_capacity(e.symbols.len());
         for (_, name) in &e.symbols {
             sym_offs.push(hint_name_cursor);
-            hint_name_cursor += 2 + name.len() + 1;
+            hint_name_cursor += 2 + name.len() + 1; // hint(u16) + name + NUL
             // DWORD-align each IMAGE_IMPORT_BY_NAME
             hint_name_cursor = align_up_usize(hint_name_cursor, 2);
         }
@@ -120,9 +120,9 @@ fn build_import_section(
         let iat_rva = section_rva + iat_offsets[di] as u32;
         let name_rva = section_rva + dll_name_offsets[di] as u32;
 
-        buf[base..base + 4].copy_from_slice(&ilt_rva.to_le_bytes());
-        buf[base + 12..base + 16].copy_from_slice(&name_rva.to_le_bytes());
-        buf[base + 16..base + 20].copy_from_slice(&iat_rva.to_le_bytes());
+        buf[base..base + 4].copy_from_slice(&ilt_rva.to_le_bytes()); // OriginalFirstThunk
+        buf[base + 12..base + 16].copy_from_slice(&name_rva.to_le_bytes()); // Name
+        buf[base + 16..base + 20].copy_from_slice(&iat_rva.to_le_bytes()); // FirstThunk
     }
 
     for (di, e) in entries.iter().enumerate() {
