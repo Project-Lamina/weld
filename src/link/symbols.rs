@@ -174,10 +174,7 @@ pub(super) fn collect_gotpcrel_symbol_names(
     seen: &mut HashSet<String>,
 ) {
     const SHT_RELA: u32 = 4;
-    let sym_names = match symbol_names_by_index_raw(data, sections) {
-        Some(v) => v,
-        None => return,
-    };
+    let mut sym_names: Option<Vec<String>> = None;
     for rela_sh in sections.iter().filter(|s| s.sh_type == SHT_RELA) {
         let Ok(relas) = parse_rela_section(data, rela_sh) else {
             continue;
@@ -189,7 +186,10 @@ pub(super) fn collect_gotpcrel_symbol_names(
             ) {
                 continue;
             }
-            if let Some(name) = sym_names.get(rel.r_sym as usize)
+            let names = sym_names.get_or_insert_with(|| {
+                symbol_names_by_index_raw(data, sections).unwrap_or_default()
+            });
+            if let Some(name) = names.get(rel.r_sym as usize)
                 && !name.is_empty()
                 && seen.insert(name.clone())
             {
