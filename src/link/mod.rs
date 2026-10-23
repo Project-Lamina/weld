@@ -818,7 +818,7 @@ fn select_needed_libraries(
             needed.push(library.soname);
             continue;
         }
-        let data = std::fs::read(&library.path).map_err(|e| e.to_string())?;
+        let data = crate::elf::read_dynamic_symbol_bytes(&library.path)?;
         let (_, sections, _) = parse_elf64_slice(&data)?;
         let mut exports = HashSet::default();
         let mut library_references = HashSet::default();

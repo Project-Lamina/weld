@@ -261,6 +261,60 @@ pub fn get_section_name(_data: &[u8], shstrtab: &[u8], name_offset: u32) -> Opti
     std::str::from_utf8(slice).ok().map(String::from)
 }
 
+/// Reads only the header, section table, and dynamic symbol tables of a shared object.
+/// Every other byte of the returned buffer stays zero, so offsets match the file.
+pub fn read_dynamic_symbol_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    fn load(
+        file: &mut std::fs::File,
+        data: &mut [u8],
+        off: usize,
+        len: usize,
+    ) -> Result<(), String> {
+        let end = off
+            .checked_add(len)
+            .filter(|&end| end <= data.len())
+            .ok_or("truncated ELF file")?;
+        file.seek(SeekFrom::Start(off as u64))
+            .and_then(|_| file.read_exact(&mut data[off..end]))
+            .map_err(|e| format!("read failed: {}", e))
+    }
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("read failed: {}", e))?;
+    let size = file
+        .metadata()
+        .map_err(|e| format!("read failed: {}", e))?
+        .len() as usize;
+    let mut data = vec![0u8; size];
+    load(&mut file, &mut data, 0, size.min(64))?;
+    let header = parse_elf64_header(&data)?;
+    let shoff = header.e_shoff as usize;
+    let shnum = header.e_shnum as usize;
+    load(&mut file, &mut data, shoff, shnum * 64)?;
+    let sections = (0..shnum)
+        .map(|i| parse_section_header(&data, (shoff + i * 64) as u64))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut ranges = Vec::new();
+    if let Some(shstrtab) = sections.get(header.e_shstrndx as usize) {
+        ranges.push(shstrtab);
+    }
+    for section in sections.iter().filter(|s| s.sh_type == 11) {
+        ranges.push(section);
+        ranges.extend(sections.get(section.sh_link as usize));
+    }
+    for sh in ranges {
+        load(
+            &mut file,
+            &mut data,
+            sh.sh_offset as usize,
+            sh.sh_size as usize,
+        )?;
+    }
+    Ok(data)
+}
+
 pub fn parse_elf64_file(
     path: &Path,
 ) -> Result<(Elf64Header, Vec<SectionHeader>, Vec<String>), String> {
