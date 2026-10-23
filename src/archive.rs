@@ -1,5 +1,7 @@
 use crate::collections::HashMap;
 
+use std::io::{Read, Seek, SeekFrom};
+
 const MAGIC: &[u8; 8] = b"!<arch>\n";
 const HEADER_LEN: usize = 60;
 
@@ -21,6 +23,85 @@ impl Member {
 pub struct Archive {
     pub members: Vec<Member>,
     pub index: Option<HashMap<String, Vec<usize>>>,
+}
+
+pub struct HeaderScan {
+    pub members: Vec<Member>,
+    pub index: Option<HashMap<String, Vec<usize>>>,
+}
+
+fn read_range<R: Read + Seek>(reader: &mut R, off: u64, buf: &mut [u8]) -> Result<(), String> {
+    reader
+        .seek(SeekFrom::Start(off))
+        .and_then(|_| reader.read_exact(buf))
+        .map_err(|e| format!("read failed: {e}"))
+}
+
+/// Reads member headers and the symbol index of an archive without reading member bodies.
+/// Fails on the same malformed input that `parse_members` rejects.
+pub fn scan_headers<R: Read + Seek>(reader: &mut R, len: u64) -> Result<HeaderScan, String> {
+    let mut magic = [0u8; 8];
+    read_range(reader, 0, &mut magic)?;
+    if &magic != MAGIC {
+        return Err("not an archive".to_string());
+    }
+    let mut members = Vec::new();
+    let mut index = None;
+    let mut off = MAGIC.len() as u64;
+    let mut header = [0u8; HEADER_LEN];
+    while off < len {
+        read_range(reader, off, &mut header)?;
+        if &header[58..60] != b"`\n" {
+            return Err(format!("bad archive member header at offset {off}"));
+        }
+        let raw_name = std::str::from_utf8(&header[..16])
+            .map_err(|_| "non-UTF-8 archive member name")?
+            .trim_end_matches(' ');
+        let size: usize = std::str::from_utf8(&header[48..58])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or("bad archive member size")?;
+        let payload_at = off + HEADER_LEN as u64;
+        let end = payload_at + size as u64;
+        if end > len {
+            return Err("truncated archive member".to_string());
+        }
+        let next = end + (size as u64 & 1);
+        match raw_name {
+            "//" => {}
+            "/" => {
+                let mut payload = vec![0u8; size];
+                read_range(reader, payload_at, &mut payload)?;
+                index = parse_index(&payload);
+            }
+            _ => {
+                let (start, body_len) = if let Some(name_len) = raw_name.strip_prefix("#1/") {
+                    let name_len: usize = name_len
+                        .parse()
+                        .map_err(|_| "bad BSD archive name length")?;
+                    if name_len > size {
+                        return Err("truncated BSD archive name".to_string());
+                    }
+                    (payload_at + name_len as u64, size - name_len)
+                } else {
+                    if let Some(index) = raw_name.strip_prefix('/') {
+                        index
+                            .parse::<usize>()
+                            .map_err(|_| "bad GNU archive name index")?;
+                    }
+                    (payload_at, size)
+                };
+                members.push(Member {
+                    name: String::new(),
+                    start: start as usize,
+                    len: body_len,
+                    offset: off as usize,
+                });
+            }
+        }
+        off = next;
+    }
+    Ok(HeaderScan { members, index })
 }
 
 fn parse_index(data: &[u8]) -> Option<HashMap<String, Vec<usize>>> {
@@ -155,6 +236,23 @@ mod tests {
         assert_eq!(names, ["a_very_long_member.o", "short.o"]);
         assert_eq!(members[0].data(&ar), b"first");
         assert_eq!(members[1].data(&ar), b"second!");
+    }
+
+    #[test]
+    fn header_scan_matches_full_parse() {
+        let mut ar = MAGIC.to_vec();
+        ar.extend(member("/", b"\0\0\0\0"));
+        ar.extend(member("//", b"a_very_long_member.o/\n"));
+        ar.extend(member("/0", b"first"));
+        ar.extend(member("#1/4", b"abcdbody"));
+        ar.extend(member("short.o/", b"second!"));
+        let full = parse_members(&ar).unwrap();
+        let scan = scan_headers(&mut std::io::Cursor::new(&ar), ar.len() as u64).unwrap();
+        let spans = |members: &[Member]| -> Vec<(usize, usize, usize)> {
+            members.iter().map(|m| (m.offset, m.start, m.len)).collect()
+        };
+        assert_eq!(spans(&scan.members), spans(&full.members));
+        assert_eq!(scan.index.is_some(), full.index.is_some());
     }
 
     #[test]
