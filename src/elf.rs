@@ -263,63 +263,52 @@ pub fn get_section_name(_data: &[u8], shstrtab: &[u8], name_offset: u32) -> Opti
     std::str::from_utf8(slice).ok().map(String::from)
 }
 
-/// Reads only the header, section table, and dynamic symbol, version and string tables
-/// of a shared object. Every other byte of the returned buffer stays zero, so offsets
-/// match the file.
-pub fn read_dynamic_symbol_bytes(path: &Path) -> Result<Vec<u8>, String> {
+/// Reads the dynamic symbol, version and string tables of a shared object into a
+/// compact buffer. The returned section headers point into that buffer; sections
+/// that were not read keep their file offsets and must not be used.
+pub fn read_dynamic_tables(path: &Path) -> Result<(Vec<u8>, Vec<SectionHeader>), String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    fn load(
-        file: &mut std::fs::File,
-        data: &mut [u8],
-        off: usize,
-        len: usize,
-    ) -> Result<(), String> {
-        let end = off
-            .checked_add(len)
-            .filter(|&end| end <= data.len())
-            .ok_or("truncated ELF file")?;
-        file.seek(SeekFrom::Start(off as u64))
-            .and_then(|_| file.read_exact(&mut data[off..end]))
+    const DYNAMIC_TABLE_TYPES: [u32; 3] = [11, SHT_GNU_VERDEF, SHT_GNU_VERSYM];
+
+    let read_at = |file: &mut std::fs::File, off: u64, buf: &mut [u8]| -> Result<(), String> {
+        file.seek(SeekFrom::Start(off))
+            .and_then(|_| file.read_exact(buf))
             .map_err(|e| format!("read failed: {}", e))
-    }
+    };
 
     let mut file = std::fs::File::open(path).map_err(|e| format!("read failed: {}", e))?;
-    let size = file
-        .metadata()
-        .map_err(|e| format!("read failed: {}", e))?
-        .len() as usize;
-    let mut data = vec![0u8; size];
-    load(&mut file, &mut data, 0, size.min(64))?;
-    let header = parse_elf64_header(&data)?;
-    let shoff = header.e_shoff as usize;
+    let mut header_bytes = [0u8; 64];
+    read_at(&mut file, 0, &mut header_bytes)?;
+    let header = parse_elf64_header(&header_bytes)?;
     let shnum = header.e_shnum as usize;
-    load(&mut file, &mut data, shoff, shnum * 64)?;
-    let sections = (0..shnum)
-        .map(|i| parse_section_header(&data, (shoff + i * 64) as u64))
+    let mut table = vec![0u8; shnum * 64];
+    read_at(&mut file, header.e_shoff, &mut table)?;
+    let mut sections = (0..shnum)
+        .map(|i| parse_section_header(&table, (i * 64) as u64))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut ranges = Vec::new();
-    if let Some(shstrtab) = sections.get(header.e_shstrndx as usize) {
-        ranges.push(shstrtab);
+    let mut wanted: Vec<usize> = Vec::new();
+    for (i, section) in sections.iter().enumerate() {
+        if DYNAMIC_TABLE_TYPES.contains(&section.sh_type) {
+            wanted.push(i);
+            if (section.sh_link as usize) < shnum {
+                wanted.push(section.sh_link as usize);
+            }
+        }
     }
-    let dynamic_tables = [11, SHT_GNU_VERDEF, SHT_GNU_VERSYM];
-    for section in sections
-        .iter()
-        .filter(|s| dynamic_tables.contains(&s.sh_type))
-    {
-        ranges.push(section);
-        ranges.extend(sections.get(section.sh_link as usize));
+    wanted.sort_unstable();
+    wanted.dedup();
+
+    let mut data = Vec::new();
+    for i in wanted {
+        let section = &mut sections[i];
+        let start = data.len();
+        data.resize(start + section.sh_size as usize, 0);
+        read_at(&mut file, section.sh_offset, &mut data[start..])?;
+        section.sh_offset = start as u64;
     }
-    for sh in ranges {
-        load(
-            &mut file,
-            &mut data,
-            sh.sh_offset as usize,
-            sh.sh_size as usize,
-        )?;
-    }
-    Ok(data)
+    Ok((data, sections))
 }
 
 pub fn parse_elf64_file(

@@ -91,8 +91,7 @@ fn exports(
         if !needed.contains(&lib.soname) || !seen.insert(lib.soname.clone()) {
             continue;
         }
-        let data = crate::elf::read_dynamic_symbol_bytes(&lib.path)?;
-        let (_, sections, _) = parse_elf64_slice(&data)?;
+        let (data, sections) = crate::elf::read_dynamic_tables(&lib.path)?;
         let mut versions = HashMap::default();
         for section in sections.iter().filter(|s| s.sh_type == 0x6ffffffd) {
             let bytes = get_strtab_from_section(&data, section);
