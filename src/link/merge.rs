@@ -291,7 +291,7 @@ pub(super) fn append_merged_section(
 ) {
     let total_size: u64 = contribs.iter().map(|(_, size)| *size).sum();
 
-    let mut merged_bytes = Vec::new();
+    let mut merged_bytes = Vec::with_capacity(contribs.iter().map(|(data, _)| data.len()).sum());
     for (data, _) in contribs {
         merged_bytes.extend_from_slice(data);
     }
