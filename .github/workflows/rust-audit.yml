@@ -1,0 +1,21 @@
+name: rust-audit
+
+on:
+  schedule:
+    - cron: '20 22 * * 3'
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: "cargo audit"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Generate lockfile
+        run: cargo generate-lockfile
+      - name: Audit dependencies
+        run: cargo audit
