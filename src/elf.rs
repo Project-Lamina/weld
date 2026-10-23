@@ -25,6 +25,8 @@ pub enum SectionType {
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
+const SHT_GNU_VERDEF: u32 = 0x6ffffffd;
+const SHT_GNU_VERSYM: u32 = 0x6fffffff;
 const ELF64_SYM_SIZE: usize = 24;
 const ELF64_RELA_SIZE: usize = 24;
 
@@ -261,8 +263,9 @@ pub fn get_section_name(_data: &[u8], shstrtab: &[u8], name_offset: u32) -> Opti
     std::str::from_utf8(slice).ok().map(String::from)
 }
 
-/// Reads only the header, section table, and dynamic symbol tables of a shared object.
-/// Every other byte of the returned buffer stays zero, so offsets match the file.
+/// Reads only the header, section table, and dynamic symbol, version and string tables
+/// of a shared object. Every other byte of the returned buffer stays zero, so offsets
+/// match the file.
 pub fn read_dynamic_symbol_bytes(path: &Path) -> Result<Vec<u8>, String> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -300,7 +303,11 @@ pub fn read_dynamic_symbol_bytes(path: &Path) -> Result<Vec<u8>, String> {
     if let Some(shstrtab) = sections.get(header.e_shstrndx as usize) {
         ranges.push(shstrtab);
     }
-    for section in sections.iter().filter(|s| s.sh_type == 11) {
+    let dynamic_tables = [11, SHT_GNU_VERDEF, SHT_GNU_VERSYM];
+    for section in sections
+        .iter()
+        .filter(|s| dynamic_tables.contains(&s.sh_type))
+    {
         ranges.push(section);
         ranges.extend(sections.get(section.sh_link as usize));
     }
