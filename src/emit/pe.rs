@@ -152,10 +152,9 @@ fn build_import_section(
 
     let idt_rva = 0u32;
     let iat_rva = iat_base_off as u32;
-    let idt_size_u32 = (num_dlls * 20) as u32;
     let iat_size_u32 = iat_total_size as u32;
 
-    (buf, idt_rva, iat_rva, idt_size_u32, iat_size_u32)
+    (buf, idt_rva, iat_rva, idt_size as u32, iat_size_u32)
 }
 
 struct PeSection {
@@ -359,7 +358,7 @@ pub fn emit_pe_executable(
     write_u32_at(&mut opt, &mut o, 0);
     // Index 1: Import table
     write_u32_at(&mut opt, &mut o, import_dir_rva);
-    write_u32_at(&mut opt, &mut o, idt_size_bytes + 20);
+    write_u32_at(&mut opt, &mut o, idt_size_bytes);
     // Index 2–11: unused
     for _ in 2..12 {
         write_u32_at(&mut opt, &mut o, 0);
