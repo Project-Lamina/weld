@@ -445,7 +445,7 @@ const IMAGE_REL_AMD64_REL32: u16 = 4;
 const IMAGE_SYM_UNDEFINED_SECTION: i16 = 0;
 const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
 
-/// Windows kernel32.dll API functions. Everything else goes to ucrt.dll.
+/// Windows kernel32.dll API functions. Everything else goes to msvcrt.dll.
 fn is_kernel32_symbol(name: &str) -> bool {
     matches!(
         name,
@@ -502,7 +502,7 @@ fn coff_symbol_name(name_bytes: &[u8; 8], strtab: &[u8]) -> String {
 /// Link a single COFF object file and emit a PE32+ executable directly.
 ///
 /// Handles `IMAGE_REL_AMD64_REL32` relocations for external symbols by inserting
-/// 6-byte JMP thunks. CRT functions (printf, etc.) are imported from `ucrt.dll`;
+/// 6-byte JMP thunks. CRT functions (printf, etc.) are imported from `msvcrt.dll`;
 /// Windows API functions are imported from `KERNEL32.DLL`.
 pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<()> {
     let n_sections = coff_read_u16(coff, 2).unwrap_or(0) as usize;
@@ -653,9 +653,7 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
         .map(|n| n.as_str())
         .collect();
 
-    // msvcrt.dll is the system CRT DLL present on all Windows versions.
-    // ucrtbase.dll does NOT export plain `printf`/`fflush` by name (they are
-    // compiler-intrinsic wrappers in the MSVC CRT headers).
+    // msvcrt.dll exports plain `printf`; ucrtbase.dll does not.
     let crt_dll_name = "msvcrt.dll";
     let entries = if ucrt_syms.is_empty() {
         vec![ImportEntry {
