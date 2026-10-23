@@ -840,6 +840,15 @@ fn emit_pe_raw(
     let entry_rva = (entry_va - IMAGE_BASE) as u32;
     let text_rva = sec_rvas[0];
     write_u16(&mut opt, 0, IMAGE_OPTIONAL_HDR64_MAGIC);
+    let raw_sum = |flag: u32| -> u32 {
+        sections
+            .iter()
+            .filter(|sec| sec.characteristics & flag != 0)
+            .map(|sec| sec.raw_size())
+            .sum()
+    };
+    write_u32_at_off(&mut opt, 4, raw_sum(IMAGE_SCN_CNT_CODE));
+    write_u32_at_off(&mut opt, 8, raw_sum(IMAGE_SCN_CNT_INITIALIZED_DATA));
     write_u32_at_off(&mut opt, 16, entry_rva);
     write_u32_at_off(&mut opt, 20, text_rva);
     write_u64_at_off(&mut opt, 24, IMAGE_BASE);
