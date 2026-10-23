@@ -441,9 +441,63 @@ pub fn emit_pe_executable(
     Ok(())
 }
 
-const IMAGE_REL_AMD64_REL32: u16 = 4;
+const IMAGE_REL_AMD64_ABSOLUTE: u16 = 0x0000;
+const IMAGE_REL_AMD64_ADDR32NB: u16 = 0x0003;
+const IMAGE_REL_AMD64_REL32: u16 = 0x0004;
+const IMAGE_REL_AMD64_REL32_5: u16 = 0x0009;
 const IMAGE_SYM_UNDEFINED_SECTION: i16 = 0;
+const IMAGE_SYM_ABSOLUTE_SECTION: i16 = -1;
 const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
+const IMAGE_SCN_LNK_INFO: u32 = 0x0000_0200;
+const IMAGE_SCN_LNK_REMOVE: u32 = 0x0000_0800;
+const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
+const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
+const SIZEOF_COFF_SYMBOL: usize = 18;
+const SIZEOF_COFF_SECTION_HEADER: usize = 40;
+const SIZEOF_COFF_RELOC: usize = 10;
+const CRT_MAIN_SYMBOL: &str = "__main";
+const COFF_RET: u8 = 0xC3;
+
+#[derive(Clone)]
+struct CoffSymbol {
+    name: String,
+    section: i16,
+    value: u32,
+    class: u8,
+}
+
+#[derive(Clone, Copy)]
+enum CoffRegion {
+    Text = 0,
+    ReadOnly = 1,
+    Writable = 2,
+}
+
+struct CoffSection<'a> {
+    name: String,
+    region: CoffRegion,
+    align: usize,
+    size: usize,
+    raw: &'a [u8],
+    relocs: Vec<(u32, u32, u16)>,
+    offset: usize,
+}
+
+fn coff_error(message: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+fn coff_section_align(flags: u32) -> usize {
+    match (flags >> 20) & 0xF {
+        0 => 1,
+        n => 1 << (n - 1),
+    }
+}
+
+fn rel32(target: u64, end: u64) -> Result<i32> {
+    i32::try_from(target as i64 - end as i64)
+        .map_err(|_| coff_error("branch target out of 32-bit range".to_string()))
+}
 
 /// Windows kernel32.dll API functions. Everything else goes to msvcrt.dll.
 fn is_kernel32_symbol(name: &str) -> bool {
@@ -475,10 +529,6 @@ fn coff_read_u16(data: &[u8], off: usize) -> Option<u16> {
     let b = data.get(off..off + 2)?;
     Some(u16::from_le_bytes([b[0], b[1]]))
 }
-fn coff_read_i16(data: &[u8], off: usize) -> Option<i16> {
-    let b = data.get(off..off + 2)?;
-    Some(i16::from_le_bytes([b[0], b[1]]))
-}
 fn coff_read_u32(data: &[u8], off: usize) -> Option<u32> {
     let b = data.get(off..off + 4)?;
     Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -501,141 +551,151 @@ fn coff_symbol_name(name_bytes: &[u8; 8], strtab: &[u8]) -> String {
 
 /// Link a single COFF object file and emit a PE32+ executable directly.
 ///
-/// Handles `IMAGE_REL_AMD64_REL32` relocations for external symbols by inserting
-/// 6-byte JMP thunks. CRT functions (printf, etc.) are imported from `msvcrt.dll`;
-/// Windows API functions are imported from `KERNEL32.DLL`.
+/// Code sections go to `.text`, read-only data to `.rdata`, writable and
+/// uninitialized data to `.data`. Undefined externals get `jmp [iat]` thunks.
+/// `__main` resolves to a `ret`.
 pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<()> {
-    let n_sections = coff_read_u16(coff, 2).unwrap_or(0) as usize;
-    let sym_table_off = coff_read_u32(coff, 8).unwrap_or(0) as usize;
-    let n_syms = coff_read_u32(coff, 12).unwrap_or(0) as usize;
+    let truncated = || coff_error("truncated COFF object".to_string());
+    let n_sections = coff_read_u16(coff, 2).ok_or_else(truncated)? as usize;
+    let opt_size = coff_read_u16(coff, 16).ok_or_else(truncated)? as usize;
+    let sym_table_off = coff_read_u32(coff, 8).ok_or_else(truncated)? as usize;
+    let n_syms = coff_read_u32(coff, 12).ok_or_else(truncated)? as usize;
 
-    // String table immediately follows the symbol table.
-    let strtab_off = sym_table_off + n_syms * 18;
-    let strtab_size = if strtab_off + 4 <= coff.len() {
-        coff_read_u32(coff, strtab_off).unwrap_or(4) as usize
-    } else {
-        4
-    };
-    let strtab_end = (strtab_off + strtab_size).min(coff.len());
-    let strtab = &coff[strtab_off.min(coff.len())..strtab_end];
+    let strtab_off = sym_table_off + n_syms * SIZEOF_COFF_SYMBOL;
+    let strtab_size = coff_read_u32(coff, strtab_off).unwrap_or(4) as usize;
+    let strtab = &coff[strtab_off.min(coff.len())..(strtab_off + strtab_size).min(coff.len())];
 
-    let mut sym_names: Vec<String> = Vec::with_capacity(n_syms);
-    {
-        let mut i = 0;
-        while i < n_syms {
-            let rec = sym_table_off + i * 18;
-            if rec + 18 > coff.len() {
-                break;
-            }
-            let name_bytes: &[u8; 8] = coff[rec..rec + 8].try_into().unwrap_or(&[0u8; 8]);
-            sym_names.push(coff_symbol_name(name_bytes, strtab));
-            let num_aux = coff[rec + 17] as usize;
-            i += 1 + num_aux;
-            // Push placeholder names for aux records so indices stay aligned
-            for _ in 0..num_aux {
-                sym_names.push(String::new());
-            }
-        }
-    }
-
-    let undefined_syms: Vec<String> = {
-        let mut seen = HashSet::default();
-        let mut out_v = Vec::new();
-        for (i, name) in sym_names.iter().enumerate() {
-            if name.is_empty() {
-                continue;
-            }
-            let rec = sym_table_off + i * 18;
-            if rec + 18 > coff.len() {
-                continue;
-            }
-            let section_num = coff_read_i16(coff, rec + 12).unwrap_or(0);
-            let storage_class = coff[rec + 16];
-            if section_num == IMAGE_SYM_UNDEFINED_SECTION
-                && storage_class == IMAGE_SYM_CLASS_EXTERNAL
-                && seen.insert(name.clone())
-            {
-                out_v.push(name.clone());
-            }
-        }
-        out_v
-    };
-
-    let sym_to_thunk: HashMap<String, usize> = undefined_syms
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.clone(), i))
-        .collect();
-
-    let mut text_data: Vec<u8> = Vec::new();
-    let mut text_relocs: Vec<(u32, u32, u16)> = Vec::new();
-
-    for s in 0..n_sections {
-        let sh_off = 20 + s * 40;
-        if sh_off + 40 > coff.len() {
+    // Indexed by raw table index; auxiliary records get empty names.
+    let mut syms: Vec<CoffSymbol> = Vec::with_capacity(n_syms);
+    let mut i = 0;
+    while i < n_syms {
+        let rec = sym_table_off + i * SIZEOF_COFF_SYMBOL;
+        let Some(r) = coff.get(rec..rec + SIZEOF_COFF_SYMBOL) else {
             break;
+        };
+        let name_bytes: &[u8; 8] = r[..8].try_into().unwrap_or(&[0u8; 8]);
+        let num_aux = r[17] as usize;
+        syms.push(CoffSymbol {
+            name: coff_symbol_name(name_bytes, strtab),
+            section: i16::from_le_bytes([r[12], r[13]]),
+            value: u32::from_le_bytes([r[8], r[9], r[10], r[11]]),
+            class: r[16],
+        });
+        for _ in 0..num_aux {
+            syms.push(CoffSymbol {
+                name: String::new(),
+                section: IMAGE_SYM_UNDEFINED_SECTION,
+                value: 0,
+                class: 0,
+            });
         }
-        let raw_off = coff_read_u32(coff, sh_off + 20).unwrap_or(0) as usize;
-        let raw_size = coff_read_u32(coff, sh_off + 16).unwrap_or(0) as usize;
-        let reloc_off = coff_read_u32(coff, sh_off + 24).unwrap_or(0) as usize;
-        let n_relocs = coff_read_u16(coff, sh_off + 32).unwrap_or(0) as usize;
-        let flags = coff_read_u32(coff, sh_off + 36).unwrap_or(0);
-
-        let is_code = (flags & 0x20) != 0;
-        if is_code && raw_size > 0 && raw_off + raw_size <= coff.len() {
-            text_data = coff[raw_off..raw_off + raw_size].to_vec();
-            for r in 0..n_relocs {
-                let r_off = reloc_off + r * 10;
-                if r_off + 10 > coff.len() {
-                    break;
-                }
-                let vaddr = coff_read_u32(coff, r_off).unwrap_or(0);
-                let sym_idx = coff_read_u32(coff, r_off + 4).unwrap_or(0);
-                let rel_type = coff_read_u16(coff, r_off + 8).unwrap_or(0);
-                text_relocs.push((vaddr, sym_idx, rel_type));
-            }
-            break; // Only first code section
-        }
+        i += 1 + num_aux;
     }
 
-    let main_offset: u32 = {
-        let mut found = 0u32;
-        for (i, name) in sym_names.iter().enumerate() {
-            if name == "main" || name == "_main" {
-                let rec = sym_table_off + i * 18;
-                if rec + 18 <= coff.len() {
-                    found = coff_read_u32(coff, rec + 8).unwrap_or(0);
-                }
-                break;
-            }
+    let mut sections: Vec<CoffSection> = Vec::new();
+    let mut slot_of_number: HashMap<usize, usize> = HashMap::default();
+    for s in 0..n_sections {
+        let sh = 20 + opt_size + s * SIZEOF_COFF_SECTION_HEADER;
+        let flags = coff_read_u32(coff, sh + 36).ok_or_else(truncated)?;
+        if flags & (IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE | IMAGE_SCN_MEM_DISCARDABLE) != 0 {
+            continue;
         }
-        found
+        let raw_size = coff_read_u32(coff, sh + 16).ok_or_else(truncated)? as usize;
+        let raw_ptr = coff_read_u32(coff, sh + 20).ok_or_else(truncated)? as usize;
+        let relocs_ptr = coff_read_u32(coff, sh + 24).ok_or_else(truncated)? as usize;
+        let n_relocs = coff_read_u16(coff, sh + 32).ok_or_else(truncated)? as usize;
+        let name = String::from_utf8_lossy(&coff[sh..sh + 8])
+            .trim_end_matches('\0')
+            .to_string();
+
+        let uninitialized = flags & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0;
+        let region = if flags & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 {
+            CoffRegion::Text
+        } else if uninitialized || flags & IMAGE_SCN_MEM_WRITE != 0 {
+            CoffRegion::Writable
+        } else {
+            CoffRegion::ReadOnly
+        };
+        let raw: &[u8] = if uninitialized {
+            &[]
+        } else {
+            coff.get(raw_ptr..raw_ptr + raw_size)
+                .ok_or_else(|| coff_error(format!("section {name} data lies outside the object")))?
+        };
+
+        let mut relocs = Vec::with_capacity(n_relocs);
+        for r in 0..n_relocs {
+            let o = relocs_ptr + r * SIZEOF_COFF_RELOC;
+            let rec = coff.get(o..o + SIZEOF_COFF_RELOC).ok_or_else(|| {
+                coff_error(format!(
+                    "relocations of section {name} lie outside the object"
+                ))
+            })?;
+            relocs.push((
+                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]),
+                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]),
+                u16::from_le_bytes([rec[8], rec[9]]),
+            ));
+        }
+
+        slot_of_number.insert(s + 1, sections.len());
+        sections.push(CoffSection {
+            name,
+            region,
+            align: coff_section_align(flags),
+            size: raw_size,
+            raw,
+            relocs,
+            offset: 0,
+        });
+    }
+
+    let mut region_len = [0usize; 3];
+    for sec in &mut sections {
+        let r = sec.region as usize;
+        region_len[r] = align_up_usize(region_len[r], sec.align);
+        sec.offset = region_len[r];
+        region_len[r] += sec.size;
+    }
+
+    let is_undefined_external = |s: &CoffSymbol| {
+        s.section == IMAGE_SYM_UNDEFINED_SECTION
+            && s.class == IMAGE_SYM_CLASS_EXTERNAL
+            && !s.name.is_empty()
     };
+    let needs_main_stub = syms
+        .iter()
+        .any(|s| is_undefined_external(s) && s.name == CRT_MAIN_SYMBOL);
+    let undefined: Vec<&str> = {
+        let mut seen: HashSet<&str> = HashSet::default();
+        syms.iter()
+            .filter(|s| is_undefined_external(s) && s.name != CRT_MAIN_SYMBOL)
+            .filter(|s| seen.insert(s.name.as_str()))
+            .map(|s| s.name.as_str())
+            .collect()
+    };
+    let thunk_index: HashMap<&str, usize> =
+        undefined.iter().enumerate().map(|(i, n)| (*n, i)).collect();
 
-    let n_thunks = undefined_syms.len();
-    let thunks_offset = text_data.len();
+    let thunks_off = region_len[CoffRegion::Text as usize];
+    let stub_off = thunks_off + undefined.len() * 6;
+    let text_size = stub_off + usize::from(needs_main_stub);
 
-    // header_size rounds up to FILE_ALIGN (512).
-    let num_sections_pe: u16 = 2;
+    let has_data = region_len[CoffRegion::Writable as usize] > 0;
+    let n_out_sections = if has_data { 3 } else { 2 };
     let headers_raw: usize = SIZEOF_DOS_STUB
         + SIZEOF_PE_SIGNATURE
         + SIZEOF_COFF_HEADER
         + SIZEOF_OPTIONAL_HEADER as usize
-        + (num_sections_pe as usize) * SIZEOF_SECTION_HEADER;
-    let size_of_headers_pe = align_up(headers_raw as u64, FILE_ALIGN) as u32;
-    let text_rva = align_up(size_of_headers_pe as u64, SECTION_ALIGN) as u32;
-    let text_va = IMAGE_BASE + text_rva as u64;
+        + n_out_sections * SIZEOF_SECTION_HEADER;
+    let size_of_headers = align_up(headers_raw as u64, FILE_ALIGN) as u32;
+    let text_rva = align_up(size_of_headers as u64, SECTION_ALIGN) as u32;
+    let rdata_rva = text_rva + align_up(text_size as u64, SECTION_ALIGN) as u32;
 
-    let total_text_bytes = thunks_offset + n_thunks * 6;
-    let rdata_rva = align_up(
-        text_rva as u64 + align_up(total_text_bytes as u64, SECTION_ALIGN),
-        SECTION_ALIGN,
-    ) as u32;
-
-    let kernel32_syms: Vec<&str> = undefined_syms
+    let kernel32_syms: Vec<&str> = undefined
         .iter()
+        .copied()
         .filter(|n| is_kernel32_symbol(n))
-        .map(|n| n.as_str())
         .collect();
     let has_exit_process = kernel32_syms.contains(&"ExitProcess");
     let mut k32_syms: Vec<&str> = if has_exit_process {
@@ -647,10 +707,10 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
     };
     k32_syms.dedup();
 
-    let ucrt_syms: Vec<&str> = undefined_syms
+    let ucrt_syms: Vec<&str> = undefined
         .iter()
+        .copied()
         .filter(|n| !is_kernel32_symbol(n))
-        .map(|n| n.as_str())
         .collect();
 
     // msvcrt.dll exports plain `printf`; ucrtbase.dll does not.
@@ -672,8 +732,13 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
             },
         ]
     };
-    let (rdata_bytes, idt_off, iat_rel_off, idt_sz, iat_sz) =
-        build_import_section(rdata_rva as u64, &entries);
+
+    let rdata_import_off = align_up_usize(region_len[CoffRegion::ReadOnly as usize], 16);
+    let (import_bytes, idt_off, iat_rel_off, idt_sz, iat_sz) =
+        build_import_section(rdata_rva as u64 + rdata_import_off as u64, &entries);
+    let import_base_rva = rdata_rva + rdata_import_off as u32;
+    let import_dir_rva = import_base_rva + idt_off;
+    let iat_rva = import_base_rva + iat_rel_off;
 
     // IAT structure: all entries for all DLLs, each 8 bytes, null-terminated per DLL.
     // Within the IAT region, entries are ordered: k32_syms (with null), then ucrt_syms (with null).
@@ -693,108 +758,188 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
     }
 
     let dll_sym_counts = vec![k32_syms.len(), ucrt_syms.len()];
-
-    let mut sym_iat_va: HashMap<String, u64> = HashMap::default();
+    let import_va = IMAGE_BASE + import_base_rva as u64;
+    let mut sym_iat_va: HashMap<&str, u64> = HashMap::default();
     for (i, name) in k32_syms.iter().enumerate() {
         sym_iat_va.insert(
-            name.to_string(),
-            iat_entry_va(
-                IMAGE_BASE + rdata_rva as u64,
-                iat_rel_off,
-                0,
-                i,
-                &dll_sym_counts,
-            ),
+            *name,
+            iat_entry_va(import_va, iat_rel_off, 0, i, &dll_sym_counts),
         );
     }
     for (i, name) in ucrt_syms.iter().enumerate() {
         sym_iat_va.insert(
-            name.to_string(),
-            iat_entry_va(
-                IMAGE_BASE + rdata_rva as u64,
-                iat_rel_off,
-                1,
-                i,
-                &dll_sym_counts,
-            ),
+            *name,
+            iat_entry_va(import_va, iat_rel_off, 1, i, &dll_sym_counts),
         );
     }
 
-    let mut thunk_bytes: Vec<u8> = Vec::with_capacity(n_thunks * 6);
-    for (i, sym_name) in undefined_syms.iter().enumerate() {
-        let thunk_va = text_va + thunks_offset as u64 + i as u64 * 6;
-        let thunk_end_va = thunk_va + 6;
-        let iat_va = sym_iat_va.get(sym_name).copied().unwrap_or(thunk_end_va);
-        let rel = (iat_va as i64 - thunk_end_va as i64) as i32;
-        thunk_bytes.extend_from_slice(&[0xFF, 0x25]);
-        thunk_bytes.extend_from_slice(&rel.to_le_bytes());
+    let rdata_len = rdata_import_off + import_bytes.len();
+    let data_rva = rdata_rva + align_up(rdata_len as u64, SECTION_ALIGN) as u32;
+    let region_rva = [text_rva, rdata_rva, data_rva];
+    let region_size = [
+        text_size,
+        rdata_len,
+        region_len[CoffRegion::Writable as usize],
+    ];
+    let last_region = if has_data { 2 } else { 1 };
+    let region_base = [
+        0usize,
+        (rdata_rva - text_rva) as usize,
+        (data_rva - text_rva) as usize,
+    ];
+    let mut blob = vec![0u8; region_base[last_region] + region_size[last_region]];
+
+    for sec in sections.iter().filter(|sec| !sec.raw.is_empty()) {
+        let at = region_base[sec.region as usize] + sec.offset;
+        blob[at..at + sec.raw.len()].copy_from_slice(sec.raw);
+    }
+    let import_at = region_base[1] + rdata_import_off;
+    blob[import_at..import_at + import_bytes.len()].copy_from_slice(&import_bytes);
+
+    let thunk_va = |i: usize| IMAGE_BASE + text_rva as u64 + (thunks_off + i * 6) as u64;
+    for (i, name) in undefined.iter().enumerate() {
+        let at = thunks_off + i * 6;
+        let end_va = thunk_va(i) + 6;
+        let iat_va = *sym_iat_va
+            .get(name)
+            .ok_or_else(|| coff_error(format!("no import slot for {name}")))?;
+        blob[at..at + 2].copy_from_slice(&[0xFF, 0x25]);
+        blob[at + 2..at + 6].copy_from_slice(&rel32(iat_va, end_va)?.to_le_bytes());
+    }
+    if needs_main_stub {
+        blob[stub_off] = COFF_RET;
     }
 
-    let mut patched_text = text_data.clone();
-    for (vaddr_in_sec, sym_idx, rel_type) in &text_relocs {
-        if *rel_type != IMAGE_REL_AMD64_REL32 {
-            continue;
+    let sec_rva = |sec: &CoffSection| region_rva[sec.region as usize] + sec.offset as u32;
+    let resolve = |sym_idx: usize, allow_thunk: bool, owner: &str| -> Result<i64> {
+        let sym = syms
+            .get(sym_idx)
+            .ok_or_else(|| coff_error(format!("{owner} names missing symbol index {sym_idx}")))?;
+        if sym.section > 0 {
+            let k = slot_of_number.get(&(sym.section as usize)).ok_or_else(|| {
+                coff_error(format!("{} is in a section that is not linked", sym.name))
+            })?;
+            return Ok(IMAGE_BASE as i64
+                + i64::from(sec_rva(&sections[*k]))
+                + i64::from(sym.value));
         }
-        let sym_name = sym_names
-            .get(*sym_idx as usize)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        if sym_name.is_empty() {
-            continue;
+        if sym.section == IMAGE_SYM_ABSOLUTE_SECTION {
+            return Ok(i64::from(sym.value));
         }
-        let thunk_idx = match sym_to_thunk.get(sym_name) {
-            Some(&idx) => idx,
-            None => continue,
-        };
-        let thunk_va = text_va + thunks_offset as u64 + thunk_idx as u64 * 6;
-        // The relocation patches a 4-byte field at vaddr_in_sec within the section.
-        // For REL32: field = target_va - (section_va + vaddr_in_sec + 4)
-        let field_va = text_va + *vaddr_in_sec as u64;
-        let rel32 = (thunk_va as i64) - (field_va as i64 + 4);
-        let off = *vaddr_in_sec as usize;
-        if off + 4 <= patched_text.len() {
-            patched_text[off..off + 4].copy_from_slice(&(rel32 as i32).to_le_bytes());
+        if is_undefined_external(sym) {
+            if sym.name == CRT_MAIN_SYMBOL {
+                return Ok(IMAGE_BASE as i64 + i64::from(text_rva) + stub_off as i64);
+            }
+            if allow_thunk && let Some(&i) = thunk_index.get(sym.name.as_str()) {
+                return Ok(thunk_va(i) as i64);
+            }
+        }
+        Err(coff_error(format!(
+            "unresolved symbol {} referenced from {owner}",
+            sym.name
+        )))
+    };
+
+    for sec in &sections {
+        let base = region_base[sec.region as usize] + sec.offset;
+        for &(vaddr, sym_idx, rel_type) in &sec.relocs {
+            if rel_type == IMAGE_REL_AMD64_ABSOLUTE {
+                continue;
+            }
+            let field = vaddr as usize;
+            if field + 4 > sec.size {
+                return Err(coff_error(format!(
+                    "relocation at {field:#x} lies outside section {}",
+                    sec.name
+                )));
+            }
+            let at = base + field;
+            let p_va = IMAGE_BASE as i64 + i64::from(text_rva) + at as i64;
+            let addend = i64::from(i32::from_le_bytes([
+                blob[at],
+                blob[at + 1],
+                blob[at + 2],
+                blob[at + 3],
+            ]));
+            let bytes: [u8; 4] = match rel_type {
+                IMAGE_REL_AMD64_REL32..=IMAGE_REL_AMD64_REL32_5 => {
+                    let target = resolve(sym_idx as usize, true, &sec.name)?;
+                    let trailing = i64::from(rel_type - IMAGE_REL_AMD64_REL32);
+                    let v = target + addend - (p_va + 4 + trailing);
+                    i32::try_from(v)
+                        .map_err(|_| coff_error(format!("REL32 out of range in {}", sec.name)))?
+                        .to_le_bytes()
+                }
+                IMAGE_REL_AMD64_ADDR32NB => {
+                    let target = resolve(sym_idx as usize, false, &sec.name)?;
+                    let v = target - IMAGE_BASE as i64 + addend;
+                    u32::try_from(v)
+                        .map_err(|_| coff_error(format!("ADDR32NB out of range in {}", sec.name)))?
+                        .to_le_bytes()
+                }
+                other => {
+                    return Err(coff_error(format!(
+                        "unsupported relocation type {other:#06x} in section {}",
+                        sec.name
+                    )));
+                }
+            };
+            blob[at..at + 4].copy_from_slice(&bytes);
         }
     }
 
-    patched_text.extend_from_slice(&thunk_bytes);
+    let entry_va = match syms
+        .iter()
+        .position(|s| s.section > 0 && (s.name == "main" || s.name == "_main"))
+    {
+        Some(i) => resolve(i, false, "entry point")? as u64,
+        None => IMAGE_BASE + text_rva as u64,
+    };
 
-    let entry_va = text_va + main_offset as u64;
-
-    // We handle routing ourselves via entry_refs; pass empty plt_symbols to avoid
-    // the emitter adding a duplicate KERNEL32.DLL entry.
-
-    let import_dir_rva = rdata_rva + idt_off;
-    let iat_rva = rdata_rva + iat_rel_off;
-
-    let text_vsize = patched_text.len() as u32;
-    let text_raw_size = align_up(text_vsize as u64, FILE_ALIGN) as u32;
-    let rdata_vsize = rdata_bytes.len() as u32;
-    let last_section_end = rdata_rva as u64 + align_up(rdata_vsize as u64, SECTION_ALIGN);
-    let size_of_image = align_up(last_section_end, SECTION_ALIGN) as u32;
-
-    let text_file_off = size_of_headers_pe;
-    let rdata_file_off = text_file_off + text_raw_size;
-
-    let sections = vec![
+    let mut pe_sections = vec![
         PeSection::new(
             ".text",
-            patched_text,
+            blob[..text_size].to_vec(),
             IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
         ),
         PeSection::new(
             ".rdata",
-            rdata_bytes,
+            blob[region_base[1]..region_base[1] + rdata_len].to_vec(),
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
         ),
     ];
+    if has_data {
+        let at = region_base[2];
+        pe_sections.push(PeSection::new(
+            ".data",
+            blob[at..at + region_size[2]].to_vec(),
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+        ));
+    }
+    let sec_rvas: Vec<u32> = region_rva[..n_out_sections].to_vec();
+    let mut sec_file_offs = Vec::with_capacity(pe_sections.len());
+    let mut file_off = size_of_headers;
+    for sec in &pe_sections {
+        sec_file_offs.push(file_off);
+        file_off += sec.raw_size();
+    }
+    let last_end = if has_data {
+        data_rva as u64
+            + align_up(
+                region_len[CoffRegion::Writable as usize] as u64,
+                SECTION_ALIGN,
+            )
+    } else {
+        rdata_rva as u64 + align_up(rdata_len as u64, SECTION_ALIGN)
+    };
+    let size_of_image = align_up(last_end, SECTION_ALIGN) as u32;
 
     emit_pe_raw(
         out,
-        &sections,
-        &[text_rva, rdata_rva],
-        &[text_file_off, rdata_file_off],
-        size_of_headers_pe,
+        &pe_sections,
+        &sec_rvas,
+        &sec_file_offs,
+        size_of_headers,
         size_of_image,
         entry_va,
         import_dir_rva,
