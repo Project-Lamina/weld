@@ -1,0 +1,21 @@
+name: rust-fmt
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  fmt:
+    name: "rustfmt (non-blocking)"
+    runs-on: ubuntu-latest
+    # The repo has pre-existing rustfmt drift; report it without failing the run.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
