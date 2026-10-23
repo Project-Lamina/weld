@@ -669,21 +669,21 @@ fn link_multi_object_parsed(
                 Some(0) => Some(
                     symbol_names
                         .get(i)
-                        .and_then(|name| global_symbols.get(name))
+                        .and_then(|name| global_symbols.get(name.as_ref()))
                         .copied()
                         .unwrap_or(0),
                 ),
                 Some(a) => Some(*a),
                 None => symbol_names
                     .get(i)
-                    .and_then(|name| global_symbols.get(name).copied()),
+                    .and_then(|name| global_symbols.get(name.as_ref()).copied()),
             };
             by_index.push(resolved_addr);
         }
 
         let got_by_index: Vec<Option<u64>> = symbol_names
             .iter()
-            .map(|name| got_symbol_map.get(name).copied())
+            .map(|name| got_symbol_map.get(name.as_ref()).copied())
             .collect();
 
         let section_off: HashMap<String, u64> = obj_contribs

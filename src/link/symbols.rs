@@ -1,5 +1,7 @@
 //! Symbol resolution across merged objects, and the output symbol table.
 
+use std::borrow::Cow;
+
 use super::{
     MergedLayout, ObjectSectionContrib, SHN_ABS, SHN_UNDEF, SHT_SYMTAB, STB_LOCAL, STB_WEAK,
     merge_sections_single_object,
@@ -214,18 +216,30 @@ pub(super) fn symbol_names_by_index_raw(data: &[u8], sections: &[SectionHeader])
     )
 }
 
-pub(super) fn symbol_names_by_index(data: &[u8], sections: &[SectionHeader]) -> Result<Vec<String>, String> {
+pub(super) fn symbol_names_by_index<'a>(
+    data: &'a [u8],
+    sections: &'a [SectionHeader],
+) -> Result<Vec<Cow<'a, str>>, String> {
     let Some((symbols, strtab)) = parse_symtab_view(data, sections)? else {
         return Ok(Vec::new());
     };
 
     Ok(symbols
         .iter()
-        .map(|sym| {
-            get_strtab_string(strtab, sym.name_offset)
-                .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset))
+        .map(|sym| match strtab_str(strtab, sym.name_offset) {
+            Some(name) => Cow::Borrowed(name),
+            None => Cow::Owned(format!("<sym_{}>", sym.name_offset)),
         })
         .collect())
+}
+
+fn strtab_str(strtab: &[u8], offset: u32) -> Option<&str> {
+    if offset == 0 {
+        return Some("");
+    }
+    let rest = strtab.get(offset as usize..)?;
+    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    std::str::from_utf8(&rest[..end]).ok()
 }
 
 pub fn resolve_symbols(
