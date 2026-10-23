@@ -5,7 +5,10 @@ use crate::{
 };
 
 use crate::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::{
+    io::{Read, Seek},
+    path::{Path, PathBuf},
+};
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const FAT_MAGIC: u32 = 0xCAFEBABE;
@@ -47,8 +50,28 @@ struct ArchiveEntry {
 
 struct ArchiveEntries {
     buffer: Vec<u8>,
+    file: Option<std::fs::File>,
     members: Vec<ArchiveEntry>,
     index: Option<HashMap<String, Vec<usize>>>,
+}
+
+impl ArchiveEntries {
+    fn body(&mut self, i: usize) -> Vec<u8> {
+        let (start, len) = (self.members[i].start, self.members[i].len);
+        match &mut self.file {
+            Some(file) => {
+                let mut body = vec![0u8; len];
+                let read = file
+                    .seek(std::io::SeekFrom::Start(start as u64))
+                    .and_then(|_| file.read_exact(&mut body));
+                if read.is_err() {
+                    body.clear();
+                }
+                body
+            }
+            None => self.buffer.get(start..start + len).unwrap_or(&[]).to_vec(),
+        }
+    }
 }
 
 fn read_u32_be(data: &[u8], off: usize) -> Option<u32> {
@@ -341,6 +364,62 @@ fn apply_symbol_summary(
     }
 }
 
+/// Opens a static library, reading only its member headers and symbol index when
+/// every member is an object with an index. Other archives are read in full.
+fn open_library_entries(path: &Path, position: usize) -> Option<ArchiveEntries> {
+    if let Some(entries) = scan_indexed_library(path, position) {
+        return Some(entries);
+    }
+    let data = normalize_macho_container(std::fs::read(path).ok()?);
+    load_archive_entries(data, position)
+}
+
+fn scan_indexed_library(path: &Path, position: usize) -> Option<ArchiveEntries> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let scan = archive::scan_headers(&mut file, len).ok()?;
+    let index = scan.index?;
+    let mut offsets = HashMap::default();
+    let mut members = Vec::new();
+    for member in scan.members {
+        let prefix_len = member.len.min(64);
+        let mut prefix = vec![0u8; prefix_len];
+        file.seek(std::io::SeekFrom::Start(member.start as u64))
+            .and_then(|_| file.read_exact(&mut prefix))
+            .ok()?;
+        if !is_elf(&prefix) {
+            if is_macho64(&prefix) || is_coff(&prefix) {
+                return None;
+            }
+            continue;
+        }
+        offsets.insert(member.offset, members.len());
+        members.push(ArchiveEntry {
+            position,
+            start: member.start,
+            len: member.len,
+            symbols: None,
+            selected: false,
+        });
+    }
+    let index = index
+        .into_iter()
+        .map(|(name, offsets_in_index)| {
+            let indices = offsets_in_index
+                .iter()
+                .map(|offset| offsets.get(offset).copied())
+                .collect::<Option<Vec<_>>>()?;
+            Some((name, indices))
+        })
+        .collect::<Option<HashMap<_, _>>>()?;
+    Some(ArchiveEntries {
+        buffer: Vec::new(),
+        file: Some(file),
+        members,
+        index: Some(index),
+    })
+}
+
 fn load_archive_entries(data: Vec<u8>, position: usize) -> Option<ArchiveEntries> {
     let archive = archive::parse_members(&data).ok()?;
     let mut offsets = HashMap::default();
@@ -390,6 +469,7 @@ fn load_archive_entries(data: Vec<u8>, position: usize) -> Option<ArchiveEntries
     );
     Some(ArchiveEntries {
         buffer: data,
+        file: None,
         members,
         index,
     })
@@ -429,25 +509,11 @@ fn select_archive_members(
                 };
                 let Some(i) = next else { break };
                 cursor = i + 1;
+                let body_owned = archive.body(i);
                 if archive.members[i].symbols.is_none() {
-                    let body = {
-                        let entry = &archive.members[i];
-                        archive
-                            .buffer
-                            .get(entry.start..entry.start + entry.len)
-                            .unwrap_or(&[])
-                    };
-                    let summary = collect_object_symbol_summary(body).unwrap_or_default();
+                    let summary = collect_object_symbol_summary(&body_owned).unwrap_or_default();
                     archive.members[i].symbols = Some(summary);
                 }
-                let body_owned = {
-                    let entry = &archive.members[i];
-                    archive
-                        .buffer
-                        .get(entry.start..entry.start + entry.len)
-                        .unwrap_or(&[])
-                        .to_vec()
-                };
                 let entry = &mut archive.members[i];
                 let symbols = entry.symbols.as_ref().expect("summary just set");
                 if symbols.defined.is_disjoint(unresolved_symbols) {
@@ -565,8 +631,7 @@ pub fn load_objects_with_positions(
             .get(i)
             .copied()
             .unwrap_or(paths.len() + i + 1);
-        let data = normalize_macho_container(std::fs::read(path).ok()?);
-        archives.push(load_archive_entries(data, position)?);
+        archives.push(open_library_entries(path, position)?);
     }
 
     select_archive_members(
