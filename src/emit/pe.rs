@@ -550,7 +550,7 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
                 continue;
             }
             let section_num = coff_read_i16(coff, rec + 12).unwrap_or(0);
-            let storage_class = coff[rec + 17]; // byte 17: StorageClass (byte 16 is NumberOfAuxSymbols)
+            let storage_class = coff[rec + 16];
             if section_num == IMAGE_SYM_UNDEFINED_SECTION
                 && storage_class == IMAGE_SYM_CLASS_EXTERNAL
                 && seen.insert(name.clone())
