@@ -818,8 +818,7 @@ fn select_needed_libraries(
             needed.push(library.soname);
             continue;
         }
-        let data = crate::elf::read_dynamic_symbol_bytes(&library.path)?;
-        let (_, sections, _) = parse_elf64_slice(&data)?;
+        let (data, sections) = crate::elf::read_dynamic_tables(&library.path)?;
         let mut exports = HashSet::default();
         let mut library_references = HashSet::default();
         for section in sections.iter().filter(|s| s.sh_type == 11) {
