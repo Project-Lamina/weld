@@ -418,9 +418,14 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
         let is_coff = object::is_coff_object(&data);
         if is_coff {
             let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
+            let mut image = Vec::new();
+            if let Err(error) = emit::pe::link_and_emit_pe_from_coff(&data, &mut image) {
+                eprintln!("weld: {error}");
+                return Some(1);
+            }
             let out_file = create_output(out_path).ok()?;
             let mut out = std::io::BufWriter::new(out_file);
-            emit::pe::link_and_emit_pe_from_coff(&data, &mut out).ok()?;
+            std::io::Write::write_all(&mut out, &image).ok()?;
             out.flush().ok()?;
             return Some(0);
         }
