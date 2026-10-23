@@ -249,6 +249,14 @@ pub(super) fn collect_mergeable_sections<'a>(
     to_merge
 }
 
+type ContentIndex<'a> = HashMap<&'a [u8], Vec<u64>>;
+
+fn progbits_bytes<'a>(data: &'a [u8], sh: &SectionHeader) -> &'a [u8] {
+    let start = sh.sh_offset as usize;
+    let end = start + sh.sh_size as usize;
+    data.get(start..end).unwrap_or(&[])
+}
+
 pub(super) fn read_section_data(data: &[u8], sh: &SectionHeader) -> Vec<u8> {
     if sh.sh_size == 0 {
         return Vec::new();
@@ -475,8 +483,8 @@ pub fn merge_sections_multi_object(
     let mut section_types = HashMap::default();
     let mut section_flags: HashMap<String, u64> = HashMap::default();
 
-    let mut elements: HashMap<(String, u64, bool, Vec<u8>), Vec<u64>> = HashMap::default();
-    for obj_data in objects {
+    let mut elements: HashMap<(String, u64, bool), ContentIndex<'_>> = HashMap::default();
+    for &obj_data in objects {
         let (header, sections, names) = parse_elf64_slice(obj_data)?;
         if header.e_machine != e_machine {
             return Err(format!(
@@ -491,7 +499,6 @@ pub fn merge_sections_multi_object(
             let input_name = name;
             let name = output_section_name(&input_name).to_string();
             section_types.insert(name.clone(), (sh.sh_type, sh.sh_entsize));
-            let data_slice = read_section_data(obj_data, sh);
 
             let size = sh.sh_size;
             let align = sh.sh_addralign.max(1);
@@ -510,14 +517,17 @@ pub fn merge_sections_multi_object(
                 offset_in_merged = 0;
                 let mut end = raw;
                 let strings = sh.sh_flags & 0x20 != 0;
-                for (old, bytes) in merge_elements(&data_slice, sh.sh_entsize as usize, strings)? {
+                let data_slice = progbits_bytes(obj_data, sh);
+                let by_content = elements
+                    .entry((name.clone(), sh.sh_entsize, strings))
+                    .or_default();
+                for (old, bytes) in merge_elements(data_slice, sh.sh_entsize as usize, strings)? {
                     let required = if old == 0 {
                         align
                     } else {
                         align.min(1u64 << old.trailing_zeros())
                     };
-                    let key = (name.clone(), sh.sh_entsize, strings, bytes.to_vec());
-                    let candidates = elements.entry(key).or_default();
+                    let candidates = by_content.entry(bytes).or_default();
                     let new = if let Some(&offset) = candidates
                         .iter()
                         .find(|&&offset| offset.is_multiple_of(required))
@@ -542,7 +552,7 @@ pub fn merge_sections_multi_object(
                 if pad > 0 {
                     entry.push((vec![0u8; pad as usize], pad));
                 }
-                entry.push((data_slice, size));
+                entry.push((read_section_data(obj_data, sh), size));
                 section_cumul.insert(name.clone(), offset_in_merged + size);
             }
 
