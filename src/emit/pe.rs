@@ -1175,4 +1175,62 @@ mod tests {
             buf.len()
         );
     }
+
+    fn coff_test_section(
+        o: &mut Vec<u8>,
+        name: &[u8; 8],
+        size: u32,
+        ptr: u32,
+        relocs: (u32, u16),
+        flags: u32,
+    ) {
+        o.extend_from_slice(name);
+        o.extend_from_slice(&0u32.to_le_bytes());
+        o.extend_from_slice(&0u32.to_le_bytes());
+        o.extend_from_slice(&size.to_le_bytes());
+        o.extend_from_slice(&ptr.to_le_bytes());
+        o.extend_from_slice(&relocs.0.to_le_bytes());
+        o.extend_from_slice(&0u32.to_le_bytes());
+        o.extend_from_slice(&relocs.1.to_le_bytes());
+        o.extend_from_slice(&0u16.to_le_bytes());
+        o.extend_from_slice(&flags.to_le_bytes());
+    }
+
+    fn coff_test_symbol(o: &mut Vec<u8>, name: &[u8; 8], section: i16, class: u8) {
+        o.extend_from_slice(name);
+        o.extend_from_slice(&0u32.to_le_bytes());
+        o.extend_from_slice(&section.to_le_bytes());
+        o.extend_from_slice(&0u16.to_le_bytes());
+        o.push(class);
+        o.push(0);
+    }
+
+    #[test]
+    fn test_coff_relocation_into_rdata_resolves() {
+        let mut coff = Vec::new();
+        coff.extend_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        coff.extend_from_slice(&2u16.to_le_bytes());
+        coff.extend_from_slice(&0u32.to_le_bytes());
+        coff.extend_from_slice(&122u32.to_le_bytes());
+        coff.extend_from_slice(&2u32.to_le_bytes());
+        coff.extend_from_slice(&0u16.to_le_bytes());
+        coff.extend_from_slice(&0u16.to_le_bytes());
+        coff_test_section(&mut coff, b".text\0\0\0", 8, 100, (108, 1), 0x6000_0020);
+        coff_test_section(&mut coff, b".rdata\0\0", 4, 118, (0, 0), 0x4000_0040);
+        coff.extend_from_slice(&[0x48, 0x8D, 0x0D, 0, 0, 0, 0, 0xC3]);
+        coff.extend_from_slice(&3u32.to_le_bytes());
+        coff.extend_from_slice(&1u32.to_le_bytes());
+        coff.extend_from_slice(&IMAGE_REL_AMD64_REL32.to_le_bytes());
+        coff.extend_from_slice(b"hi\0\0");
+        coff_test_symbol(&mut coff, b"main\0\0\0\0", 1, IMAGE_SYM_CLASS_EXTERNAL);
+        coff_test_symbol(&mut coff, b".rdata\0\0", 2, 3);
+        coff.extend_from_slice(&4u32.to_le_bytes());
+
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coff(&coff, &mut out).expect("links");
+        let disp_at = 512 + 3;
+        let disp = i32::from_le_bytes(out[disp_at..disp_at + 4].try_into().unwrap());
+        assert_eq!(disp, 0x2000 - 0x1007);
+        assert_eq!(&out[1024..1027], b"hi\0");
+    }
 }
