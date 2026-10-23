@@ -553,7 +553,6 @@ fn coff_symbol_name(name_bytes: &[u8; 8], strtab: &[u8]) -> String {
 ///
 /// Code sections go to `.text`, read-only data to `.rdata`, writable and
 /// uninitialized data to `.data`. Undefined externals get `jmp [iat]` thunks.
-/// `__main` resolves to a `ret`.
 pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<()> {
     let truncated = || coff_error("truncated COFF object".to_string());
     let n_sections = coff_read_u16(coff, 2).ok_or_else(truncated)? as usize;
@@ -663,9 +662,16 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
             && s.class == IMAGE_SYM_CLASS_EXTERNAL
             && !s.name.is_empty()
     };
-    let needs_main_stub = syms
+    if syms
         .iter()
-        .any(|s| is_undefined_external(s) && s.name == CRT_MAIN_SYMBOL);
+        .any(|s| is_undefined_external(s) && s.name == CRT_MAIN_SYMBOL)
+    {
+        return Err(coff_error(format!(
+            "undefined {CRT_MAIN_SYMBOL}: it runs global constructors from libgcc and weld \
+             cannot supply it; link a runtime that defines it"
+        )));
+    }
+    let needs_main_stub = false;
     let undefined: Vec<&str> = {
         let mut seen: HashSet<&str> = HashSet::default();
         syms.iter()
