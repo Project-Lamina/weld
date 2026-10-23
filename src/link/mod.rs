@@ -118,6 +118,9 @@ pub struct LinkOptions {
     pub gc_roots: Vec<String>,
 }
 
+/// Links ELF64 objects with `LinkOptions::default()`. `libs` names the libraries to
+/// resolve. Unless `static_link` is set, an x86_64 link that names a shared library
+/// (or `c` / `System`) gets PLT and GOT entries for its undefined symbols.
 pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<LinkResult, String> {
     link_multi_object_with_options(objects, libs, &LinkOptions::default())
 }
