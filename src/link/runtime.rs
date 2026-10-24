@@ -117,7 +117,9 @@ fn exports(
         for section in sections.iter().filter(|s| s.sh_type == 11) {
             let strings = get_strtab_from_section(&data, &sections[section.sh_link as usize]);
             for (i, record) in get_strtab_from_section(&data, section)
-                .chunks_exact(24)
+                .as_chunks::<24>()
+                .0
+                .iter()
                 .enumerate()
             {
                 if half(record, 6)? == SHN_UNDEF || record[4] >> 4 == STB_LOCAL {
@@ -200,7 +202,7 @@ pub(super) fn prepare(
         let strings = get_strtab_from_section(&obj.data, &obj.sections[table.sh_link as usize]);
         let symbols = get_strtab_from_section(&obj.data, table);
         let mut indices = vec![0u32; symbols.len() / 24];
-        for (i, record) in symbols.chunks_exact(24).enumerate() {
+        for (i, record) in symbols.as_chunks::<24>().0.iter().enumerate() {
             if half(record, 6)? != SHN_UNDEF {
                 continue;
             }
@@ -220,7 +222,10 @@ pub(super) fn prepare(
             else {
                 continue;
             };
-            for record in get_strtab_from_section(&obj.data, section).chunks_exact(24) {
+            for record in get_strtab_from_section(&obj.data, section)
+                .as_chunks::<24>()
+                .0
+            {
                 let kind = word(record, 8)?;
                 if !matches!(kind, 1 | 6 | 8) {
                     continue;
@@ -425,7 +430,9 @@ pub(super) fn prepare(
     let dynidx = layout.section_by_name[".dynamic"];
     let mut entries: Vec<(u64, u64)> = layout.sections[dynidx]
         .data
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .filter_map(|v| {
             let tag = u64::from_le_bytes(v[..8].try_into().unwrap());
             (tag != 0).then(|| (tag, u64::from_le_bytes(v[8..].try_into().unwrap())))
@@ -649,7 +656,7 @@ pub(super) fn finish(
     bytes.resize(layout.sections[idx].data.len(), 0);
     layout.sections[idx].data = bytes;
     let idx = layout.section_by_name[".dynamic"];
-    for record in layout.sections[idx].data.chunks_exact_mut(16) {
+    for record in layout.sections[idx].data.as_chunks_mut::<16>().0 {
         if u64::from_le_bytes(record[..8].try_into().unwrap()) == 8 {
             record[8..].copy_from_slice(&size.to_le_bytes());
         }
@@ -791,7 +798,7 @@ pub(super) fn remap_generated(layout: &mut MergedLayout, remap: impl Fn(u64) -> 
     for section in &mut layout.sections {
         match section.name.as_str() {
             ".dynamic" => {
-                for record in section.data.chunks_exact_mut(16) {
+                for record in section.data.as_chunks_mut::<16>().0 {
                     let tag = u64::from_le_bytes(record[..8].try_into().unwrap());
                     if matches!(
                         tag,
@@ -815,13 +822,13 @@ pub(super) fn remap_generated(layout: &mut MergedLayout, remap: impl Fn(u64) -> 
                 }
             }
             ".rela.plt" => {
-                for record in section.data.chunks_exact_mut(24) {
+                for record in section.data.as_chunks_mut::<24>().0 {
                     let value = u64::from_le_bytes(record[..8].try_into().unwrap());
                     record[..8].copy_from_slice(&remap(value).to_le_bytes());
                 }
             }
             ".dynsym" => {
-                for record in section.data.chunks_exact_mut(24) {
+                for record in section.data.as_chunks_mut::<24>().0 {
                     let value = u64::from_le_bytes(record[8..16].try_into().unwrap());
                     if value != 0 {
                         record[8..16].copy_from_slice(&remap(value).to_le_bytes());
@@ -829,8 +836,8 @@ pub(super) fn remap_generated(layout: &mut MergedLayout, remap: impl Fn(u64) -> 
                 }
             }
             ".got.plt" => {
-                for record in section.data.chunks_exact_mut(8) {
-                    let value = u64::from_le_bytes(record.try_into().unwrap());
+                for record in section.data.as_chunks_mut::<8>().0 {
+                    let value = u64::from_le_bytes(*record);
                     if value != 0 {
                         record.copy_from_slice(&remap(value).to_le_bytes());
                     }
