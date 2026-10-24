@@ -127,3 +127,31 @@ fn rejects_malformed_object_sections_before_allocating() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn rejects_pc_relative_relocation_that_does_not_fit() {
+    let dir = std::env::temp_dir().join(format!("weld-pc32-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(
+        dir.join("far.s"),
+        ".globl main\nmain:\n  leaq farsym(%rip), %rax\n  xor %eax, %eax\n  ret\n.globl farsym\n.set farsym, 0x90000000\n",
+    )
+    .unwrap();
+    let status = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-c", "far.s", "-o", "far.o"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let output = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-Bdrv", "-nostdlib", "-no-pie", "far.o", "-o", "output"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("does not fit in i32"), "{stderr}");
+    assert!(!dir.join("output").exists());
+    fs::remove_dir_all(dir).unwrap();
+}
