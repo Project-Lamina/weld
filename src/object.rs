@@ -1,5 +1,9 @@
 use crate::{
     archive,
+    coff::{
+        self, IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_WEAK_EXTERNAL, IMAGE_SYM_UNDEFINED_SECTION,
+        MACHINE_AMD64,
+    },
     elf::{get_strtab_from_section, get_strtab_string, parse_elf64_slice, parse_symtab},
     macho::{is_macho_dylib, is_macho64, parse_macho64_object},
 };
@@ -20,20 +24,6 @@ const SHT_SYMTAB: u32 = 2;
 const STB_GLOBAL: u8 = 1;
 const STB_WEAK: u8 = 2;
 const N_EXT: u8 = 0x01;
-
-// COFF machine types present in bare object files (.obj).
-// PE executables start with the DOS MZ header (0x4D5A), not one of these.
-const COFF_MACHINE_I386: u16 = 0x014C;
-const COFF_MACHINE_AMD64: u16 = 0x8664;
-const COFF_MACHINE_ARM64: u16 = 0xAA64;
-const COFF_MACHINE_ARM: u16 = 0x01C0;
-const COFF_MACHINE_RISCV32: u16 = 0x5032;
-const COFF_MACHINE_RISCV64: u16 = 0x5064;
-
-const IMAGE_SYM_UNDEFINED: i16 = 0;
-const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
-const IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
-const IMAGE_SCN_LNK_NRELOC_OVFL: u32 = 0x0100_0000;
 
 #[derive(Default, Clone)]
 struct ObjectSymbolSummary {
@@ -158,21 +148,11 @@ fn is_elf(data: &[u8]) -> bool {
     data.len() >= ELF_MAGIC.len() && data[..ELF_MAGIC.len()] == ELF_MAGIC
 }
 
-fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
-    data.get(off..off + 2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-}
-
-fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
-    data.get(off..off + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-}
-
 fn is_coff(data: &[u8]) -> bool {
-    if data.len() < 20 {
+    if data.len() < coff::HEADER_SIZE {
         return false;
     }
-    let machine = match read_u16_le(data, 0) {
+    let machine = match coff::read_u16(data, 0) {
         Some(m) => m,
         None => return false,
     };
@@ -182,165 +162,72 @@ fn is_coff(data: &[u8]) -> bool {
     }
     matches!(
         machine,
-        COFF_MACHINE_I386
-            | COFF_MACHINE_AMD64
-            | COFF_MACHINE_ARM64
-            | COFF_MACHINE_ARM
-            | COFF_MACHINE_RISCV32
-            | COFF_MACHINE_RISCV64
+        coff::MACHINE_I386
+            | MACHINE_AMD64
+            | coff::MACHINE_ARM64
+            | coff::MACHINE_ARM
+            | coff::MACHINE_RISCV32
+            | coff::MACHINE_RISCV64
     )
 }
 
 /// Extract global/external symbol names from a COFF object file.
 fn collect_coff_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
-    if data.len() < 20 {
+    if data.len() < coff::HEADER_SIZE {
         return None;
     }
-    let sym_table_off = read_u32_le(data, 8)? as usize;
-    let sym_count = read_u32_le(data, 12)? as usize;
-
-    if sym_table_off == 0 || sym_count == 0 {
+    let object = coff::parse(data);
+    if object.symbol_table_offset == 0 || object.symbol_count == 0 {
         return Some(ObjectSymbolSummary::default());
     }
-
-    // Each COFF symbol record is exactly 18 bytes.
-    let sym_table_end = sym_table_off.checked_add(sym_count.checked_mul(18)?)?;
-    if sym_table_end > data.len() {
+    if object.symbols_truncated {
         return None;
     }
-
-    // The string table immediately follows the symbol table.
-    let strtab_off = sym_table_end;
-    let strtab_size = if strtab_off + 4 <= data.len() {
-        read_u32_le(data, strtab_off)? as usize
-    } else {
-        0
-    };
-    let strtab_end = strtab_off.checked_add(strtab_size)?;
-    let strtab = if strtab_end <= data.len() {
-        &data[strtab_off..strtab_end]
-    } else {
-        &data[strtab_off.min(data.len())..]
-    };
-
-    let referenced = coff_relocated_symbols(data);
+    let symbols = &object.symbols;
+    let count = object.symbol_count;
+    let referenced: HashSet<usize> = object
+        .sections
+        .iter()
+        .flat_map(|sec| sec.relocs.iter().map(|&(_, sym, _)| sym as usize))
+        .collect();
     let mut weak_tags: HashSet<usize> = HashSet::default();
     let mut i = 0usize;
-    while i < sym_count {
-        let rec_off = sym_table_off + i * 18;
-        if data[rec_off + 16] == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
-            let tag = read_u32_le(data, rec_off + 18).unwrap_or(0) as usize;
-            weak_tags.insert(tag);
+    while i < count {
+        let sym = &symbols[i];
+        if sym.class == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
+            weak_tags.insert(sym.tag);
         }
-        i += 1 + data[rec_off + 17] as usize;
+        i += 1 + sym.num_aux;
     }
 
     let mut summary = ObjectSymbolSummary::default();
     let mut i = 0usize;
-    while i < sym_count {
-        let rec_off = sym_table_off + i * 18;
-        let section_number = i16::from_le_bytes([data[rec_off + 12], data[rec_off + 13]]);
-        let storage_class = data[rec_off + 16];
-        let num_aux = data[rec_off + 17] as usize;
-        let name = coff_symbol_name(&data[rec_off..rec_off + 8], strtab);
-
-        if storage_class == IMAGE_SYM_CLASS_EXTERNAL && !name.is_empty() {
-            if section_number != IMAGE_SYM_UNDEFINED {
-                summary.defined.insert(name);
+    while i < count {
+        let sym = &symbols[i];
+        if sym.class == IMAGE_SYM_CLASS_EXTERNAL && !sym.name.is_empty() {
+            if sym.section != IMAGE_SYM_UNDEFINED_SECTION {
+                summary.defined.insert(sym.name.clone());
             } else if referenced.contains(&i) || !weak_tags.contains(&i) {
-                summary.undefined.insert(name);
+                summary.undefined.insert(sym.name.clone());
             }
-        } else if storage_class == IMAGE_SYM_CLASS_WEAK_EXTERNAL && num_aux > 0 && !name.is_empty()
+        } else if sym.class == IMAGE_SYM_CLASS_WEAK_EXTERNAL
+            && sym.num_aux > 0
+            && !sym.name.is_empty()
+            && referenced.contains(&i)
+            && !sym.tag_name.is_empty()
         {
-            let tag = read_u32_le(data, rec_off + 18).unwrap_or(0) as usize;
-            if tag < sym_count {
-                let tag_off = sym_table_off + tag * 18;
-                let default = coff_symbol_name(&data[tag_off..tag_off + 8], strtab);
-                if referenced.contains(&i) && !default.is_empty() {
-                    summary.undefined.insert(name.clone());
-                    summary.weak_defaults.push((name, default));
-                }
-            }
+            summary.undefined.insert(sym.name.clone());
+            summary
+                .weak_defaults
+                .push((sym.name.clone(), sym.tag_name.clone()));
         }
-
-        i += 1 + num_aux;
+        i += 1 + sym.num_aux;
     }
 
     summary
         .undefined
         .retain(|sym| !summary.defined.contains(sym));
     Some(summary)
-}
-
-/// Symbol-table indices named by any relocation in the object.
-/// Byte offset and count of a section's relocation records. A section with more than
-/// 0xFFFF relocations sets `count` to 0xFFFF and IMAGE_SCN_LNK_NRELOC_OVFL; the real
-/// count, including the record that holds it, is then the first record's VirtualAddress.
-pub(crate) fn coff_reloc_span(
-    data: &[u8],
-    relocs_ptr: usize,
-    count: u16,
-    flags: u32,
-) -> Option<(usize, usize)> {
-    if count == u16::MAX && flags & IMAGE_SCN_LNK_NRELOC_OVFL != 0 {
-        let total = read_u32_le(data, relocs_ptr)? as usize;
-        return Some((relocs_ptr + 10, total.checked_sub(1)?));
-    }
-    Some((relocs_ptr, count as usize))
-}
-
-fn coff_relocated_symbols(data: &[u8]) -> HashSet<usize> {
-    let mut referenced = HashSet::default();
-    let Some(n_sections) = data
-        .get(2..4)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
-    else {
-        return referenced;
-    };
-    let opt_size = data
-        .get(16..18)
-        .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize);
-    for s in 0..n_sections {
-        let sh = 20 + opt_size + s * 40;
-        let (Some(ptr), Some(count), Some(flags)) = (
-            read_u32_le(data, sh + 24),
-            data.get(sh + 32..sh + 34),
-            read_u32_le(data, sh + 36),
-        ) else {
-            break;
-        };
-        let count = u16::from_le_bytes([count[0], count[1]]);
-        let Some((first, n)) = coff_reloc_span(data, ptr as usize, count, flags) else {
-            break;
-        };
-        for r in 0..n {
-            let Some(sym) = read_u32_le(data, first + r * 10 + 4) else {
-                break;
-            };
-            referenced.insert(sym as usize);
-        }
-    }
-    referenced
-}
-
-/// Decode a COFF symbol name: either inline (≤8 bytes, NUL-padded) or a
-/// string-table reference stored as 0x00000000 + 4-byte offset.
-fn coff_symbol_name(name_bytes: &[u8], strtab: &[u8]) -> String {
-    if name_bytes.len() < 8 {
-        return String::new();
-    }
-    if name_bytes[0..4] == [0, 0, 0, 0] {
-        let off = u32::from_le_bytes([name_bytes[4], name_bytes[5], name_bytes[6], name_bytes[7]])
-            as usize;
-        if off >= 4 && off < strtab.len() {
-            let s = &strtab[off..];
-            let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-            return String::from_utf8_lossy(&s[..end]).into_owned();
-        }
-        return String::new();
-    }
-    let end = name_bytes[..8].iter().position(|&b| b == 0).unwrap_or(8);
-    String::from_utf8_lossy(&name_bytes[..end]).into_owned()
 }
 
 #[allow(dead_code)]
@@ -832,7 +719,7 @@ mod tests {
 
         let mut data = vec![0u8; 20 + (sym_count as usize) * 18 + strtab_size];
 
-        write_u16_le_at(&mut data, 0, COFF_MACHINE_AMD64);
+        write_u16_le_at(&mut data, 0, MACHINE_AMD64);
         write_u16_le_at(&mut data, 2, 0);
         write_u32_le_at(&mut data, 8, sym_table_off);
         write_u32_le_at(&mut data, 12, sym_count);
@@ -864,11 +751,11 @@ mod tests {
     #[test]
     fn coff_detection_accepts_known_machine_types() {
         let mut buf = [0u8; 20];
-        write_u16_le_at(&mut buf, 0, COFF_MACHINE_AMD64);
+        write_u16_le_at(&mut buf, 0, MACHINE_AMD64);
         assert!(is_coff(&buf));
-        write_u16_le_at(&mut buf, 0, COFF_MACHINE_ARM64);
+        write_u16_le_at(&mut buf, 0, coff::MACHINE_ARM64);
         assert!(is_coff(&buf));
-        write_u16_le_at(&mut buf, 0, COFF_MACHINE_RISCV64);
+        write_u16_le_at(&mut buf, 0, coff::MACHINE_RISCV64);
         assert!(is_coff(&buf));
     }
 
@@ -1102,7 +989,7 @@ mod coff_weak_selection_tests {
         let reloc_off = 20 + 40 * usize::from(section_count);
         let sym_off = reloc_off + 10 * relocs.len();
         let mut data = vec![0u8; 20];
-        data[0..2].copy_from_slice(&COFF_MACHINE_AMD64.to_le_bytes());
+        data[0..2].copy_from_slice(&MACHINE_AMD64.to_le_bytes());
         data[2..4].copy_from_slice(&section_count.to_le_bytes());
         data[8..12].copy_from_slice(&(sym_off as u32).to_le_bytes());
         data[12..16].copy_from_slice(&count.to_le_bytes());
@@ -1176,8 +1063,18 @@ mod coff_weak_selection_tests {
         coff_object(
             &[
                 ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
-                ("dflt", IMAGE_SYM_UNDEFINED, IMAGE_SYM_CLASS_EXTERNAL, 0),
-                ("foo", IMAGE_SYM_UNDEFINED, IMAGE_SYM_CLASS_WEAK_EXTERNAL, 1),
+                (
+                    "dflt",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_EXTERNAL,
+                    0,
+                ),
+                (
+                    "foo",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_WEAK_EXTERNAL,
+                    1,
+                ),
             ],
             relocs,
         )
@@ -1235,22 +1132,5 @@ mod coff_weak_selection_tests {
     #[test]
     fn direct_reference_to_default_selects_it() {
         assert_eq!(selected_members(&caller(&[1, 2]), lib_with(&["dflt"])), [1]);
-    }
-}
-
-#[cfg(test)]
-mod coff_reloc_span_tests {
-    use super::*;
-
-    #[test]
-    fn overflowed_relocation_count_comes_from_first_record() {
-        let mut data = vec![0u8; 64];
-        data[20..24].copy_from_slice(&5u32.to_le_bytes());
-        assert_eq!(
-            coff_reloc_span(&data, 20, u16::MAX, IMAGE_SCN_LNK_NRELOC_OVFL),
-            Some((30, 4))
-        );
-        assert_eq!(coff_reloc_span(&data, 20, 3, 0), Some((20, 3)));
-        assert_eq!(coff_reloc_span(&data, 20, u16::MAX, 0), Some((20, 65535)));
     }
 }
