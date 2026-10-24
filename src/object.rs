@@ -230,8 +230,8 @@ fn collect_coff_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
     while i < sym_count {
         let rec_off = sym_table_off + i * 18;
         let section_number = i16::from_le_bytes([data[rec_off + 12], data[rec_off + 13]]);
-        let storage_class = data[rec_off + 17];
-        let num_aux = data[rec_off + 16] as usize;
+        let storage_class = data[rec_off + 16];
+        let num_aux = data[rec_off + 17] as usize;
 
         if storage_class == IMAGE_SYM_CLASS_EXTERNAL {
             let name = coff_symbol_name(&data[rec_off..rec_off + 8], strtab);
@@ -731,13 +731,13 @@ mod tests {
         let s0 = 20usize;
         data[s0..s0 + 4].copy_from_slice(b"_foo");
         data[s0 + 12..s0 + 14].copy_from_slice(&1i16.to_le_bytes());
-        data[s0 + 17] = IMAGE_SYM_CLASS_EXTERNAL;
+        data[s0 + 16] = IMAGE_SYM_CLASS_EXTERNAL;
 
         let s1 = 20 + 18;
         data[s1..s1 + 4].copy_from_slice(&[0, 0, 0, 0]);
         data[s1 + 4..s1 + 8].copy_from_slice(&4u32.to_le_bytes());
         data[s1 + 12..s1 + 14].copy_from_slice(&0i16.to_le_bytes());
-        data[s1 + 17] = IMAGE_SYM_CLASS_EXTERNAL;
+        data[s1 + 16] = IMAGE_SYM_CLASS_EXTERNAL;
 
         let st_off = 20 + (sym_count as usize) * 18;
         data[st_off..st_off + strtab_size].copy_from_slice(strtab_content);
