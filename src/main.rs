@@ -417,9 +417,29 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
         let data = std::fs::read(first).ok()?;
         let is_coff = object::is_coff_object(&data);
         if is_coff {
+            let mut objects = Vec::with_capacity(args.input_files.len());
+            objects.push(data);
+            for path in &args.input_files[1..] {
+                let data = match std::fs::read(path) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        eprintln!("weld: {}: {error}", path.display());
+                        return Some(1);
+                    }
+                };
+                if !object::is_coff_object(&data) {
+                    eprintln!(
+                        "weld: {} is not a COFF object; mixing COFF and other inputs is not supported",
+                        path.display()
+                    );
+                    return Some(1);
+                }
+                objects.push(data);
+            }
+            let refs: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
             let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
             let mut image = Vec::new();
-            if let Err(error) = emit::pe::link_and_emit_pe_from_coff(&data, &mut image) {
+            if let Err(error) = emit::pe::link_and_emit_pe_from_coffs(&refs, &mut image) {
                 eprintln!("weld: {error}");
                 return Some(1);
             }

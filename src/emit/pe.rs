@@ -448,6 +448,11 @@ const IMAGE_REL_AMD64_REL32_5: u16 = 0x0009;
 const IMAGE_SYM_UNDEFINED_SECTION: i16 = 0;
 const IMAGE_SYM_ABSOLUTE_SECTION: i16 = -1;
 const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
+const IMAGE_SYM_CLASS_STATIC: u8 = 3;
+const IMAGE_SCN_LNK_COMDAT: u32 = 0x0000_1000;
+const IMAGE_COMDAT_SELECT_NODUPLICATES: u8 = 1;
+const IMAGE_COMDAT_SELECT_ANY: u8 = 2;
+const IMAGE_COMDAT_SELECT_ASSOCIATIVE: u8 = 5;
 const IMAGE_SCN_LNK_INFO: u32 = 0x0000_0200;
 const IMAGE_SCN_LNK_REMOVE: u32 = 0x0000_0800;
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
@@ -473,7 +478,14 @@ enum CoffRegion {
     Writable = 2,
 }
 
+#[derive(Clone, Copy)]
+struct CoffComdat {
+    selection: u8,
+    assoc: usize,
+}
+
 struct CoffSection<'a> {
+    object: usize,
     name: String,
     region: CoffRegion,
     align: usize,
@@ -481,6 +493,14 @@ struct CoffSection<'a> {
     raw: &'a [u8],
     relocs: Vec<(u32, u32, u16)>,
     offset: usize,
+    comdat: Option<CoffComdat>,
+    keep: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CoffDef {
+    Section { index: usize, value: u32 },
+    Absolute(u32),
 }
 
 fn coff_error(message: String) -> std::io::Error {
@@ -549,12 +569,19 @@ fn coff_symbol_name(name_bytes: &[u8; 8], strtab: &[u8]) -> String {
     String::from_utf8_lossy(&name_bytes[..end]).into_owned()
 }
 
-/// Link a single COFF object file and emit a PE32+ executable directly.
-///
-/// Code sections go to `.text`, read-only data to `.rdata`, writable and
-/// uninitialized data to `.data`. Undefined externals get `jmp [iat]` thunks.
-pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<()> {
-    let truncated = || coff_error("truncated COFF object".to_string());
+fn coff_duplicate_symbol(name: &str, first: usize, second: usize) -> std::io::Error {
+    coff_error(format!(
+        "duplicate symbol {name} defined in object {first} and object {second}"
+    ))
+}
+
+/// Parse one COFF object. Sections that are not linked are `None`, so the
+/// index of an entry is its section number minus one.
+fn parse_coff_object(
+    object: usize,
+    coff: &[u8],
+) -> Result<(Vec<CoffSymbol>, Vec<Option<CoffSection<'_>>>)> {
+    let truncated = || coff_error(format!("truncated COFF object {object}"));
     let n_sections = coff_read_u16(coff, 2).ok_or_else(truncated)? as usize;
     let opt_size = coff_read_u16(coff, 16).ok_or_else(truncated)? as usize;
     let sym_table_off = coff_read_u32(coff, 8).ok_or_else(truncated)? as usize;
@@ -566,6 +593,7 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
 
     // Indexed by raw table index; auxiliary records get empty names.
     let mut syms: Vec<CoffSymbol> = Vec::with_capacity(n_syms);
+    let mut section_aux: HashMap<usize, (u8, usize)> = HashMap::default();
     let mut i = 0;
     while i < n_syms {
         let rec = sym_table_off + i * SIZEOF_COFF_SYMBOL;
@@ -574,9 +602,18 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
         };
         let name_bytes: &[u8; 8] = r[..8].try_into().unwrap_or(&[0u8; 8]);
         let num_aux = r[17] as usize;
+        let section = i16::from_le_bytes([r[12], r[13]]);
+        if r[16] == IMAGE_SYM_CLASS_STATIC && section > 0 && num_aux > 0 {
+            let aux_at = rec + SIZEOF_COFF_SYMBOL;
+            if let (Some(&selection), Some(number)) =
+                (coff.get(aux_at + 14), coff_read_u16(coff, aux_at + 12))
+            {
+                section_aux.insert(section as usize, (selection, number as usize));
+            }
+        }
         syms.push(CoffSymbol {
             name: coff_symbol_name(name_bytes, strtab),
-            section: i16::from_le_bytes([r[12], r[13]]),
+            section,
             value: u32::from_le_bytes([r[8], r[9], r[10], r[11]]),
             class: r[16],
         });
@@ -591,12 +628,12 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
         i += 1 + num_aux;
     }
 
-    let mut sections: Vec<CoffSection> = Vec::new();
-    let mut slot_of_number: HashMap<usize, usize> = HashMap::default();
+    let mut sections: Vec<Option<CoffSection>> = Vec::with_capacity(n_sections);
     for s in 0..n_sections {
         let sh = 20 + opt_size + s * SIZEOF_COFF_SECTION_HEADER;
         let flags = coff_read_u32(coff, sh + 36).ok_or_else(truncated)?;
         if flags & (IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE | IMAGE_SCN_MEM_DISCARDABLE) != 0 {
+            sections.push(None);
             continue;
         }
         let raw_size = coff_read_u32(coff, sh + 16).ok_or_else(truncated)? as usize;
@@ -637,8 +674,15 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
             ));
         }
 
-        slot_of_number.insert(s + 1, sections.len());
-        sections.push(CoffSection {
+        let comdat = (flags & IMAGE_SCN_LNK_COMDAT != 0).then(|| {
+            let (selection, assoc) = section_aux
+                .get(&(s + 1))
+                .copied()
+                .unwrap_or((IMAGE_COMDAT_SELECT_ANY, 0));
+            CoffComdat { selection, assoc }
+        });
+        sections.push(Some(CoffSection {
+            object,
             name,
             region,
             align: coff_section_align(flags),
@@ -646,43 +690,163 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
             raw,
             relocs,
             offset: 0,
-        });
+            comdat,
+            keep: true,
+        }));
+    }
+    Ok((syms, sections))
+}
+
+/// Link COFF objects and emit a PE32+ executable directly.
+///
+/// Code sections go to `.text`, read-only data to `.rdata`, writable and
+/// uninitialized data to `.data`. Undefined externals get `jmp [iat]` thunks.
+pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> Result<()> {
+    let mut syms_of: Vec<Vec<CoffSymbol>> = Vec::with_capacity(objects.len());
+    let mut slot_of: Vec<Vec<Option<usize>>> = Vec::with_capacity(objects.len());
+    let mut sections: Vec<CoffSection> = Vec::new();
+    for (oi, coff) in objects.iter().enumerate() {
+        let (syms, parsed) = parse_coff_object(oi, coff)?;
+        let mut slots = Vec::with_capacity(parsed.len());
+        for sec in parsed {
+            slots.push(sec.map(|s| {
+                sections.push(s);
+                sections.len() - 1
+            }));
+        }
+        syms_of.push(syms);
+        slot_of.push(slots);
     }
 
+    let mut comdat_key: Vec<Option<&str>> = vec![None; sections.len()];
+    for (oi, syms) in syms_of.iter().enumerate() {
+        for s in syms {
+            if s.class != IMAGE_SYM_CLASS_EXTERNAL || s.section <= 0 {
+                continue;
+            }
+            let Some(Some(k)) = slot_of[oi].get(s.section as usize - 1) else {
+                continue;
+            };
+            if sections[*k].comdat.is_some() && comdat_key[*k].is_none() {
+                comdat_key[*k] = Some(s.name.as_str());
+            }
+        }
+    }
+    let mut comdat_owner: HashMap<&str, usize> = HashMap::default();
+    for k in 0..sections.len() {
+        let (Some(comdat), Some(key)) = (sections[k].comdat, comdat_key[k]) else {
+            continue;
+        };
+        if comdat.selection == IMAGE_COMDAT_SELECT_ASSOCIATIVE {
+            continue;
+        }
+        match comdat_owner.get(key).copied() {
+            None => {
+                comdat_owner.insert(key, k);
+            }
+            Some(first) => {
+                if comdat.selection == IMAGE_COMDAT_SELECT_NODUPLICATES {
+                    return Err(coff_duplicate_symbol(
+                        key,
+                        sections[first].object,
+                        sections[k].object,
+                    ));
+                }
+                sections[k].keep = false;
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for k in 0..sections.len() {
+            let Some(CoffComdat {
+                selection: IMAGE_COMDAT_SELECT_ASSOCIATIVE,
+                assoc,
+            }) = sections[k].comdat
+            else {
+                continue;
+            };
+            let target_kept = slot_of[sections[k].object]
+                .get(assoc.wrapping_sub(1))
+                .copied()
+                .flatten()
+                .is_some_and(|t| sections[t].keep);
+            if sections[k].keep && !target_kept {
+                sections[k].keep = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut defs: HashMap<&str, (CoffDef, usize)> = HashMap::default();
+    for (oi, syms) in syms_of.iter().enumerate() {
+        for s in syms {
+            if s.class != IMAGE_SYM_CLASS_EXTERNAL || s.name.is_empty() {
+                continue;
+            }
+            let def = if s.section > 0 {
+                match slot_of[oi].get(s.section as usize - 1).copied().flatten() {
+                    Some(k) if sections[k].keep => CoffDef::Section {
+                        index: k,
+                        value: s.value,
+                    },
+                    _ => continue,
+                }
+            } else if s.section == IMAGE_SYM_ABSOLUTE_SECTION {
+                CoffDef::Absolute(s.value)
+            } else {
+                continue;
+            };
+            if let Some(&(_, first)) = defs.get(s.name.as_str()) {
+                return Err(coff_duplicate_symbol(&s.name, first, oi));
+            }
+            defs.insert(s.name.as_str(), (def, oi));
+        }
+    }
+
+    let mut undefined: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::default();
+    for syms in &syms_of {
+        for s in syms {
+            if s.section != IMAGE_SYM_UNDEFINED_SECTION
+                || s.class != IMAGE_SYM_CLASS_EXTERNAL
+                || s.name.is_empty()
+                || defs.contains_key(s.name.as_str())
+            {
+                continue;
+            }
+            if s.value != 0 {
+                return Err(coff_error(format!(
+                    "common symbol {} is not supported",
+                    s.name
+                )));
+            }
+            if s.name == CRT_MAIN_SYMBOL {
+                return Err(coff_error(format!(
+                    "undefined {CRT_MAIN_SYMBOL}: it runs global constructors from libgcc and weld \
+                     cannot supply it; link a runtime that defines it"
+                )));
+            }
+            if seen.insert(s.name.as_str()) {
+                undefined.push(s.name.as_str());
+            }
+        }
+    }
+    let thunk_index: HashMap<&str, usize> =
+        undefined.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+
     let mut region_len = [0usize; 3];
-    for sec in &mut sections {
+    for sec in sections.iter_mut().filter(|sec| sec.keep) {
         let r = sec.region as usize;
         region_len[r] = align_up_usize(region_len[r], sec.align);
         sec.offset = region_len[r];
         region_len[r] += sec.size;
     }
 
-    let is_undefined_external = |s: &CoffSymbol| {
-        s.section == IMAGE_SYM_UNDEFINED_SECTION
-            && s.class == IMAGE_SYM_CLASS_EXTERNAL
-            && !s.name.is_empty()
-    };
-    if syms
-        .iter()
-        .any(|s| is_undefined_external(s) && s.name == CRT_MAIN_SYMBOL)
-    {
-        return Err(coff_error(format!(
-            "undefined {CRT_MAIN_SYMBOL}: it runs global constructors from libgcc and weld \
-             cannot supply it; link a runtime that defines it"
-        )));
-    }
     let needs_main_stub = false;
-    let undefined: Vec<&str> = {
-        let mut seen: HashSet<&str> = HashSet::default();
-        syms.iter()
-            .filter(|s| is_undefined_external(s) && s.name != CRT_MAIN_SYMBOL)
-            .filter(|s| seen.insert(s.name.as_str()))
-            .map(|s| s.name.as_str())
-            .collect()
-    };
-    let thunk_index: HashMap<&str, usize> =
-        undefined.iter().enumerate().map(|(i, n)| (*n, i)).collect();
-
     let thunks_off = region_len[CoffRegion::Text as usize];
     let stub_off = thunks_off + undefined.len() * 6;
     let text_size = stub_off + usize::from(needs_main_stub);
@@ -795,7 +959,10 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
     ];
     let mut blob = vec![0u8; region_base[last_region] + region_size[last_region]];
 
-    for sec in sections.iter().filter(|sec| !sec.raw.is_empty()) {
+    for sec in sections
+        .iter()
+        .filter(|sec| sec.keep && !sec.raw.is_empty())
+    {
         let at = region_base[sec.region as usize] + sec.offset;
         blob[at..at + sec.raw.len()].copy_from_slice(sec.raw);
     }
@@ -817,24 +984,35 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
     }
 
     let sec_rva = |sec: &CoffSection| region_rva[sec.region as usize] + sec.offset as u32;
-    let resolve = |sym_idx: usize, allow_thunk: bool, owner: &str| -> Result<i64> {
-        let sym = syms
+    let def_va = |def: CoffDef| -> i64 {
+        match def {
+            CoffDef::Section { index, value } => {
+                IMAGE_BASE as i64 + i64::from(sec_rva(&sections[index])) + i64::from(value)
+            }
+            CoffDef::Absolute(v) => i64::from(v),
+        }
+    };
+    let resolve = |oi: usize, sym_idx: usize, allow_thunk: bool, owner: &str| -> Result<i64> {
+        let sym = syms_of[oi]
             .get(sym_idx)
             .ok_or_else(|| coff_error(format!("{owner} names missing symbol index {sym_idx}")))?;
         if sym.section > 0 {
-            let k = slot_of_number.get(&(sym.section as usize)).ok_or_else(|| {
-                coff_error(format!("{} is in a section that is not linked", sym.name))
-            })?;
-            return Ok(IMAGE_BASE as i64
-                + i64::from(sec_rva(&sections[*k]))
-                + i64::from(sym.value));
-        }
-        if sym.section == IMAGE_SYM_ABSOLUTE_SECTION {
+            if let Some(k) = slot_of[oi]
+                .get(sym.section as usize - 1)
+                .copied()
+                .flatten()
+                .filter(|&k| sections[k].keep)
+            {
+                return Ok(IMAGE_BASE as i64
+                    + i64::from(sec_rva(&sections[k]))
+                    + i64::from(sym.value));
+            }
+        } else if sym.section == IMAGE_SYM_ABSOLUTE_SECTION {
             return Ok(i64::from(sym.value));
         }
-        if is_undefined_external(sym) {
-            if sym.name == CRT_MAIN_SYMBOL {
-                return Ok(IMAGE_BASE as i64 + i64::from(text_rva) + stub_off as i64);
+        if sym.class == IMAGE_SYM_CLASS_EXTERNAL {
+            if let Some(&(def, _)) = defs.get(sym.name.as_str()) {
+                return Ok(def_va(def));
             }
             if allow_thunk && let Some(&i) = thunk_index.get(sym.name.as_str()) {
                 return Ok(thunk_va(i) as i64);
@@ -846,7 +1024,7 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
         )))
     };
 
-    for sec in &sections {
+    for sec in sections.iter().filter(|sec| sec.keep) {
         let base = region_base[sec.region as usize] + sec.offset;
         for &(vaddr, sym_idx, rel_type) in &sec.relocs {
             if rel_type == IMAGE_REL_AMD64_ABSOLUTE {
@@ -867,9 +1045,10 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
                 blob[at + 2],
                 blob[at + 3],
             ]));
+            let object = sec.object;
             let bytes: [u8; 4] = match rel_type {
                 IMAGE_REL_AMD64_REL32..=IMAGE_REL_AMD64_REL32_5 => {
-                    let target = resolve(sym_idx as usize, true, &sec.name)?;
+                    let target = resolve(object, sym_idx as usize, true, &sec.name)?;
                     let trailing = i64::from(rel_type - IMAGE_REL_AMD64_REL32);
                     let v = target + addend - (p_va + 4 + trailing);
                     i32::try_from(v)
@@ -877,7 +1056,7 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
                         .to_le_bytes()
                 }
                 IMAGE_REL_AMD64_ADDR32NB => {
-                    let target = resolve(sym_idx as usize, false, &sec.name)?;
+                    let target = resolve(object, sym_idx as usize, false, &sec.name)?;
                     let v = target - IMAGE_BASE as i64 + addend;
                     u32::try_from(v)
                         .map_err(|_| coff_error(format!("ADDR32NB out of range in {}", sec.name)))?
@@ -894,11 +1073,13 @@ pub fn link_and_emit_pe_from_coff(coff: &[u8], out: &mut impl Write) -> Result<(
         }
     }
 
-    let entry_va = match syms
-        .iter()
-        .position(|s| s.section > 0 && (s.name == "main" || s.name == "_main"))
-    {
-        Some(i) => resolve(i, false, "entry point")? as u64,
+    let entry_sym = syms_of.iter().enumerate().find_map(|(oi, syms)| {
+        syms.iter()
+            .position(|s| s.section > 0 && (s.name == "main" || s.name == "_main"))
+            .map(|i| (oi, i))
+    });
+    let entry_va = match entry_sym {
+        Some((oi, i)) => resolve(oi, i, false, "entry point")? as u64,
         None => IMAGE_BASE + text_rva as u64,
     };
 
@@ -1170,61 +1351,202 @@ mod tests {
         );
     }
 
-    fn coff_test_section(
-        o: &mut Vec<u8>,
-        name: &[u8; 8],
-        size: u32,
-        ptr: u32,
-        relocs: (u32, u16),
+    struct TestSection<'a> {
+        name: &'a str,
         flags: u32,
-    ) {
-        o.extend_from_slice(name);
-        o.extend_from_slice(&0u32.to_le_bytes());
-        o.extend_from_slice(&0u32.to_le_bytes());
-        o.extend_from_slice(&size.to_le_bytes());
-        o.extend_from_slice(&ptr.to_le_bytes());
-        o.extend_from_slice(&relocs.0.to_le_bytes());
-        o.extend_from_slice(&0u32.to_le_bytes());
-        o.extend_from_slice(&relocs.1.to_le_bytes());
-        o.extend_from_slice(&0u16.to_le_bytes());
-        o.extend_from_slice(&flags.to_le_bytes());
+        data: &'a [u8],
+        relocs: &'a [(u32, u32, u16)],
+        selection: u8,
+        assoc: u16,
     }
 
-    fn coff_test_symbol(o: &mut Vec<u8>, name: &[u8; 8], section: i16, class: u8) {
-        o.extend_from_slice(name);
+    fn push_test_name(o: &mut Vec<u8>, name: &str) {
+        let mut bytes = [0u8; 8];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        o.extend_from_slice(&bytes);
+    }
+
+    /// Builds a COFF object. Each section gets a section symbol with one
+    /// auxiliary record; `symbols` follow them, so the first of them has
+    /// index `2 * sections.len()`.
+    fn coff_object(sections: &[TestSection], symbols: &[(&str, i16, u8, u32)]) -> Vec<u8> {
+        let n = sections.len();
+        let mut at = 20 + n * SIZEOF_COFF_SECTION_HEADER;
+        let mut raw_ptrs = Vec::new();
+        for s in sections {
+            raw_ptrs.push(at);
+            at += s.data.len();
+        }
+        let mut reloc_ptrs = Vec::new();
+        for s in sections {
+            reloc_ptrs.push(at);
+            at += s.relocs.len() * SIZEOF_COFF_RELOC;
+        }
+        let mut o = Vec::new();
+        o.extend_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        o.extend_from_slice(&(n as u16).to_le_bytes());
         o.extend_from_slice(&0u32.to_le_bytes());
-        o.extend_from_slice(&section.to_le_bytes());
+        o.extend_from_slice(&(at as u32).to_le_bytes());
+        o.extend_from_slice(&((2 * n + symbols.len()) as u32).to_le_bytes());
         o.extend_from_slice(&0u16.to_le_bytes());
-        o.push(class);
-        o.push(0);
+        o.extend_from_slice(&0u16.to_le_bytes());
+        for (i, s) in sections.iter().enumerate() {
+            push_test_name(&mut o, s.name);
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o.extend_from_slice(&(s.data.len() as u32).to_le_bytes());
+            o.extend_from_slice(&(raw_ptrs[i] as u32).to_le_bytes());
+            o.extend_from_slice(&(reloc_ptrs[i] as u32).to_le_bytes());
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o.extend_from_slice(&(s.relocs.len() as u16).to_le_bytes());
+            o.extend_from_slice(&0u16.to_le_bytes());
+            o.extend_from_slice(&s.flags.to_le_bytes());
+        }
+        for s in sections {
+            o.extend_from_slice(s.data);
+        }
+        for s in sections {
+            for &(vaddr, sym, rel_type) in s.relocs {
+                o.extend_from_slice(&vaddr.to_le_bytes());
+                o.extend_from_slice(&sym.to_le_bytes());
+                o.extend_from_slice(&rel_type.to_le_bytes());
+            }
+        }
+        for (i, s) in sections.iter().enumerate() {
+            push_test_name(&mut o, s.name);
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o.extend_from_slice(&((i + 1) as i16).to_le_bytes());
+            o.extend_from_slice(&0u16.to_le_bytes());
+            o.push(IMAGE_SYM_CLASS_STATIC);
+            o.push(1);
+            o.extend_from_slice(&(s.data.len() as u32).to_le_bytes());
+            o.extend_from_slice(&(s.relocs.len() as u16).to_le_bytes());
+            o.extend_from_slice(&0u16.to_le_bytes());
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o.extend_from_slice(&s.assoc.to_le_bytes());
+            o.push(s.selection);
+            o.extend_from_slice(&[0u8; 3]);
+        }
+        for &(name, section, class, value) in symbols {
+            push_test_name(&mut o, name);
+            o.extend_from_slice(&value.to_le_bytes());
+            o.extend_from_slice(&section.to_le_bytes());
+            o.extend_from_slice(&0u16.to_le_bytes());
+            o.push(class);
+            o.push(0);
+        }
+        o.extend_from_slice(&4u32.to_le_bytes());
+        o
+    }
+
+    fn pe_section_vsize(out: &[u8], index: usize) -> u32 {
+        let e_lfanew = u32::from_le_bytes(out[0x3C..0x40].try_into().unwrap()) as usize;
+        let at = e_lfanew
+            + 4
+            + SIZEOF_COFF_HEADER
+            + SIZEOF_OPTIONAL_HEADER as usize
+            + index * SIZEOF_SECTION_HEADER;
+        u32::from_le_bytes(out[at + 8..at + 12].try_into().unwrap())
+    }
+
+    const TEXT_FLAGS: u32 = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    const COMDAT_TEXT_FLAGS: u32 = TEXT_FLAGS | IMAGE_SCN_LNK_COMDAT;
+
+    fn text_section<'a>(data: &'a [u8], relocs: &'a [(u32, u32, u16)]) -> TestSection<'a> {
+        TestSection {
+            name: ".text",
+            flags: TEXT_FLAGS,
+            data,
+            relocs,
+            selection: 0,
+            assoc: 0,
+        }
     }
 
     #[test]
     fn test_coff_relocation_into_rdata_resolves() {
-        let mut coff = Vec::new();
-        coff.extend_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
-        coff.extend_from_slice(&2u16.to_le_bytes());
-        coff.extend_from_slice(&0u32.to_le_bytes());
-        coff.extend_from_slice(&122u32.to_le_bytes());
-        coff.extend_from_slice(&2u32.to_le_bytes());
-        coff.extend_from_slice(&0u16.to_le_bytes());
-        coff.extend_from_slice(&0u16.to_le_bytes());
-        coff_test_section(&mut coff, b".text\0\0\0", 8, 100, (108, 1), 0x6000_0020);
-        coff_test_section(&mut coff, b".rdata\0\0", 4, 118, (0, 0), 0x4000_0040);
-        coff.extend_from_slice(&[0x48, 0x8D, 0x0D, 0, 0, 0, 0, 0xC3]);
-        coff.extend_from_slice(&3u32.to_le_bytes());
-        coff.extend_from_slice(&1u32.to_le_bytes());
-        coff.extend_from_slice(&IMAGE_REL_AMD64_REL32.to_le_bytes());
-        coff.extend_from_slice(b"hi\0\0");
-        coff_test_symbol(&mut coff, b"main\0\0\0\0", 1, IMAGE_SYM_CLASS_EXTERNAL);
-        coff_test_symbol(&mut coff, b".rdata\0\0", 2, 3);
-        coff.extend_from_slice(&4u32.to_le_bytes());
+        let text = [0x48, 0x8D, 0x0D, 0, 0, 0, 0, 0xC3];
+        let relocs = [(3, 2, IMAGE_REL_AMD64_REL32)];
+        let coff = coff_object(
+            &[
+                text_section(&text, &relocs),
+                TestSection {
+                    name: ".rdata",
+                    flags: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+                    data: b"hi\0\0",
+                    relocs: &[],
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
 
         let mut out = Vec::new();
-        link_and_emit_pe_from_coff(&coff, &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[coff.as_slice()], &mut out).expect("links");
         let disp_at = 512 + 3;
         let disp = i32::from_le_bytes(out[disp_at..disp_at + 4].try_into().unwrap());
         assert_eq!(disp, 0x2000 - 0x1007);
         assert_eq!(&out[1024..1027], b"hi\0");
+    }
+
+    #[test]
+    fn test_coff_objects_link_across_each_other() {
+        let call = [0xE8, 0, 0, 0, 0, 0xC3];
+        let call_relocs = [(1, 3, IMAGE_REL_AMD64_REL32)];
+        let caller = coff_object(
+            &[text_section(&call, &call_relocs)],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                (
+                    "helper",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_EXTERNAL,
+                    0,
+                ),
+            ],
+        );
+        let body = [0xC3, 0xC3, 0x90, 0xC3];
+        let callee = coff_object(
+            &[text_section(&body, &[])],
+            &[("helper", 1, IMAGE_SYM_CLASS_EXTERNAL, 2)],
+        );
+
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], &mut out)
+            .expect("links");
+        let disp = i32::from_le_bytes(out[512 + 1..512 + 5].try_into().unwrap());
+        assert_eq!(disp, 3);
+    }
+
+    #[test]
+    fn test_coff_duplicate_strong_definition_is_error() {
+        let body = [0xC3];
+        let obj = coff_object(
+            &[text_section(&body, &[])],
+            &[("dup", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        let result = link_and_emit_pe_from_coffs(&[obj.as_slice(), obj.as_slice()], &mut out);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_coff_comdat_is_linked_once() {
+        let body = [0xC3; 4];
+        let obj = coff_object(
+            &[TestSection {
+                name: ".text",
+                flags: COMDAT_TEXT_FLAGS,
+                data: &body,
+                relocs: &[],
+                selection: IMAGE_COMDAT_SELECT_ANY,
+                assoc: 0,
+            }],
+            &[("inl", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice(), obj.as_slice()], &mut out).expect("links");
+        assert_eq!(pe_section_vsize(&out, 0), 4);
     }
 }
