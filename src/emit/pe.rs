@@ -452,6 +452,8 @@ const OPCODE_JMP_REL32: u8 = 0xE9;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
 const BASE_RELOC_PAGE: u32 = 0x1000;
 const DATA_DIR_BASE_RELOC: usize = 5;
+const DATA_DIR_EXCEPTION: usize = 3;
+const PDATA_RECORD_SIZE: usize = 12;
 const IMAGE_REL_AMD64_REL32_5: u16 = 0x0009;
 const IMAGE_SYM_UNDEFINED_SECTION: i16 = 0;
 const IMAGE_SYM_ABSOLUTE_SECTION: i16 = -1;
@@ -487,6 +489,7 @@ enum CoffRegion {
     Text = 0,
     ReadOnly = 1,
     Writable = 2,
+    Pdata = 3,
 }
 
 #[derive(Clone, Copy)]
@@ -687,7 +690,9 @@ fn parse_coff_object(
             .to_string();
 
         let uninitialized = flags & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0;
-        let region = if flags & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 {
+        let region = if name == ".pdata" || name.starts_with(".pdata$") {
+            CoffRegion::Pdata
+        } else if flags & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 {
             CoffRegion::Text
         } else if uninitialized || flags & IMAGE_SCN_MEM_WRITE != 0 {
             CoffRegion::Writable
@@ -894,10 +899,22 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
     let thunk_index: HashMap<&str, usize> =
         undefined.iter().enumerate().map(|(i, n)| (*n, i)).collect();
 
-    let mut region_len = [0usize; 3];
+    let mut region_len = [0usize; 4];
     for sec in sections.iter_mut().filter(|sec| sec.keep) {
         let r = sec.region as usize;
-        region_len[r] = align_up_usize(region_len[r], sec.align);
+        let align = match sec.region {
+            CoffRegion::Pdata => {
+                if sec.size % PDATA_RECORD_SIZE != 0 {
+                    return Err(coff_error(format!(
+                        "{} in object {} is not a whole number of exception records",
+                        sec.name, sec.object
+                    )));
+                }
+                1
+            }
+            _ => sec.align,
+        };
+        region_len[r] = align_up_usize(region_len[r], align);
         sec.offset = region_len[r];
         region_len[r] += sec.size;
     }
@@ -908,6 +925,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
     let text_size = stub_off + usize::from(needs_main_stub);
 
     let has_data = region_len[CoffRegion::Writable as usize] > 0;
+    let has_pdata = region_len[CoffRegion::Pdata as usize] > 0;
     let has_base_relocs = sections.iter().any(|sec| {
         sec.keep
             && sec
@@ -915,7 +933,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                 .iter()
                 .any(|&(_, _, t)| t == IMAGE_REL_AMD64_ADDR64 || t == IMAGE_REL_AMD64_ADDR32)
     });
-    let n_regions = if has_data { 3 } else { 2 };
+    let n_regions = 2 + usize::from(has_data) + usize::from(has_pdata);
     let n_out_sections = n_regions + usize::from(has_base_relocs);
     let headers_raw: usize = SIZEOF_DOS_STUB
         + SIZEOF_PE_SIGNATURE
@@ -1009,19 +1027,25 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
 
     let rdata_len = rdata_import_off + import_bytes.len();
     let data_rva = rdata_rva + align_up(rdata_len as u64, SECTION_ALIGN) as u32;
-    let region_rva = [text_rva, rdata_rva, data_rva];
+    let pdata_rva = data_rva
+        + align_up(
+            region_len[CoffRegion::Writable as usize] as u64,
+            SECTION_ALIGN,
+        ) as u32;
+    let region_rva = [text_rva, rdata_rva, data_rva, pdata_rva];
     let region_size = [
         text_size,
         rdata_len,
         region_len[CoffRegion::Writable as usize],
+        region_len[CoffRegion::Pdata as usize],
     ];
-    let last_region = if has_data { 2 } else { 1 };
     let region_base = [
         0usize,
         (rdata_rva - text_rva) as usize,
         (data_rva - text_rva) as usize,
+        (pdata_rva - text_rva) as usize,
     ];
-    let mut blob = vec![0u8; region_base[last_region] + region_size[last_region]];
+    let mut blob = vec![0u8; region_base[3] + region_size[3]];
 
     for sec in sections
         .iter()
@@ -1183,6 +1207,17 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         }
     }
 
+    if has_pdata {
+        let at = region_base[3];
+        let (chunks, _) = blob[at..at + region_size[3]].as_chunks::<PDATA_RECORD_SIZE>();
+        let mut records: Vec<[u8; PDATA_RECORD_SIZE]> = chunks.to_vec();
+        records.sort_by_key(|rec| u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]));
+        for (i, rec) in records.iter().enumerate() {
+            let off = at + i * PDATA_RECORD_SIZE;
+            blob[off..off + PDATA_RECORD_SIZE].copy_from_slice(rec);
+        }
+    }
+
     let entry_sym = syms_of.iter().enumerate().find_map(|(oi, syms)| {
         syms.iter()
             .position(|s| s.section > 0 && (s.name == "main" || s.name == "_main"))
@@ -1205,6 +1240,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
         ),
     ];
+    let mut sec_rvas: Vec<u32> = vec![text_rva, rdata_rva];
     if has_data {
         let at = region_base[2];
         pe_sections.push(PeSection::new(
@@ -1212,17 +1248,23 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
             blob[at..at + region_size[2]].to_vec(),
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
         ));
+        sec_rvas.push(data_rva);
     }
-    let regions_end = if has_data {
-        data_rva as u64
-            + align_up(
-                region_len[CoffRegion::Writable as usize] as u64,
-                SECTION_ALIGN,
-            )
+    if has_pdata {
+        let at = region_base[3];
+        pe_sections.push(PeSection::new(
+            ".pdata",
+            blob[at..at + region_size[3]].to_vec(),
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+        ));
+        sec_rvas.push(pdata_rva);
+    }
+    let pdata_dir = if has_pdata {
+        (pdata_rva, region_size[3] as u32)
     } else {
-        rdata_rva as u64 + align_up(rdata_len as u64, SECTION_ALIGN)
+        (0, 0)
     };
-    let mut sec_rvas: Vec<u32> = region_rva[..n_regions].to_vec();
+    let regions_end = pdata_rva as u64 + align_up(region_size[3] as u64, SECTION_ALIGN);
     let mut image_end = regions_end;
     let mut base_reloc_dir = (0u32, 0u32);
     if !base_relocs.is_empty() {
@@ -1257,6 +1299,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         idt_sz,
         iat_sz,
         base_reloc_dir,
+        pdata_dir,
     )
 }
 
@@ -1274,6 +1317,7 @@ fn emit_pe_raw(
     idt_size: u32,
     iat_size: u32,
     base_reloc_dir: (u32, u32),
+    pdata_dir: (u32, u32),
 ) -> Result<()> {
     let mut dos = [0u8; SIZEOF_DOS_STUB];
     dos[0] = b'M';
@@ -1338,6 +1382,8 @@ fn emit_pe_raw(
         112 + DATA_DIR_BASE_RELOC * 8 + 4,
         base_reloc_dir.1,
     );
+    write_u32_at_off(&mut opt, 112 + DATA_DIR_EXCEPTION * 8, pdata_dir.0);
+    write_u32_at_off(&mut opt, 112 + DATA_DIR_EXCEPTION * 8 + 4, pdata_dir.1);
     out.write_all(&opt)?;
 
     for (i, sec) in sections.iter().enumerate() {
@@ -1695,10 +1741,14 @@ mod tests {
         u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
     }
 
-    fn pe_base_reloc_dir(out: &[u8]) -> (u32, u32) {
+    fn pe_data_dir(out: &[u8], index: usize) -> (u32, u32) {
         let e_lfanew = u32::from_le_bytes(out[0x3C..0x40].try_into().unwrap()) as usize;
-        let dir = e_lfanew + 24 + 112 + DATA_DIR_BASE_RELOC * 8;
+        let dir = e_lfanew + 24 + 112 + index * 8;
         (le_u32(out, dir), le_u32(out, dir + 4))
+    }
+
+    fn pe_base_reloc_dir(out: &[u8]) -> (u32, u32) {
+        pe_data_dir(out, DATA_DIR_BASE_RELOC)
     }
 
     const DATA_FLAGS: u32 =
@@ -1868,6 +1918,84 @@ mod tests {
                     0,
                 ),
             ],
+        );
+        let mut out = Vec::new();
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+    }
+
+    fn pdata_object(
+        text: &[u8],
+        pdata: &[u8],
+        pdata_relocs: &[(u32, u32, u16)],
+        symbols: &[(&str, i16, u8, u32)],
+    ) -> Vec<u8> {
+        coff_object(
+            &[
+                text_section(text, &[]),
+                TestSection {
+                    name: ".pdata",
+                    flags: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+                    data: pdata,
+                    relocs: pdata_relocs,
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            symbols,
+        )
+    }
+
+    #[test]
+    fn test_coff_pdata_is_contiguous_and_sorted() {
+        let record = [0u8; 12];
+        let obj0 = pdata_object(
+            &[0x90; 8],
+            &record,
+            &[(0, 5, IMAGE_REL_AMD64_ADDR32NB)],
+            &[
+                ("f0", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("f1", 0, IMAGE_SYM_CLASS_EXTERNAL, 0),
+            ],
+        );
+        let obj1 = pdata_object(
+            &[0xC3; 8],
+            &record,
+            &[(0, 5, IMAGE_REL_AMD64_ADDR32NB)],
+            &[
+                ("f1", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("f0", 0, IMAGE_SYM_CLASS_EXTERNAL, 0),
+            ],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj0.as_slice(), obj1.as_slice()], &mut out).expect("links");
+
+        let pdata = pe_section_header(&out, 2);
+        let pdata_rva = le_u32(pdata, 12);
+        let pdata_ptr = le_u32(pdata, 20) as usize;
+        assert_eq!(le_u32(&out, pdata_ptr), 0x1000);
+        assert_eq!(le_u32(&out, pdata_ptr + 12), 0x1008);
+        assert_eq!(pe_data_dir(&out, DATA_DIR_EXCEPTION), (pdata_rva, 24));
+    }
+
+    #[test]
+    fn test_coff_without_pdata_has_no_exception_dir() {
+        let text = [0xC3];
+        let obj = coff_object(
+            &[text_section(&text, &[])],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        assert_eq!(pe_data_dir(&out, DATA_DIR_EXCEPTION), (0, 0));
+    }
+
+    #[test]
+    fn test_coff_pdata_size_not_multiple_of_record_is_error() {
+        let obj = pdata_object(
+            &[0xC3],
+            &[0u8; 4],
+            &[],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
         let mut out = Vec::new();
         assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
