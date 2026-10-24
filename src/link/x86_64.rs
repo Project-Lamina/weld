@@ -13,6 +13,14 @@ fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
     buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
 }
 
+fn pc_relative_field(displacement: i64, r_type: u32) -> Result<u32, String> {
+    i32::try_from(displacement)
+        .map(|value| value as u32)
+        .map_err(|_| {
+            format!("relocation type {r_type} displacement {displacement} does not fit in i32")
+        })
+}
+
 /// Apply all x86_64 `SHT_RELA` relocations from `data` into `layout`.
 ///
 /// `symbol_addrs[i]` is the resolved virtual address of ELF symbol index `i`,
@@ -93,7 +101,10 @@ pub fn apply_relocations(
                     let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
                         return Err(format!("undefined symbol index {}", rel.r_sym));
                     };
-                    let val = (*s_addr as i64).wrapping_add(a).wrapping_sub(p) as u32;
+                    let val = pc_relative_field(
+                        (*s_addr as i64).wrapping_add(a).wrapping_sub(p),
+                        rel.r_type,
+                    )?;
                     if merged.data.len() < off + 4 {
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }
@@ -109,7 +120,10 @@ pub fn apply_relocations(
                         .ok_or_else(|| {
                             format!("no GOT entry for symbol index {} (GOTPCREL)", rel.r_sym)
                         })?;
-                    let val = (got_entry_vaddr as i64).wrapping_add(a).wrapping_sub(p) as u32;
+                    let val = pc_relative_field(
+                        (got_entry_vaddr as i64).wrapping_add(a).wrapping_sub(p),
+                        rel.r_type,
+                    )?;
                     if merged.data.len() < off + 4 {
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }
