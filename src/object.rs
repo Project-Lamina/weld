@@ -33,6 +33,7 @@ const COFF_MACHINE_RISCV64: u16 = 0x5064;
 const IMAGE_SYM_UNDEFINED: i16 = 0;
 const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
 const IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
+const IMAGE_SCN_LNK_NRELOC_OVFL: u32 = 0x0100_0000;
 
 #[derive(Default, Clone)]
 struct ObjectSymbolSummary {
@@ -271,9 +272,23 @@ fn collect_coff_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
     Some(summary)
 }
 
-/// Symbol-table indices named by any relocation in the object. Overflowed
-/// relocation counts are not followed, so such an object is read as referencing
-/// only the relocations it lists directly.
+/// Symbol-table indices named by any relocation in the object.
+/// Byte offset and count of a section's relocation records. A section with more than
+/// 0xFFFF relocations sets `count` to 0xFFFF and IMAGE_SCN_LNK_NRELOC_OVFL; the real
+/// count, including the record that holds it, is then the first record's VirtualAddress.
+pub(crate) fn coff_reloc_span(
+    data: &[u8],
+    relocs_ptr: usize,
+    count: u16,
+    flags: u32,
+) -> Option<(usize, usize)> {
+    if count == u16::MAX && flags & IMAGE_SCN_LNK_NRELOC_OVFL != 0 {
+        let total = read_u32_le(data, relocs_ptr)? as usize;
+        return Some((relocs_ptr + 10, total.checked_sub(1)?));
+    }
+    Some((relocs_ptr, count as usize))
+}
+
 fn coff_relocated_symbols(data: &[u8]) -> HashSet<usize> {
     let mut referenced = HashSet::default();
     let Some(n_sections) = data
@@ -287,13 +302,19 @@ fn coff_relocated_symbols(data: &[u8]) -> HashSet<usize> {
         .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize);
     for s in 0..n_sections {
         let sh = 20 + opt_size + s * 40;
-        let (Some(ptr), Some(count)) = (read_u32_le(data, sh + 24), data.get(sh + 32..sh + 34))
-        else {
+        let (Some(ptr), Some(count), Some(flags)) = (
+            read_u32_le(data, sh + 24),
+            data.get(sh + 32..sh + 34),
+            read_u32_le(data, sh + 36),
+        ) else {
             break;
         };
-        let count = u16::from_le_bytes([count[0], count[1]]) as usize;
-        for r in 0..count {
-            let Some(sym) = read_u32_le(data, ptr as usize + r * 10 + 4) else {
+        let count = u16::from_le_bytes([count[0], count[1]]);
+        let Some((first, n)) = coff_reloc_span(data, ptr as usize, count, flags) else {
+            break;
+        };
+        for r in 0..n {
+            let Some(sym) = read_u32_le(data, first + r * 10 + 4) else {
                 break;
             };
             referenced.insert(sym as usize);
@@ -1173,7 +1194,6 @@ mod coff_weak_selection_tests {
                 coff_object(&[(name, 1, IMAGE_SYM_CLASS_EXTERNAL, 0)], &[]),
             ));
         }
-        let members: Vec<(&str, Vec<u8>)> = members.into_iter().map(|(n, b)| (n, b)).collect();
         archive(&members)
     }
 
@@ -1215,5 +1235,22 @@ mod coff_weak_selection_tests {
     #[test]
     fn direct_reference_to_default_selects_it() {
         assert_eq!(selected_members(&caller(&[1, 2]), lib_with(&["dflt"])), [1]);
+    }
+}
+
+#[cfg(test)]
+mod coff_reloc_span_tests {
+    use super::*;
+
+    #[test]
+    fn overflowed_relocation_count_comes_from_first_record() {
+        let mut data = vec![0u8; 64];
+        data[20..24].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(
+            coff_reloc_span(&data, 20, u16::MAX, IMAGE_SCN_LNK_NRELOC_OVFL),
+            Some((30, 4))
+        );
+        assert_eq!(coff_reloc_span(&data, 20, 3, 0), Some((20, 3)));
+        assert_eq!(coff_reloc_span(&data, 20, u16::MAX, 0), Some((20, 65535)));
     }
 }
