@@ -1,11 +1,14 @@
 //! PE32+ (64-bit Windows) executable emission.
 
+use crate::coff::{
+    self, IMAGE_SCN_LNK_COMDAT, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SYM_ABSOLUTE_SECTION,
+    IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_WEAK_EXTERNAL, IMAGE_SYM_UNDEFINED_SECTION,
+    MACHINE_AMD64,
+};
 use crate::collections::{HashMap, HashSet};
 use crate::link::{DynamicLinkInfo, MergedLayout};
-use crate::object::coff_reloc_span;
 use std::io::{Result, Write};
 
-const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 const IMAGE_FILE_LARGE_ADDRESS_AWARE: u16 = 0x0020;
 const IMAGE_OPTIONAL_HDR64_MAGIC: u16 = 0x020B;
@@ -302,7 +305,7 @@ pub fn emit_pe_executable(
     out.write_all(b"PE\0\0")?;
 
     let mut coff = [0u8; SIZEOF_COFF_HEADER];
-    write_u16(&mut coff, 0, IMAGE_FILE_MACHINE_AMD64);
+    write_u16(&mut coff, 0, MACHINE_AMD64);
     write_u16(&mut coff, 2, num_sections);
     write_u16(&mut coff, 16, SIZEOF_OPTIONAL_HEADER);
     write_u16(
@@ -455,42 +458,16 @@ const DATA_DIR_BASE_RELOC: usize = 5;
 const DATA_DIR_EXCEPTION: usize = 3;
 const PDATA_RECORD_SIZE: usize = 12;
 const IMAGE_REL_AMD64_REL32_5: u16 = 0x0009;
-const IMAGE_SYM_UNDEFINED_SECTION: i16 = 0;
-const IMAGE_SYM_ABSOLUTE_SECTION: i16 = -1;
-const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
-/// Auxiliary record TagIndex names the default symbol used when the weak name
-/// has no strong definition anywhere in the link.
-const IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
 const IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
 const IMPORT_SYMBOL_PREFIX: &str = "__imp_";
-const IMAGE_SYM_CLASS_STATIC: u8 = 3;
-const IMAGE_SCN_LNK_COMDAT: u32 = 0x0000_1000;
 const IMAGE_COMDAT_SELECT_NODUPLICATES: u8 = 1;
 const IMAGE_COMDAT_SELECT_ANY: u8 = 2;
 const IMAGE_COMDAT_SELECT_SAME_SIZE: u8 = 3;
 const IMAGE_COMDAT_SELECT_EXACT_MATCH: u8 = 4;
 const IMAGE_COMDAT_SELECT_ASSOCIATIVE: u8 = 5;
 const IMAGE_COMDAT_SELECT_LARGEST: u8 = 6;
-const IMAGE_SCN_LNK_INFO: u32 = 0x0000_0200;
-const IMAGE_SCN_LNK_REMOVE: u32 = 0x0000_0800;
-const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
-const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
-const SIZEOF_COFF_SYMBOL: usize = 18;
-const SIZEOF_COFF_SECTION_HEADER: usize = 40;
-const SIZEOF_COFF_RELOC: usize = 10;
 const CRT_MAIN_SYMBOL: &str = "__main";
 const COFF_RET: u8 = 0xC3;
-
-#[derive(Clone)]
-struct CoffSymbol {
-    name: String,
-    section: i16,
-    value: u32,
-    class: u8,
-    typ: u16,
-    /// Symbol index of the default symbol, for weak externals.
-    tag: usize,
-}
 
 #[derive(Clone, Copy)]
 enum CoffRegion {
@@ -567,48 +544,6 @@ fn is_kernel32_symbol(name: &str) -> bool {
     )
 }
 
-fn coff_read_u16(data: &[u8], off: usize) -> Option<u16> {
-    let b = data.get(off..off + 2)?;
-    Some(u16::from_le_bytes([b[0], b[1]]))
-}
-fn coff_read_u32(data: &[u8], off: usize) -> Option<u32> {
-    let b = data.get(off..off + 4)?;
-    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-}
-
-fn coff_symbol_name(name_bytes: &[u8; 8], strtab: &[u8]) -> String {
-    if name_bytes[..4] == [0, 0, 0, 0] {
-        let off = u32::from_le_bytes([name_bytes[4], name_bytes[5], name_bytes[6], name_bytes[7]])
-            as usize;
-        if off >= 4 && off < strtab.len() {
-            let s = &strtab[off..];
-            let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-            return String::from_utf8_lossy(&s[..end]).into_owned();
-        }
-        return String::new();
-    }
-    let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
-    String::from_utf8_lossy(&name_bytes[..end]).into_owned()
-}
-
-/// Section names longer than 8 bytes are stored as `/` followed by the decimal
-/// offset of the name in the string table.
-fn coff_section_name(raw: &[u8], strtab: &[u8]) -> String {
-    if raw[0] == b'/' {
-        let digits = raw[1..].split(|&b| b == 0).next().unwrap_or(&[]);
-        let offset = std::str::from_utf8(digits)
-            .ok()
-            .and_then(|d| d.parse::<usize>().ok());
-        if let Some(off) = offset.filter(|&off| off >= 4) {
-            let s = strtab.get(off..).unwrap_or(&[]);
-            let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-            return String::from_utf8_lossy(&s[..end]).into_owned();
-        }
-    }
-    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    String::from_utf8_lossy(&raw[..end]).into_owned()
-}
-
 fn coff_duplicate_symbol(name: &str, first: usize, second: usize) -> std::io::Error {
     coff_error(format!(
         "duplicate symbol {name} defined in object {first} and object {second}"
@@ -644,146 +579,77 @@ fn build_base_relocs(sites: &[(u32, u16)]) -> Vec<u8> {
     out
 }
 
+fn coff_problem(problem: coff::Problem, object: usize) -> std::io::Error {
+    coff_error(match problem {
+        coff::Problem::Truncated => format!("truncated COFF object {object}"),
+        coff::Problem::SectionData(name) => {
+            format!("section {name} data lies outside the object")
+        }
+        coff::Problem::Relocs(name) => {
+            format!("relocations of section {name} lie outside the object")
+        }
+    })
+}
+
 /// Parse one COFF object. Sections that are not linked are `None`, so the
 /// index of an entry is its section number minus one.
 fn parse_coff_object(
     object: usize,
-    coff: &[u8],
-) -> Result<(Vec<CoffSymbol>, Vec<Option<CoffSection<'_>>>)> {
-    let truncated = || coff_error(format!("truncated COFF object {object}"));
-    let machine = coff_read_u16(coff, 0).ok_or_else(truncated)?;
-    if machine != IMAGE_FILE_MACHINE_AMD64 {
+    coff_data: &[u8],
+) -> Result<(Vec<coff::Symbol>, Vec<Option<CoffSection<'_>>>)> {
+    let machine = coff::read_u16(coff_data, 0)
+        .ok_or_else(|| coff_problem(coff::Problem::Truncated, object))?;
+    if machine != MACHINE_AMD64 {
         return Err(coff_error(format!(
             "object {object} has machine type {machine:#06x}; only x86-64 objects can be linked"
         )));
     }
-    let n_sections = coff_read_u16(coff, 2).ok_or_else(truncated)? as usize;
-    let opt_size = coff_read_u16(coff, 16).ok_or_else(truncated)? as usize;
-    let sym_table_off = coff_read_u32(coff, 8).ok_or_else(truncated)? as usize;
-    let n_syms = coff_read_u32(coff, 12).ok_or_else(truncated)? as usize;
-
-    let strtab_off = sym_table_off + n_syms * SIZEOF_COFF_SYMBOL;
-    let strtab: &[u8] = if n_syms == 0 {
-        &[]
-    } else {
-        let strtab_size = coff_read_u32(coff, strtab_off).unwrap_or(4) as usize;
-        &coff[strtab_off.min(coff.len())..(strtab_off + strtab_size).min(coff.len())]
-    };
-
-    // Indexed by raw table index; auxiliary records get empty names.
-    let mut syms: Vec<CoffSymbol> = Vec::with_capacity(n_syms);
-    let mut section_aux: HashMap<usize, (u8, usize)> = HashMap::default();
-    let mut i = 0;
-    while i < n_syms {
-        let rec = sym_table_off + i * SIZEOF_COFF_SYMBOL;
-        let Some(r) = coff.get(rec..rec + SIZEOF_COFF_SYMBOL) else {
-            break;
-        };
-        let name_bytes: &[u8; 8] = r[..8].try_into().unwrap_or(&[0u8; 8]);
-        let num_aux = r[17] as usize;
-        let section = i16::from_le_bytes([r[12], r[13]]);
-        if r[16] == IMAGE_SYM_CLASS_STATIC && section > 0 && num_aux > 0 {
-            let aux_at = rec + SIZEOF_COFF_SYMBOL;
-            if let (Some(&selection), Some(number)) =
-                (coff.get(aux_at + 14), coff_read_u16(coff, aux_at + 12))
-            {
-                section_aux.insert(section as usize, (selection, number as usize));
+    let parsed = coff::parse(coff_data);
+    if let Some(problem) = parsed.problem {
+        return Err(coff_problem(problem, object));
+    }
+    let comdat_aux = parsed.comdat_aux;
+    let sections = parsed
+        .sections
+        .into_iter()
+        .enumerate()
+        .map(|(s, sec)| {
+            if sec.skipped {
+                return None;
             }
-        }
-        syms.push(CoffSymbol {
-            name: coff_symbol_name(name_bytes, strtab),
-            section,
-            value: u32::from_le_bytes([r[8], r[9], r[10], r[11]]),
-            class: r[16],
-            typ: u16::from_le_bytes([r[14], r[15]]),
-            tag: if r[16] == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
-                coff_read_u32(coff, rec + SIZEOF_COFF_SYMBOL).unwrap_or(0) as usize
+            let region = if sec.name == ".pdata" || sec.name.starts_with(".pdata$") {
+                CoffRegion::Pdata
+            } else if sec.flags & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 {
+                CoffRegion::Text
+            } else if sec.flags & coff::IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0
+                || sec.flags & IMAGE_SCN_MEM_WRITE != 0
+            {
+                CoffRegion::Writable
             } else {
-                0
-            },
-        });
-        for _ in 0..num_aux {
-            syms.push(CoffSymbol {
-                name: String::new(),
-                section: IMAGE_SYM_UNDEFINED_SECTION,
-                value: 0,
-                class: 0,
-                typ: 0,
-                tag: 0,
+                CoffRegion::ReadOnly
+            };
+            let comdat = (sec.flags & IMAGE_SCN_LNK_COMDAT != 0).then(|| {
+                let (selection, assoc) = comdat_aux
+                    .get(&(s + 1))
+                    .copied()
+                    .unwrap_or((IMAGE_COMDAT_SELECT_ANY, 0));
+                CoffComdat { selection, assoc }
             });
-        }
-        i += 1 + num_aux;
-    }
-
-    let mut sections: Vec<Option<CoffSection>> = Vec::with_capacity(n_sections);
-    for s in 0..n_sections {
-        let sh = 20 + opt_size + s * SIZEOF_COFF_SECTION_HEADER;
-        let flags = coff_read_u32(coff, sh + 36).ok_or_else(truncated)?;
-        if flags & (IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE | IMAGE_SCN_MEM_DISCARDABLE) != 0 {
-            sections.push(None);
-            continue;
-        }
-        let raw_size = coff_read_u32(coff, sh + 16).ok_or_else(truncated)? as usize;
-        let raw_ptr = coff_read_u32(coff, sh + 20).ok_or_else(truncated)? as usize;
-        let relocs_ptr = coff_read_u32(coff, sh + 24).ok_or_else(truncated)? as usize;
-        let n_relocs = coff_read_u16(coff, sh + 32).ok_or_else(truncated)?;
-        let name = coff_section_name(&coff[sh..sh + 8], strtab);
-
-        let uninitialized = flags & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0;
-        let region = if name == ".pdata" || name.starts_with(".pdata$") {
-            CoffRegion::Pdata
-        } else if flags & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 {
-            CoffRegion::Text
-        } else if uninitialized || flags & IMAGE_SCN_MEM_WRITE != 0 {
-            CoffRegion::Writable
-        } else {
-            CoffRegion::ReadOnly
-        };
-        let raw: &[u8] = if uninitialized {
-            &[]
-        } else {
-            coff.get(raw_ptr..raw_ptr + raw_size)
-                .ok_or_else(|| coff_error(format!("section {name} data lies outside the object")))?
-        };
-
-        let (relocs_at, n_relocs) =
-            coff_reloc_span(coff, relocs_ptr, n_relocs, flags).ok_or_else(truncated)?;
-        let mut relocs = Vec::with_capacity(n_relocs);
-        for r in 0..n_relocs {
-            let o = relocs_at + r * SIZEOF_COFF_RELOC;
-            let rec = coff.get(o..o + SIZEOF_COFF_RELOC).ok_or_else(|| {
-                coff_error(format!(
-                    "relocations of section {name} lie outside the object"
-                ))
-            })?;
-            relocs.push((
-                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]),
-                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]),
-                u16::from_le_bytes([rec[8], rec[9]]),
-            ));
-        }
-
-        let comdat = (flags & IMAGE_SCN_LNK_COMDAT != 0).then(|| {
-            let (selection, assoc) = section_aux
-                .get(&(s + 1))
-                .copied()
-                .unwrap_or((IMAGE_COMDAT_SELECT_ANY, 0));
-            CoffComdat { selection, assoc }
-        });
-        sections.push(Some(CoffSection {
-            object,
-            name,
-            region,
-            align: coff_section_align(flags),
-            size: raw_size,
-            raw,
-            relocs,
-            offset: 0,
-            comdat,
-            keep: true,
-        }));
-    }
-    Ok((syms, sections))
+            Some(CoffSection {
+                object,
+                name: sec.name,
+                region,
+                align: coff_section_align(sec.flags),
+                size: sec.size,
+                raw: sec.raw,
+                relocs: sec.relocs,
+                offset: 0,
+                comdat,
+                keep: true,
+            })
+        })
+        .collect();
+    Ok((parsed.symbols, sections))
 }
 
 /// Link COFF objects and emit a PE32+ executable directly.
@@ -791,7 +657,7 @@ fn parse_coff_object(
 /// Code sections go to `.text`, read-only data to `.rdata`, writable and
 /// uninitialized data to `.data`. Undefined externals get `jmp [iat]` thunks.
 pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> Result<()> {
-    let mut syms_of: Vec<Vec<CoffSymbol>> = Vec::with_capacity(objects.len());
+    let mut syms_of: Vec<Vec<coff::Symbol>> = Vec::with_capacity(objects.len());
     let mut slot_of: Vec<Vec<Option<usize>>> = Vec::with_capacity(objects.len());
     let mut sections: Vec<CoffSection> = Vec::new();
     for (oi, coff) in objects.iter().enumerate() {
@@ -1153,7 +1019,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
             CoffDef::Absolute(v) => i64::from(v),
         }
     };
-    let is_undefined_external = |sym: &CoffSymbol| {
+    let is_undefined_external = |sym: &coff::Symbol| {
         sym.section == IMAGE_SYM_UNDEFINED_SECTION
             && sym.class == IMAGE_SYM_CLASS_EXTERNAL
             && !sym.name.is_empty()
@@ -1433,7 +1299,7 @@ fn emit_pe_raw(
 
     let n_sec = sections.len() as u16;
     let mut coff_hdr = [0u8; SIZEOF_COFF_HEADER];
-    coff_hdr[0..2].copy_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+    coff_hdr[0..2].copy_from_slice(&MACHINE_AMD64.to_le_bytes());
     coff_hdr[2..4].copy_from_slice(&n_sec.to_le_bytes());
     coff_hdr[16..18].copy_from_slice(&SIZEOF_OPTIONAL_HEADER.to_le_bytes());
     let characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE;
@@ -1557,6 +1423,10 @@ fn write_u64_at(buf: &mut [u8], cursor: &mut usize, v: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coff::{
+        IMAGE_SYM_CLASS_STATIC, RELOC_SIZE as SIZEOF_COFF_RELOC,
+        SECTION_HEADER_SIZE as SIZEOF_COFF_SECTION_HEADER,
+    };
     use crate::link::MergedSection;
 
     fn minimal_layout() -> (MergedLayout, u64) {
@@ -1610,10 +1480,7 @@ mod tests {
         emit_pe_executable(&layout, entry, None, &mut buf).unwrap();
         let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().unwrap()) as usize;
         let machine = u16::from_le_bytes(buf[e_lfanew + 4..e_lfanew + 6].try_into().unwrap());
-        assert_eq!(
-            machine, IMAGE_FILE_MACHINE_AMD64,
-            "machine type should be AMD64"
-        );
+        assert_eq!(machine, MACHINE_AMD64, "machine type should be AMD64");
     }
 
     #[test]
@@ -1672,7 +1539,7 @@ mod tests {
             at += s.relocs.len() * SIZEOF_COFF_RELOC;
         }
         let mut o = Vec::new();
-        o.extend_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        o.extend_from_slice(&MACHINE_AMD64.to_le_bytes());
         o.extend_from_slice(&(n as u16).to_le_bytes());
         o.extend_from_slice(&0u32.to_le_bytes());
         o.extend_from_slice(&(at as u32).to_le_bytes());
