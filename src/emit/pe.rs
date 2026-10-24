@@ -467,7 +467,10 @@ const IMAGE_SYM_CLASS_STATIC: u8 = 3;
 const IMAGE_SCN_LNK_COMDAT: u32 = 0x0000_1000;
 const IMAGE_COMDAT_SELECT_NODUPLICATES: u8 = 1;
 const IMAGE_COMDAT_SELECT_ANY: u8 = 2;
+const IMAGE_COMDAT_SELECT_SAME_SIZE: u8 = 3;
+const IMAGE_COMDAT_SELECT_EXACT_MATCH: u8 = 4;
 const IMAGE_COMDAT_SELECT_ASSOCIATIVE: u8 = 5;
+const IMAGE_COMDAT_SELECT_LARGEST: u8 = 6;
 const IMAGE_SCN_LNK_INFO: u32 = 0x0000_0200;
 const IMAGE_SCN_LNK_REMOVE: u32 = 0x0000_0800;
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
@@ -825,12 +828,32 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                 comdat_owner.insert(key, k);
             }
             Some(first) => {
-                if comdat.selection == IMAGE_COMDAT_SELECT_NODUPLICATES {
-                    return Err(coff_duplicate_symbol(
-                        key,
-                        sections[first].object,
-                        sections[k].object,
-                    ));
+                let mismatch = |what: &str| {
+                    coff_error(format!(
+                        "comdat {key} differs in {what} between objects {} and {}",
+                        sections[first].object, sections[k].object
+                    ))
+                };
+                match comdat.selection {
+                    IMAGE_COMDAT_SELECT_NODUPLICATES => {
+                        return Err(coff_duplicate_symbol(
+                            key,
+                            sections[first].object,
+                            sections[k].object,
+                        ));
+                    }
+                    IMAGE_COMDAT_SELECT_SAME_SIZE if sections[first].size != sections[k].size => {
+                        return Err(mismatch("size"));
+                    }
+                    IMAGE_COMDAT_SELECT_EXACT_MATCH if sections[first].raw != sections[k].raw => {
+                        return Err(mismatch("contents"));
+                    }
+                    IMAGE_COMDAT_SELECT_LARGEST if sections[k].size > sections[first].size => {
+                        sections[first].keep = false;
+                        comdat_owner.insert(key, k);
+                        continue;
+                    }
+                    _ => {}
                 }
                 sections[k].keep = false;
             }
@@ -1808,6 +1831,55 @@ mod tests {
         let mut out = Vec::new();
         let result = link_and_emit_pe_from_coffs(&[obj.as_slice(), obj.as_slice()], &mut out);
         assert!(result.is_err());
+    }
+
+    fn comdat_object(body: &[u8], selection: u8) -> Vec<u8> {
+        coff_object(
+            &[TestSection {
+                name: ".text",
+                flags: COMDAT_TEXT_FLAGS,
+                data: body,
+                relocs: &[],
+                selection,
+                assoc: 0,
+            }],
+            &[("inl", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        )
+    }
+
+    #[test]
+    fn test_coff_comdat_largest_keeps_largest_copy() {
+        let small = comdat_object(&[0xC3; 4], IMAGE_COMDAT_SELECT_LARGEST);
+        let large = comdat_object(&[0x90; 8], IMAGE_COMDAT_SELECT_LARGEST);
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[small.as_slice(), large.as_slice()], &mut out)
+            .expect("links");
+        assert_eq!(pe_section_vsize(&out, 0), 8);
+        assert_eq!(&out[512..520], &[0x90; 8]);
+
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[large.as_slice(), small.as_slice()], &mut out)
+            .expect("links");
+        assert_eq!(pe_section_vsize(&out, 0), 8);
+    }
+
+    #[test]
+    fn test_coff_comdat_same_size_rejects_different_sizes() {
+        let a = comdat_object(&[0xC3; 4], IMAGE_COMDAT_SELECT_SAME_SIZE);
+        let b = comdat_object(&[0xC3; 8], IMAGE_COMDAT_SELECT_SAME_SIZE);
+        let mut out = Vec::new();
+        assert!(link_and_emit_pe_from_coffs(&[a.as_slice(), b.as_slice()], &mut out).is_err());
+    }
+
+    #[test]
+    fn test_coff_comdat_exact_match_rejects_different_contents() {
+        let a = comdat_object(&[0xC3; 4], IMAGE_COMDAT_SELECT_EXACT_MATCH);
+        let b = comdat_object(&[0x90; 4], IMAGE_COMDAT_SELECT_EXACT_MATCH);
+        let mut out = Vec::new();
+        assert!(link_and_emit_pe_from_coffs(&[a.as_slice(), b.as_slice()], &mut out).is_err());
+        let same = comdat_object(&[0xC3; 4], IMAGE_COMDAT_SELECT_EXACT_MATCH);
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[a.as_slice(), same.as_slice()], &mut out).expect("links");
     }
 
     #[test]
