@@ -22,6 +22,8 @@ pub enum SectionType {
     Rela = 4,
 }
 
+const SHT_NULL: u32 = 0;
+const SHT_NOBITS: u32 = 8;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
@@ -371,7 +373,6 @@ pub fn parse_elf64_slice(
 ) -> Result<(Elf64Header, Vec<SectionHeader>, Vec<String>), String> {
     let header = parse_elf64_header(data)?;
 
-    let shoff = header.e_shoff as usize;
     let shnum = header.e_shnum as usize;
     let shstrndx = header.e_shstrndx as usize;
 
@@ -379,11 +380,30 @@ pub fn parse_elf64_slice(
         return Ok((header, Vec::new(), Vec::new()));
     }
 
+    header
+        .e_shoff
+        .checked_add((shnum * 64) as u64)
+        .filter(|&end| end <= data.len() as u64)
+        .ok_or("section header table extends past end of file")?;
+
     let mut sections = Vec::with_capacity(shnum);
     for i in 0..shnum {
-        let off = shoff + i * 64;
-        let sh = parse_section_header(data, off as u64)?;
+        let off = header.e_shoff + (i * 64) as u64;
+        let sh = parse_section_header(data, off)?;
         sections.push(sh);
+    }
+
+    for (i, sh) in sections.iter().enumerate() {
+        if sh.sh_type == SHT_NULL || sh.sh_type == SHT_NOBITS {
+            continue;
+        }
+        if sh
+            .sh_offset
+            .checked_add(sh.sh_size)
+            .is_none_or(|end| end > data.len() as u64)
+        {
+            return Err(format!("section {i} extends past end of file"));
+        }
     }
 
     let shstrtab_data = if shstrndx < sections.len() {
