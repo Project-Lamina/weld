@@ -411,51 +411,39 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
     Some(0)
 }
 
-fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
-    // COFF objects take the direct COFF to PE path; ELF objects fall through to the legacy path.
-    if let Some(first) = args.input_files.first() {
-        let data = std::fs::read(first).ok()?;
-        let is_coff = object::is_coff_object(&data);
-        if is_coff {
-            let mut objects = Vec::with_capacity(args.input_files.len());
-            objects.push(data);
-            for path in &args.input_files[1..] {
-                let data = match std::fs::read(path) {
-                    Ok(data) => data,
-                    Err(error) => {
-                        eprintln!("weld: {}: {error}", path.display());
-                        return Some(1);
-                    }
-                };
-                if !object::is_coff_object(&data) {
-                    eprintln!(
-                        "weld: {} is not a COFF object; mixing COFF and other inputs is not supported",
-                        path.display()
-                    );
-                    return Some(1);
-                }
-                objects.push(data);
-            }
-            let refs: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
-            let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
-            let mut image = Vec::new();
-            if let Err(error) = emit::pe::link_and_emit_pe_from_coffs(&refs, &mut image) {
-                eprintln!("weld: {error}");
-                return Some(1);
-            }
-            let out_file = create_output(out_path).ok()?;
-            let mut out = std::io::BufWriter::new(out_file);
-            std::io::Write::write_all(&mut out, &image).ok()?;
-            out.flush().ok()?;
-            return Some(0);
-        }
+fn try_weld_link_coff(args: &ParsedArgs, objects: Vec<Vec<u8>>) -> Option<i32> {
+    let refs: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
+    let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
+    let mut image = Vec::new();
+    if let Err(error) = emit::pe::link_and_emit_pe_from_coffs(&refs, &mut image) {
+        eprintln!("weld: {error}");
+        return Some(1);
     }
+    let out_file = create_output(out_path).ok()?;
+    let mut out = std::io::BufWriter::new(out_file);
+    std::io::Write::write_all(&mut out, &image).ok()?;
+    out.flush().ok()?;
+    Some(0)
+}
 
-    let obj_data_list = object::load_elf_objects(
+fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
+    // COFF inputs take the direct COFF to PE path; ELF inputs fall through to the legacy path.
+    let (libraries, library_positions): (Vec<_>, Vec<_>) =
+        static_library_inputs(args).into_iter().unzip();
+    let loaded = object::load_objects_with_positions(
         &args.input_files,
-        &static_library_paths(args),
+        &libraries,
         &entry_seeds(args),
+        &args.input_positions,
+        &library_positions,
     )?;
+    if loaded.format == ObjectFormat::Coff {
+        return try_weld_link_coff(args, loaded.objects);
+    }
+    if loaded.format != ObjectFormat::Elf {
+        return None;
+    }
+    let obj_data_list = loaded.objects;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
         None
@@ -523,7 +511,7 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
     match loaded.format {
         ObjectFormat::Elf => try_weld_link_elf(args, loaded.objects, loaded.positions),
         ObjectFormat::MachO => try_weld_link_macho(args),
-        ObjectFormat::Coff => try_weld_link_pe(args),
+        ObjectFormat::Coff => try_weld_link_coff(args, loaded.objects),
     }
 }
 

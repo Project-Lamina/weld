@@ -167,12 +167,6 @@ fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// Returns true for bare COFF object files (.obj). PE executables are excluded
-/// because they begin with the MZ DOS stub (0x4D5A), not a COFF machine type.
-pub fn is_coff_object(data: &[u8]) -> bool {
-    is_coff(data)
-}
-
 fn is_coff(data: &[u8]) -> bool {
     if data.len() < 20 {
         return false;
@@ -774,15 +768,6 @@ pub fn load_objects_with_positions(
         dylibs: dylib_paths,
         positions,
     })
-}
-
-pub fn load_elf_objects(
-    paths: &[PathBuf],
-    libs: &[PathBuf],
-    entries: &[String],
-) -> Option<Vec<Vec<u8>>> {
-    let (format, objects, _) = load_objects(paths, libs, entries)?;
-    (format == ObjectFormat::Elf).then_some(objects)
 }
 
 pub fn load_macho_objects(
