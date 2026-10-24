@@ -446,7 +446,6 @@ const IMAGE_REL_AMD64_ADDR32NB: u16 = 0x0003;
 const IMAGE_REL_AMD64_ADDR64: u16 = 0x0001;
 const IMAGE_REL_AMD64_ADDR32: u16 = 0x0002;
 const IMAGE_REL_AMD64_REL32: u16 = 0x0004;
-const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
 const OPCODE_CALL_REL32: u8 = 0xE8;
 const OPCODE_JMP_REL32: u8 = 0xE9;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
@@ -1183,11 +1182,13 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                     base_relocs.push((site_rva, IMAGE_REL_BASED_DIR64));
                 }
                 IMAGE_REL_AMD64_ADDR32 => {
-                    let target = resolve(object, sym_idx as usize, false, &sec.name)?;
-                    // The loader adds its base delta to these 32 bits only.
-                    let v = (target + addend) as u32;
-                    blob[at..at + 4].copy_from_slice(&v.to_le_bytes());
-                    base_relocs.push((site_rva, IMAGE_REL_BASED_HIGHLOW));
+                    // The loader adds its base delta to these 32 bits only, so the stored
+                    // value is a usable pointer only while the image stays below 4 GiB.
+                    // ASLR does not guarantee that, and MSVC does not emit ADDR32 for x64.
+                    return Err(coff_error(format!(
+                        "ADDR32 relocation in {}: use ADDR32NB or ADDR64",
+                        sec.name
+                    )));
                 }
                 IMAGE_REL_AMD64_ADDR32NB => {
                     let target = resolve(object, sym_idx as usize, false, &sec.name)?;
@@ -1804,20 +1805,12 @@ mod tests {
     }
 
     #[test]
-    fn test_coff_addr32_emits_highlow_reloc() {
+    fn test_coff_addr32_is_rejected() {
         let obj = absolute_pointer_object(IMAGE_REL_AMD64_ADDR32);
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
-
-        let data_ptr = le_u32(pe_section_header(&out, 2), 20) as usize;
-        assert_eq!(le_u32(&out, data_ptr), 0x4000_1000);
-
-        let (reloc_rva, _) = pe_base_reloc_dir(&out);
-        let reloc = pe_section_header(&out, 3);
-        assert_eq!(le_u32(reloc, 12), reloc_rva);
-        let ptr = le_u32(reloc, 20) as usize;
-        let entry = u16::from_le_bytes(out[ptr + 8..ptr + 10].try_into().unwrap());
-        assert_eq!(entry >> 12, IMAGE_REL_BASED_HIGHLOW);
+        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+            .expect_err("ADDR32 must be rejected");
+        assert!(err.to_string().contains("ADDR32"), "{err}");
     }
 
     #[test]
