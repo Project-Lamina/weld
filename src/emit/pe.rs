@@ -447,6 +447,8 @@ const IMAGE_REL_AMD64_ADDR64: u16 = 0x0001;
 const IMAGE_REL_AMD64_ADDR32: u16 = 0x0002;
 const IMAGE_REL_AMD64_REL32: u16 = 0x0004;
 const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
+const OPCODE_CALL_REL32: u8 = 0xE8;
+const OPCODE_JMP_REL32: u8 = 0xE9;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
 const BASE_RELOC_PAGE: u32 = 0x1000;
 const DATA_DIR_BASE_RELOC: usize = 5;
@@ -454,6 +456,8 @@ const IMAGE_REL_AMD64_REL32_5: u16 = 0x0009;
 const IMAGE_SYM_UNDEFINED_SECTION: i16 = 0;
 const IMAGE_SYM_ABSOLUTE_SECTION: i16 = -1;
 const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
+const IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
+const IMPORT_SYMBOL_PREFIX: &str = "__imp_";
 const IMAGE_SYM_CLASS_STATIC: u8 = 3;
 const IMAGE_SCN_LNK_COMDAT: u32 = 0x0000_1000;
 const IMAGE_COMDAT_SELECT_NODUPLICATES: u8 = 1;
@@ -475,6 +479,7 @@ struct CoffSymbol {
     section: i16,
     value: u32,
     class: u8,
+    typ: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -651,6 +656,7 @@ fn parse_coff_object(
             section,
             value: u32::from_le_bytes([r[8], r[9], r[10], r[11]]),
             class: r[16],
+            typ: u16::from_le_bytes([r[14], r[15]]),
         });
         for _ in 0..num_aux {
             syms.push(CoffSymbol {
@@ -658,6 +664,7 @@ fn parse_coff_object(
                 section: IMAGE_SYM_UNDEFINED_SECTION,
                 value: 0,
                 class: 0,
+                typ: 0,
             });
         }
         i += 1 + num_aux;
@@ -859,14 +866,28 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                     s.name
                 )));
             }
-            if s.name == CRT_MAIN_SYMBOL {
-                return Err(coff_error(format!(
-                    "undefined {CRT_MAIN_SYMBOL}: it runs global constructors from libgcc and weld \
-                     cannot supply it; link a runtime that defines it"
-                )));
-            }
-            if seen.insert(s.name.as_str()) {
-                undefined.push(s.name.as_str());
+            let import = match s.name.strip_prefix(IMPORT_SYMBOL_PREFIX) {
+                Some(base) => {
+                    if defs.contains_key(base) {
+                        return Err(coff_error(format!(
+                            "{IMPORT_SYMBOL_PREFIX}{base} refers to a symbol defined in this link; \
+                             pointer slots for local symbols are not supported"
+                        )));
+                    }
+                    base
+                }
+                None => {
+                    if s.name == CRT_MAIN_SYMBOL {
+                        return Err(coff_error(format!(
+                            "undefined {CRT_MAIN_SYMBOL}: it runs global constructors from libgcc and weld \
+                             cannot supply it; link a runtime that defines it"
+                        )));
+                    }
+                    s.name.as_str()
+                }
+            };
+            if seen.insert(import) {
+                undefined.push(import);
             }
         }
     }
@@ -1035,6 +1056,11 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
             CoffDef::Absolute(v) => i64::from(v),
         }
     };
+    let is_undefined_external = |sym: &CoffSymbol| {
+        sym.section == IMAGE_SYM_UNDEFINED_SECTION
+            && sym.class == IMAGE_SYM_CLASS_EXTERNAL
+            && !sym.name.is_empty()
+    };
     let resolve = |oi: usize, sym_idx: usize, allow_thunk: bool, owner: &str| -> Result<i64> {
         let sym = syms_of[oi]
             .get(sym_idx)
@@ -1053,13 +1079,26 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         } else if sym.section == IMAGE_SYM_ABSOLUTE_SECTION {
             return Ok(i64::from(sym.value));
         }
-        if sym.class == IMAGE_SYM_CLASS_EXTERNAL {
-            if let Some(&(def, _)) = defs.get(sym.name.as_str()) {
-                return Ok(def_va(def));
+        if sym.class == IMAGE_SYM_CLASS_EXTERNAL
+            && let Some(&(def, _)) = defs.get(sym.name.as_str())
+        {
+            return Ok(def_va(def));
+        }
+        if is_undefined_external(sym) {
+            if let Some(base) = sym.name.strip_prefix(IMPORT_SYMBOL_PREFIX) {
+                return sym_iat_va
+                    .get(base)
+                    .map(|&va| va as i64)
+                    .ok_or_else(|| coff_error(format!("no import slot for {base}")));
             }
             if allow_thunk && let Some(&i) = thunk_index.get(sym.name.as_str()) {
                 return Ok(thunk_va(i) as i64);
             }
+            return Err(coff_error(format!(
+                "undefined symbol {} referenced from {owner} as data or a function address; \
+                 import it through {IMPORT_SYMBOL_PREFIX}{}",
+                sym.name, sym.name
+            )));
         }
         Err(coff_error(format!(
             "unresolved symbol {} referenced from {owner}",
@@ -1095,9 +1134,18 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                 i64::from(i32::from_le_bytes(blob[at..at + 4].try_into().unwrap()))
             };
             let object = sec.object;
+            let call_site = matches!(rel_type, IMAGE_REL_AMD64_REL32..=IMAGE_REL_AMD64_REL32_5)
+                && matches!(
+                    field.checked_sub(1).and_then(|p| sec.raw.get(p)),
+                    Some(&(OPCODE_CALL_REL32 | OPCODE_JMP_REL32))
+                );
+            let function_sym = syms_of[object]
+                .get(sym_idx as usize)
+                .is_some_and(|s| s.typ & 0xF0 == IMAGE_SYM_DTYPE_FUNCTION);
+            let allow_thunk = call_site || function_sym;
             match rel_type {
                 IMAGE_REL_AMD64_REL32..=IMAGE_REL_AMD64_REL32_5 => {
-                    let target = resolve(object, sym_idx as usize, true, &sec.name)?;
+                    let target = resolve(object, sym_idx as usize, allow_thunk, &sec.name)?;
                     let trailing = i64::from(rel_type - IMAGE_REL_AMD64_REL32);
                     let v = target + addend - (p_va + 4 + trailing);
                     let v = i32::try_from(v)
@@ -1105,7 +1153,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                     blob[at..at + 4].copy_from_slice(&v.to_le_bytes());
                 }
                 IMAGE_REL_AMD64_ADDR64 => {
-                    let target = resolve(object, sym_idx as usize, false, &sec.name)?;
+                    let target = resolve(object, sym_idx as usize, allow_thunk, &sec.name)?;
                     let v = (target + addend) as u64;
                     blob[at..at + 8].copy_from_slice(&v.to_le_bytes());
                     base_relocs.push((site_rva, IMAGE_REL_BASED_DIR64));
@@ -1732,5 +1780,96 @@ mod tests {
         let mut out = Vec::new();
         link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
         assert_eq!(pe_base_reloc_dir(&out), (0, 0));
+    }
+
+    fn undefined_import_object(text: &[u8], relocs: &[(u32, u32, u16)], symbol: &str) -> Vec<u8> {
+        coff_object(
+            &[text_section(text, relocs)],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                (
+                    symbol,
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_EXTERNAL,
+                    0,
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn test_coff_import_prefix_resolves_to_iat_slot() {
+        let call = [0xFF, 0x15, 0, 0, 0, 0, 0xC3];
+        let relocs = [(2, 3, IMAGE_REL_AMD64_REL32)];
+        let obj = undefined_import_object(&call, &relocs, "__imp_f");
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+
+        let disp = i32::from_le_bytes(out[512 + 2..512 + 6].try_into().unwrap());
+        let slot_rva = (0x1000 + 2 + 4 + disp) as u32;
+        let rdata = pe_section_header(&out, 1);
+        let rdata_rva = le_u32(rdata, 12);
+        let rdata_size = le_u32(rdata, 8);
+        assert!(slot_rva >= rdata_rva && slot_rva + 8 <= rdata_rva + rdata_size);
+        let slot_at = le_u32(rdata, 20) as usize + (slot_rva - rdata_rva) as usize;
+        assert_ne!(
+            u64::from_le_bytes(out[slot_at..slot_at + 8].try_into().unwrap()),
+            0
+        );
+        assert!(!out.windows(7).any(|w| w == b"__imp_f"));
+    }
+
+    #[test]
+    fn test_coff_call_to_undefined_function_uses_thunk() {
+        let call = [0xE8, 0, 0, 0, 0, 0xC3];
+        let relocs = [(1, 3, IMAGE_REL_AMD64_REL32)];
+        let obj = undefined_import_object(&call, &relocs, "f");
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+
+        let disp = i32::from_le_bytes(out[512 + 1..512 + 5].try_into().unwrap());
+        let target = (0x1000 + 1 + 4 + disp) as u32;
+        let thunk_at = 512 + (target - 0x1000) as usize;
+        assert_eq!(&out[thunk_at..thunk_at + 2], &[0xFF, 0x25]);
+    }
+
+    #[test]
+    fn test_coff_data_reference_to_undefined_symbol_is_error() {
+        let lea = [0x48, 0x8D, 0x0D, 0, 0, 0, 0, 0xC3];
+        let relocs = [(3, 3, IMAGE_REL_AMD64_REL32)];
+        let obj = undefined_import_object(&lea, &relocs, "plain");
+        let mut out = Vec::new();
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+    }
+
+    #[test]
+    fn test_coff_absolute_reference_to_undefined_symbol_is_error() {
+        let text = [0xC3];
+        let data = [0u8; 8];
+        let relocs = [(0, 3, IMAGE_REL_AMD64_ADDR64)];
+        let obj = coff_object(
+            &[
+                text_section(&text, &[]),
+                TestSection {
+                    name: ".data",
+                    flags: DATA_FLAGS,
+                    data: &data,
+                    relocs: &relocs,
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                (
+                    "plain",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_EXTERNAL,
+                    0,
+                ),
+            ],
+        );
+        let mut out = Vec::new();
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
     }
 }
