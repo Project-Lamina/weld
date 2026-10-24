@@ -134,6 +134,9 @@ pub(crate) fn parse(coff: &[u8]) -> Object<'_> {
     let strtab = string_table(coff, sym_off, n_syms);
     read_symbols(coff, sym_off, n_syms, strtab, &mut object);
     read_sections(coff, n_sections, opt_size, strtab, &mut object);
+    if object.symbols_truncated {
+        note(&mut object, Problem::SymbolTable);
+    }
     object
 }
 
@@ -161,8 +164,9 @@ fn read_symbols(
 ) {
     if n_syms > 0 && (sym_off == 0 || sym_off + n_syms * SYMBOL_SIZE > coff.len()) {
         object.symbols_truncated = true;
-        note(object, Problem::SymbolTable);
-        return;
+        if sym_off == 0 {
+            return;
+        }
     }
     let mut i = 0;
     while i < n_syms {
