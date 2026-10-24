@@ -1104,50 +1104,56 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
             && sym.class == IMAGE_SYM_CLASS_EXTERNAL
             && !sym.name.is_empty()
     };
-    let resolve = |oi: usize, sym_idx: usize, allow_thunk: bool, owner: &str| -> Result<i64> {
-        let sym = syms_of[oi]
-            .get(sym_idx)
-            .ok_or_else(|| coff_error(format!("{owner} names missing symbol index {sym_idx}")))?;
-        if sym.section > 0 {
-            if let Some(k) = slot_of[oi]
-                .get(sym.section as usize - 1)
-                .copied()
-                .flatten()
-                .filter(|&k| sections[k].keep)
+    // The flag is true when the value is an image address, which needs a base
+    // relocation if it is stored in memory. Absolute symbols are not relocated.
+    let resolve =
+        |oi: usize, sym_idx: usize, allow_thunk: bool, owner: &str| -> Result<(i64, bool)> {
+            let sym = syms_of[oi].get(sym_idx).ok_or_else(|| {
+                coff_error(format!("{owner} names missing symbol index {sym_idx}"))
+            })?;
+            if sym.section > 0 {
+                if let Some(k) = slot_of[oi]
+                    .get(sym.section as usize - 1)
+                    .copied()
+                    .flatten()
+                    .filter(|&k| sections[k].keep)
+                {
+                    let va =
+                        IMAGE_BASE as i64 + i64::from(sec_rva(&sections[k])) + i64::from(sym.value);
+                    return Ok((va, true));
+                }
+            } else if sym.section == IMAGE_SYM_ABSOLUTE_SECTION {
+                return Ok((i64::from(sym.value), false));
+            }
+            if sym.class == IMAGE_SYM_CLASS_EXTERNAL
+                && let Some(&(def, _)) = defs.get(sym.name.as_str())
             {
-                return Ok(IMAGE_BASE as i64
-                    + i64::from(sec_rva(&sections[k]))
-                    + i64::from(sym.value));
+                return Ok(match def {
+                    CoffDef::Section { .. } => (def_va(def), true),
+                    CoffDef::Absolute(_) => (def_va(def), false),
+                });
             }
-        } else if sym.section == IMAGE_SYM_ABSOLUTE_SECTION {
-            return Ok(i64::from(sym.value));
-        }
-        if sym.class == IMAGE_SYM_CLASS_EXTERNAL
-            && let Some(&(def, _)) = defs.get(sym.name.as_str())
-        {
-            return Ok(def_va(def));
-        }
-        if is_undefined_external(sym) {
-            if let Some(base) = sym.name.strip_prefix(IMPORT_SYMBOL_PREFIX) {
-                return sym_iat_va
-                    .get(base)
-                    .map(|&va| va as i64)
-                    .ok_or_else(|| coff_error(format!("no import slot for {base}")));
-            }
-            if allow_thunk && let Some(&i) = thunk_index.get(sym.name.as_str()) {
-                return Ok(thunk_va(i) as i64);
-            }
-            return Err(coff_error(format!(
-                "undefined symbol {} referenced from {owner} as data or a function address; \
+            if is_undefined_external(sym) {
+                if let Some(base) = sym.name.strip_prefix(IMPORT_SYMBOL_PREFIX) {
+                    return sym_iat_va
+                        .get(base)
+                        .map(|&va| (va as i64, true))
+                        .ok_or_else(|| coff_error(format!("no import slot for {base}")));
+                }
+                if allow_thunk && let Some(&i) = thunk_index.get(sym.name.as_str()) {
+                    return Ok((thunk_va(i) as i64, true));
+                }
+                return Err(coff_error(format!(
+                    "undefined symbol {} referenced from {owner} as data or a function address; \
                  import it through {IMPORT_SYMBOL_PREFIX}{}",
-                sym.name, sym.name
-            )));
-        }
-        Err(coff_error(format!(
-            "unresolved symbol {} referenced from {owner}",
-            sym.name
-        )))
-    };
+                    sym.name, sym.name
+                )));
+            }
+            Err(coff_error(format!(
+                "unresolved symbol {} referenced from {owner}",
+                sym.name
+            )))
+        };
 
     let mut base_relocs: Vec<(u32, u16)> = Vec::new();
     for sec in sections.iter().filter(|sec| sec.keep) {
@@ -1188,7 +1194,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
             let allow_thunk = call_site || function_sym;
             match rel_type {
                 IMAGE_REL_AMD64_REL32..=IMAGE_REL_AMD64_REL32_5 => {
-                    let target = resolve(object, sym_idx as usize, allow_thunk, &sec.name)?;
+                    let (target, _) = resolve(object, sym_idx as usize, allow_thunk, &sec.name)?;
                     let trailing = i64::from(rel_type - IMAGE_REL_AMD64_REL32);
                     let v = target + addend - (p_va + 4 + trailing);
                     let v = i32::try_from(v)
@@ -1196,10 +1202,13 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                     blob[at..at + 4].copy_from_slice(&v.to_le_bytes());
                 }
                 IMAGE_REL_AMD64_ADDR64 => {
-                    let target = resolve(object, sym_idx as usize, allow_thunk, &sec.name)?;
+                    let (target, image_addr) =
+                        resolve(object, sym_idx as usize, allow_thunk, &sec.name)?;
                     let v = (target + addend) as u64;
                     blob[at..at + 8].copy_from_slice(&v.to_le_bytes());
-                    base_relocs.push((site_rva, IMAGE_REL_BASED_DIR64));
+                    if image_addr {
+                        base_relocs.push((site_rva, IMAGE_REL_BASED_DIR64));
+                    }
                 }
                 IMAGE_REL_AMD64_ADDR32 => {
                     // The loader adds its base delta to these 32 bits only, so the stored
@@ -1211,7 +1220,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                     )));
                 }
                 IMAGE_REL_AMD64_ADDR32NB => {
-                    let target = resolve(object, sym_idx as usize, false, &sec.name)?;
+                    let (target, _) = resolve(object, sym_idx as usize, false, &sec.name)?;
                     let v = target - IMAGE_BASE as i64 + addend;
                     let v = u32::try_from(v).map_err(|_| {
                         coff_error(format!("ADDR32NB out of range in {}", sec.name))
@@ -1245,7 +1254,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
             .map(|i| (oi, i))
     });
     let entry_va = match entry_sym {
-        Some((oi, i)) => resolve(oi, i, false, "entry point")? as u64,
+        Some((oi, i)) => resolve(oi, i, false, "entry point")?.0 as u64,
         None => IMAGE_BASE + text_rva as u64,
     };
 
@@ -1806,6 +1815,42 @@ mod tests {
                 ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
             ],
         )
+    }
+
+    #[test]
+    fn test_coff_addr64_to_absolute_symbol_has_no_base_reloc() {
+        let text = [0xC3];
+        let data = [0u8; 8];
+        let relocs = [(0, 5, IMAGE_REL_AMD64_ADDR64)];
+        let obj = coff_object(
+            &[
+                text_section(&text, &[]),
+                TestSection {
+                    name: ".data",
+                    flags: DATA_FLAGS,
+                    data: &data,
+                    relocs: &relocs,
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                (
+                    "konst",
+                    IMAGE_SYM_ABSOLUTE_SECTION,
+                    IMAGE_SYM_CLASS_EXTERNAL,
+                    0x42,
+                ),
+            ],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        let data = pe_section_header(&out, 2);
+        let data_ptr = le_u32(data, 20) as usize;
+        let stored = u64::from_le_bytes(out[data_ptr..data_ptr + 8].try_into().unwrap());
+        assert_eq!(stored, 0x42);
+        assert_eq!(pe_base_reloc_dir(&out), (0, 0));
     }
 
     #[test]
