@@ -70,7 +70,11 @@ fn rejects_malformed_object_sections_before_allocating() {
     let dir = std::env::temp_dir().join(format!("weld-malformed-{}", std::process::id()));
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
-    fs::write(dir.join("input.c"), "int main(void) { return 0; }").unwrap();
+    fs::write(
+        dir.join("input.c"),
+        "static char buf[64]; int main(void) { return buf[0]; }",
+    )
+    .unwrap();
     let status = Command::new("gcc")
         .current_dir(&dir)
         .args(["-c", "input.c", "-o", "input.o"])
@@ -83,6 +87,7 @@ fn rejects_malformed_object_sections_before_allocating() {
     // .text: not a power of two, then far past any real alignment.
     let symtab = elf_section_field(&original, 2).unwrap();
     let progbits = elf_section_field(&original, 1).unwrap();
+    let nobits = elf_section_field(&original, 8).unwrap();
     let past_end = original.len() as u64 + 16;
     for (name, field, value, diagnostic) in [
         (
@@ -104,6 +109,7 @@ fn rejects_malformed_object_sections_before_allocating() {
             1u64 << 40,
             "unsupported alignment",
         ),
+        ("bss size 2^40", nobits + 32, 1u64 << 40, "is too large"),
     ] {
         let mut mutant = original.clone();
         mutant[field..field + 8].copy_from_slice(&value.to_le_bytes());
