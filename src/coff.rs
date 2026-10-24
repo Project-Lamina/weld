@@ -79,6 +79,7 @@ pub(crate) struct Section<'a> {
 
 pub(crate) enum Problem {
     Truncated,
+    SymbolTable,
     SectionData(String),
     Relocs(String),
 }
@@ -158,7 +159,11 @@ fn read_symbols(
     strtab: &[u8],
     object: &mut Object<'_>,
 ) {
-    object.symbols_truncated = sym_off + n_syms * SYMBOL_SIZE > coff.len();
+    if n_syms > 0 && (sym_off == 0 || sym_off + n_syms * SYMBOL_SIZE > coff.len()) {
+        object.symbols_truncated = true;
+        note(object, Problem::SymbolTable);
+        return;
+    }
     let mut i = 0;
     while i < n_syms {
         let rec = sym_off + i * SYMBOL_SIZE;
