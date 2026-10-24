@@ -245,7 +245,7 @@ pub(super) fn set_relative_tags(layout: &mut MergedLayout, count: u64) {
     let dynidx = layout.section_by_name[".dynamic"];
     let address = layout.sections[relaidx].vaddr;
     let size = layout.sections[relaidx].data.len() as u64;
-    for record in layout.sections[dynidx].data.chunks_exact_mut(16) {
+    for record in layout.sections[dynidx].data.as_chunks_mut::<16>().0 {
         let value = match u64::from_le_bytes(record[..8].try_into().unwrap()) {
             7 => address,
             8 => size,
