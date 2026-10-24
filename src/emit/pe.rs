@@ -457,6 +457,9 @@ const IMAGE_REL_AMD64_REL32_5: u16 = 0x0009;
 const IMAGE_SYM_UNDEFINED_SECTION: i16 = 0;
 const IMAGE_SYM_ABSOLUTE_SECTION: i16 = -1;
 const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
+/// Auxiliary record TagIndex names the default symbol used when the weak name
+/// has no strong definition anywhere in the link.
+const IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
 const IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
 const IMPORT_SYMBOL_PREFIX: &str = "__imp_";
 const IMAGE_SYM_CLASS_STATIC: u8 = 3;
@@ -481,6 +484,8 @@ struct CoffSymbol {
     value: u32,
     class: u8,
     typ: u16,
+    /// Symbol index of the default symbol, for weak externals.
+    tag: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -681,6 +686,11 @@ fn parse_coff_object(
             value: u32::from_le_bytes([r[8], r[9], r[10], r[11]]),
             class: r[16],
             typ: u16::from_le_bytes([r[14], r[15]]),
+            tag: if r[16] == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
+                coff_read_u32(coff, rec + SIZEOF_COFF_SYMBOL).unwrap_or(0) as usize
+            } else {
+                0
+            },
         });
         for _ in 0..num_aux {
             syms.push(CoffSymbol {
@@ -689,6 +699,7 @@ fn parse_coff_object(
                 value: 0,
                 class: 0,
                 typ: 0,
+                tag: 0,
             });
         }
         i += 1 + num_aux;
@@ -876,7 +887,18 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
     let mut undefined: Vec<&str> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::default();
     for syms in &syms_of {
-        for s in syms {
+        for rec in syms {
+            let s = if rec.class == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
+                if defs.contains_key(rec.name.as_str()) {
+                    continue;
+                }
+                match syms.get(rec.tag) {
+                    Some(default) => default,
+                    None => continue,
+                }
+            } else {
+                rec
+            };
             if s.section != IMAGE_SYM_UNDEFINED_SECTION
                 || s.class != IMAGE_SYM_CLASS_EXTERNAL
                 || s.name.is_empty()
@@ -1108,9 +1130,28 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
     // relocation if it is stored in memory. Absolute symbols are not relocated.
     let resolve =
         |oi: usize, sym_idx: usize, allow_thunk: bool, owner: &str| -> Result<(i64, bool)> {
-            let sym = syms_of[oi].get(sym_idx).ok_or_else(|| {
-                coff_error(format!("{owner} names missing symbol index {sym_idx}"))
-            })?;
+            let missing =
+                |idx: usize| coff_error(format!("{owner} names missing symbol index {idx}"));
+            let mut sym_idx = sym_idx;
+            let mut sym = syms_of[oi].get(sym_idx).ok_or_else(|| missing(sym_idx))?;
+            let mut hops = 0usize;
+            while sym.class == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
+                if let Some(&(def, _)) = defs.get(sym.name.as_str()) {
+                    return Ok(match def {
+                        CoffDef::Section { .. } => (def_va(def), true),
+                        CoffDef::Absolute(_) => (def_va(def), false),
+                    });
+                }
+                hops += 1;
+                if hops > syms_of[oi].len() {
+                    return Err(coff_error(format!(
+                        "weak external {} forms a cycle",
+                        sym.name
+                    )));
+                }
+                sym_idx = sym.tag;
+                sym = syms_of[oi].get(sym_idx).ok_or_else(|| missing(sym_idx))?;
+            }
             if sym.section > 0 {
                 if let Some(k) = slot_of[oi]
                     .get(sym.section as usize - 1)
@@ -1615,7 +1656,17 @@ mod tests {
         o.extend_from_slice(&(n as u16).to_le_bytes());
         o.extend_from_slice(&0u32.to_le_bytes());
         o.extend_from_slice(&(at as u32).to_le_bytes());
-        o.extend_from_slice(&((2 * n + symbols.len()) as u32).to_le_bytes());
+        let n_records: usize = symbols
+            .iter()
+            .map(|&(_, _, class, _)| {
+                if class == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum();
+        o.extend_from_slice(&((2 * n + n_records) as u32).to_le_bytes());
         o.extend_from_slice(&0u16.to_le_bytes());
         o.extend_from_slice(&0u16.to_le_bytes());
         for (i, s) in sections.iter().enumerate() {
@@ -1656,12 +1707,20 @@ mod tests {
             o.extend_from_slice(&[0u8; 3]);
         }
         for &(name, section, class, value) in symbols {
+            // For a weak external the value is the TagIndex of its default symbol,
+            // which is stored in the auxiliary record.
+            let weak = class == IMAGE_SYM_CLASS_WEAK_EXTERNAL;
             push_test_name(&mut o, name);
-            o.extend_from_slice(&value.to_le_bytes());
+            o.extend_from_slice(&(if weak { 0 } else { value }).to_le_bytes());
             o.extend_from_slice(&section.to_le_bytes());
             o.extend_from_slice(&0u16.to_le_bytes());
             o.push(class);
-            o.push(0);
+            o.push(u8::from(weak));
+            if weak {
+                o.extend_from_slice(&value.to_le_bytes());
+                o.extend_from_slice(&3u32.to_le_bytes());
+                o.extend_from_slice(&[0u8; 10]);
+            }
         }
         o.extend_from_slice(&((4 + strtab_tail.len()) as u32).to_le_bytes());
         o.extend_from_slice(strtab_tail);
@@ -1827,6 +1886,100 @@ mod tests {
                 ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
             ],
         )
+    }
+
+    fn weak_call_caller(default_index: u32) -> Vec<u8> {
+        let call = [0xE8, 0, 0, 0, 0, 0xC3];
+        coff_object(
+            &[text_section(&call, &[(1, 4, IMAGE_REL_AMD64_REL32)])],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                (
+                    "dflt",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_EXTERNAL,
+                    0,
+                ),
+                (
+                    "foo",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_WEAK_EXTERNAL,
+                    default_index,
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn test_coff_weak_external_prefers_strong_definition() {
+        let caller = weak_call_caller(3);
+        let body = [0xC3, 0xC3, 0x90, 0xC3];
+        let callee = coff_object(
+            &[text_section(&body, &[])],
+            &[("foo", 1, IMAGE_SYM_CLASS_EXTERNAL, 2)],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], &mut out)
+            .expect("links");
+        let disp = i32::from_le_bytes(out[512 + 1..512 + 5].try_into().unwrap());
+        assert_eq!(disp, 3);
+    }
+
+    #[test]
+    fn test_coff_weak_external_falls_back_to_default() {
+        let caller = weak_call_caller(3);
+        let body = [0xC3, 0xC3, 0x90, 0xC3];
+        let callee = coff_object(
+            &[text_section(&body, &[])],
+            &[("dflt", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], &mut out)
+            .expect("links");
+        let disp = i32::from_le_bytes(out[512 + 1..512 + 5].try_into().unwrap());
+        assert_eq!(disp, 1);
+    }
+
+    #[test]
+    fn test_coff_weak_external_with_absolute_default_stores_null() {
+        let text = [0xC3];
+        let data = [0u8; 8];
+        let relocs = [(0, 6, IMAGE_REL_AMD64_ADDR64)];
+        let obj = coff_object(
+            &[
+                text_section(&text, &[]),
+                TestSection {
+                    name: ".data",
+                    flags: DATA_FLAGS,
+                    data: &data,
+                    relocs: &relocs,
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                (
+                    "zero",
+                    IMAGE_SYM_ABSOLUTE_SECTION,
+                    IMAGE_SYM_CLASS_EXTERNAL,
+                    0,
+                ),
+                (
+                    "foo",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_WEAK_EXTERNAL,
+                    5,
+                ),
+            ],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        let data = pe_section_header(&out, 2);
+        let data_ptr = le_u32(data, 20) as usize;
+        let stored = u64::from_le_bytes(out[data_ptr..data_ptr + 8].try_into().unwrap());
+        assert_eq!(stored, 0);
+        assert_eq!(pe_base_reloc_dir(&out), (0, 0));
     }
 
     #[test]
