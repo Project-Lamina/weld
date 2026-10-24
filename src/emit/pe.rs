@@ -2,6 +2,7 @@
 
 use crate::collections::{HashMap, HashSet};
 use crate::link::{DynamicLinkInfo, MergedLayout};
+use crate::object::coff_reloc_span;
 use std::io::{Result, Write};
 
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -716,7 +717,7 @@ fn parse_coff_object(
         let raw_size = coff_read_u32(coff, sh + 16).ok_or_else(truncated)? as usize;
         let raw_ptr = coff_read_u32(coff, sh + 20).ok_or_else(truncated)? as usize;
         let relocs_ptr = coff_read_u32(coff, sh + 24).ok_or_else(truncated)? as usize;
-        let n_relocs = coff_read_u16(coff, sh + 32).ok_or_else(truncated)? as usize;
+        let n_relocs = coff_read_u16(coff, sh + 32).ok_or_else(truncated)?;
         let name = coff_section_name(&coff[sh..sh + 8], strtab);
 
         let uninitialized = flags & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0;
@@ -736,9 +737,11 @@ fn parse_coff_object(
                 .ok_or_else(|| coff_error(format!("section {name} data lies outside the object")))?
         };
 
+        let (relocs_at, n_relocs) =
+            coff_reloc_span(coff, relocs_ptr, n_relocs, flags).ok_or_else(truncated)?;
         let mut relocs = Vec::with_capacity(n_relocs);
         for r in 0..n_relocs {
-            let o = relocs_ptr + r * SIZEOF_COFF_RELOC;
+            let o = relocs_at + r * SIZEOF_COFF_RELOC;
             let rec = coff.get(o..o + SIZEOF_COFF_RELOC).ok_or_else(|| {
                 coff_error(format!(
                     "relocations of section {name} lie outside the object"
