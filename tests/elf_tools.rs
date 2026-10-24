@@ -389,7 +389,7 @@ fn load_segments_enforce_wx_for_pie_exec_and_static() {
         let bytes = fs::read(dir.join("output")).unwrap();
         let count = u16::from_le_bytes(bytes[56..58].try_into().unwrap()) as usize;
         let mut loads = 0;
-        for header in bytes[64..64 + count * 56].chunks_exact(56) {
+        for header in bytes[64..64 + count * 56].as_chunks::<56>().0 {
             let kind = u32::from_le_bytes(header[..4].try_into().unwrap());
             let rights = u32::from_le_bytes(header[4..8].try_into().unwrap());
             if kind == 1 {
