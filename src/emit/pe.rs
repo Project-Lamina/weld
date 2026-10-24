@@ -804,6 +804,12 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
     let mut seen: HashSet<&str> = HashSet::default();
     for (oi, syms) in syms_of.iter().enumerate() {
         for (ri, rec) in syms.iter().enumerate() {
+            if rec.class == IMAGE_SYM_CLASS_WEAK_EXTERNAL && rec.num_aux == 0 {
+                return Err(coff_error(format!(
+                    "weak external {} in object {oi} has no default record",
+                    rec.name
+                )));
+            }
             let s = if rec.class == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
                 if defs.contains_key(rec.name.as_str()) || !referenced.contains(&(oi, ri)) {
                     continue;
@@ -2295,5 +2301,22 @@ mod tests {
         let mut out = Vec::new();
         link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
         assert!(!out.windows(5).any(|w| w == b"dflt\0"));
+    }
+
+    #[test]
+    fn test_coff_weak_external_without_default_record_is_error() {
+        let mut caller = weak_call_caller(3);
+        let sym_off = u32::from_le_bytes(caller[8..12].try_into().unwrap()) as usize;
+        let weak_at = sym_off + 4 * 18;
+        assert_eq!(caller[weak_at + 16], IMAGE_SYM_CLASS_WEAK_EXTERNAL);
+        caller[weak_at + 17] = 0;
+        let callee = coff_object(
+            &[text_section(&[0xC3], &[])],
+            &[("dflt", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        assert!(
+            link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], &mut out).is_err()
+        );
     }
 }
