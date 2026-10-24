@@ -443,7 +443,13 @@ pub fn emit_pe_executable(
 
 const IMAGE_REL_AMD64_ABSOLUTE: u16 = 0x0000;
 const IMAGE_REL_AMD64_ADDR32NB: u16 = 0x0003;
+const IMAGE_REL_AMD64_ADDR64: u16 = 0x0001;
+const IMAGE_REL_AMD64_ADDR32: u16 = 0x0002;
 const IMAGE_REL_AMD64_REL32: u16 = 0x0004;
+const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
+const IMAGE_REL_BASED_DIR64: u16 = 10;
+const BASE_RELOC_PAGE: u32 = 0x1000;
+const DATA_DIR_BASE_RELOC: usize = 5;
 const IMAGE_REL_AMD64_REL32_5: u16 = 0x0009;
 const IMAGE_SYM_UNDEFINED_SECTION: i16 = 0;
 const IMAGE_SYM_ABSOLUTE_SECTION: i16 = -1;
@@ -573,6 +579,35 @@ fn coff_duplicate_symbol(name: &str, first: usize, second: usize) -> std::io::Er
     coff_error(format!(
         "duplicate symbol {name} defined in object {first} and object {second}"
     ))
+}
+
+/// Base relocation blocks: one per 4 KiB page, each with `(type << 12) | offset` entries.
+fn build_base_relocs(sites: &[(u32, u16)]) -> Vec<u8> {
+    let mut sites = sites.to_vec();
+    sites.sort_unstable();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < sites.len() {
+        let page = sites[i].0 & !(BASE_RELOC_PAGE - 1);
+        let mut j = i;
+        while j < sites.len() && sites[j].0 & !(BASE_RELOC_PAGE - 1) == page {
+            j += 1;
+        }
+        let mut entries: Vec<u16> = sites[i..j]
+            .iter()
+            .map(|&(rva, ty)| (ty << 12) | ((rva & (BASE_RELOC_PAGE - 1)) as u16))
+            .collect();
+        if entries.len() % 2 == 1 {
+            entries.push(0);
+        }
+        out.extend_from_slice(&page.to_le_bytes());
+        out.extend_from_slice(&((8 + 2 * entries.len()) as u32).to_le_bytes());
+        for entry in entries {
+            out.extend_from_slice(&entry.to_le_bytes());
+        }
+        i = j;
+    }
+    out
 }
 
 /// Parse one COFF object. Sections that are not linked are `None`, so the
@@ -852,7 +887,15 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
     let text_size = stub_off + usize::from(needs_main_stub);
 
     let has_data = region_len[CoffRegion::Writable as usize] > 0;
-    let n_out_sections = if has_data { 3 } else { 2 };
+    let has_base_relocs = sections.iter().any(|sec| {
+        sec.keep
+            && sec
+                .relocs
+                .iter()
+                .any(|&(_, _, t)| t == IMAGE_REL_AMD64_ADDR64 || t == IMAGE_REL_AMD64_ADDR32)
+    });
+    let n_regions = if has_data { 3 } else { 2 };
+    let n_out_sections = n_regions + usize::from(has_base_relocs);
     let headers_raw: usize = SIZEOF_DOS_STUB
         + SIZEOF_PE_SIGNATURE
         + SIZEOF_COFF_HEADER
@@ -1024,14 +1067,20 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         )))
     };
 
+    let mut base_relocs: Vec<(u32, u16)> = Vec::new();
     for sec in sections.iter().filter(|sec| sec.keep) {
         let base = region_base[sec.region as usize] + sec.offset;
         for &(vaddr, sym_idx, rel_type) in &sec.relocs {
             if rel_type == IMAGE_REL_AMD64_ABSOLUTE {
                 continue;
             }
+            let width = if rel_type == IMAGE_REL_AMD64_ADDR64 {
+                8
+            } else {
+                4
+            };
             let field = vaddr as usize;
-            if field + 4 > sec.size {
+            if field + width > sec.size {
                 return Err(coff_error(format!(
                     "relocation at {field:#x} lies outside section {}",
                     sec.name
@@ -1039,28 +1088,42 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
             }
             let at = base + field;
             let p_va = IMAGE_BASE as i64 + i64::from(text_rva) + at as i64;
-            let addend = i64::from(i32::from_le_bytes([
-                blob[at],
-                blob[at + 1],
-                blob[at + 2],
-                blob[at + 3],
-            ]));
+            let site_rva = text_rva + at as u32;
+            let addend = if width == 8 {
+                i64::from_le_bytes(blob[at..at + 8].try_into().unwrap())
+            } else {
+                i64::from(i32::from_le_bytes(blob[at..at + 4].try_into().unwrap()))
+            };
             let object = sec.object;
-            let bytes: [u8; 4] = match rel_type {
+            match rel_type {
                 IMAGE_REL_AMD64_REL32..=IMAGE_REL_AMD64_REL32_5 => {
                     let target = resolve(object, sym_idx as usize, true, &sec.name)?;
                     let trailing = i64::from(rel_type - IMAGE_REL_AMD64_REL32);
                     let v = target + addend - (p_va + 4 + trailing);
-                    i32::try_from(v)
-                        .map_err(|_| coff_error(format!("REL32 out of range in {}", sec.name)))?
-                        .to_le_bytes()
+                    let v = i32::try_from(v)
+                        .map_err(|_| coff_error(format!("REL32 out of range in {}", sec.name)))?;
+                    blob[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                IMAGE_REL_AMD64_ADDR64 => {
+                    let target = resolve(object, sym_idx as usize, false, &sec.name)?;
+                    let v = (target + addend) as u64;
+                    blob[at..at + 8].copy_from_slice(&v.to_le_bytes());
+                    base_relocs.push((site_rva, IMAGE_REL_BASED_DIR64));
+                }
+                IMAGE_REL_AMD64_ADDR32 => {
+                    let target = resolve(object, sym_idx as usize, false, &sec.name)?;
+                    // The loader adds its base delta to these 32 bits only.
+                    let v = (target + addend) as u32;
+                    blob[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                    base_relocs.push((site_rva, IMAGE_REL_BASED_HIGHLOW));
                 }
                 IMAGE_REL_AMD64_ADDR32NB => {
                     let target = resolve(object, sym_idx as usize, false, &sec.name)?;
                     let v = target - IMAGE_BASE as i64 + addend;
-                    u32::try_from(v)
-                        .map_err(|_| coff_error(format!("ADDR32NB out of range in {}", sec.name)))?
-                        .to_le_bytes()
+                    let v = u32::try_from(v).map_err(|_| {
+                        coff_error(format!("ADDR32NB out of range in {}", sec.name))
+                    })?;
+                    blob[at..at + 4].copy_from_slice(&v.to_le_bytes());
                 }
                 other => {
                     return Err(coff_error(format!(
@@ -1068,8 +1131,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                         sec.name
                     )));
                 }
-            };
-            blob[at..at + 4].copy_from_slice(&bytes);
+            }
         }
     }
 
@@ -1103,14 +1165,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
         ));
     }
-    let sec_rvas: Vec<u32> = region_rva[..n_out_sections].to_vec();
-    let mut sec_file_offs = Vec::with_capacity(pe_sections.len());
-    let mut file_off = size_of_headers;
-    for sec in &pe_sections {
-        sec_file_offs.push(file_off);
-        file_off += sec.raw_size();
-    }
-    let last_end = if has_data {
+    let regions_end = if has_data {
         data_rva as u64
             + align_up(
                 region_len[CoffRegion::Writable as usize] as u64,
@@ -1119,7 +1174,27 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
     } else {
         rdata_rva as u64 + align_up(rdata_len as u64, SECTION_ALIGN)
     };
-    let size_of_image = align_up(last_end, SECTION_ALIGN) as u32;
+    let mut sec_rvas: Vec<u32> = region_rva[..n_regions].to_vec();
+    let mut image_end = regions_end;
+    let mut base_reloc_dir = (0u32, 0u32);
+    if !base_relocs.is_empty() {
+        let bytes = build_base_relocs(&base_relocs);
+        base_reloc_dir = (regions_end as u32, bytes.len() as u32);
+        sec_rvas.push(regions_end as u32);
+        image_end += align_up(bytes.len() as u64, SECTION_ALIGN);
+        pe_sections.push(PeSection::new(
+            ".reloc",
+            bytes,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE,
+        ));
+    }
+    let mut sec_file_offs = Vec::with_capacity(pe_sections.len());
+    let mut file_off = size_of_headers;
+    for sec in &pe_sections {
+        sec_file_offs.push(file_off);
+        file_off += sec.raw_size();
+    }
+    let size_of_image = align_up(image_end, SECTION_ALIGN) as u32;
 
     emit_pe_raw(
         out,
@@ -1133,6 +1208,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         iat_rva,
         idt_sz,
         iat_sz,
+        base_reloc_dir,
     )
 }
 
@@ -1149,6 +1225,7 @@ fn emit_pe_raw(
     iat_rva: u32,
     idt_size: u32,
     iat_size: u32,
+    base_reloc_dir: (u32, u32),
 ) -> Result<()> {
     let mut dos = [0u8; SIZEOF_DOS_STUB];
     dos[0] = b'M';
@@ -1207,6 +1284,12 @@ fn emit_pe_raw(
     write_u32_at_off(&mut opt, 112 + 8 + 4, idt_size);
     write_u32_at_off(&mut opt, 112 + 12 * 8, iat_rva);
     write_u32_at_off(&mut opt, 112 + 12 * 8 + 4, iat_size);
+    write_u32_at_off(&mut opt, 112 + DATA_DIR_BASE_RELOC * 8, base_reloc_dir.0);
+    write_u32_at_off(
+        &mut opt,
+        112 + DATA_DIR_BASE_RELOC * 8 + 4,
+        base_reloc_dir.1,
+    );
     out.write_all(&opt)?;
 
     for (i, sec) in sections.iter().enumerate() {
@@ -1548,5 +1631,106 @@ mod tests {
         let mut out = Vec::new();
         link_and_emit_pe_from_coffs(&[obj.as_slice(), obj.as_slice()], &mut out).expect("links");
         assert_eq!(pe_section_vsize(&out, 0), 4);
+    }
+
+    fn pe_section_header(out: &[u8], index: usize) -> &[u8] {
+        let e_lfanew = u32::from_le_bytes(out[0x3C..0x40].try_into().unwrap()) as usize;
+        let at = e_lfanew
+            + 4
+            + SIZEOF_COFF_HEADER
+            + SIZEOF_OPTIONAL_HEADER as usize
+            + index * SIZEOF_SECTION_HEADER;
+        &out[at..at + SIZEOF_SECTION_HEADER]
+    }
+
+    fn le_u32(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    fn pe_base_reloc_dir(out: &[u8]) -> (u32, u32) {
+        let e_lfanew = u32::from_le_bytes(out[0x3C..0x40].try_into().unwrap()) as usize;
+        let dir = e_lfanew + 24 + 112 + DATA_DIR_BASE_RELOC * 8;
+        (le_u32(out, dir), le_u32(out, dir + 4))
+    }
+
+    const DATA_FLAGS: u32 =
+        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+
+    fn absolute_pointer_object(rel_type: u16) -> Vec<u8> {
+        let text = [0xC3];
+        let data = [0u8; 8];
+        let relocs = [(0, 4, rel_type)];
+        coff_object(
+            &[
+                text_section(&text, &[]),
+                TestSection {
+                    name: ".data",
+                    flags: DATA_FLAGS,
+                    data: &data,
+                    relocs: &relocs,
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[
+                ("f", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+            ],
+        )
+    }
+
+    #[test]
+    fn test_coff_addr64_emits_base_reloc() {
+        let obj = absolute_pointer_object(IMAGE_REL_AMD64_ADDR64);
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+
+        let data = pe_section_header(&out, 2);
+        let data_rva = le_u32(data, 12);
+        let data_ptr = le_u32(data, 20) as usize;
+        let stored = u64::from_le_bytes(out[data_ptr..data_ptr + 8].try_into().unwrap());
+        assert_eq!(stored, IMAGE_BASE + 0x1000);
+
+        let (reloc_rva, reloc_size) = pe_base_reloc_dir(&out);
+        let reloc = pe_section_header(&out, 3);
+        assert_eq!(le_u32(reloc, 12), reloc_rva);
+        assert_eq!(reloc_size, 12);
+        let ptr = le_u32(reloc, 20) as usize;
+        assert_eq!(le_u32(&out, ptr), data_rva & !0xFFF);
+        assert_eq!(le_u32(&out, ptr + 4), 12);
+        let entry = u16::from_le_bytes(out[ptr + 8..ptr + 10].try_into().unwrap());
+        assert_eq!(
+            entry,
+            (IMAGE_REL_BASED_DIR64 << 12) | (data_rva & 0xFFF) as u16
+        );
+    }
+
+    #[test]
+    fn test_coff_addr32_emits_highlow_reloc() {
+        let obj = absolute_pointer_object(IMAGE_REL_AMD64_ADDR32);
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+
+        let data_ptr = le_u32(pe_section_header(&out, 2), 20) as usize;
+        assert_eq!(le_u32(&out, data_ptr), 0x4000_1000);
+
+        let (reloc_rva, _) = pe_base_reloc_dir(&out);
+        let reloc = pe_section_header(&out, 3);
+        assert_eq!(le_u32(reloc, 12), reloc_rva);
+        let ptr = le_u32(reloc, 20) as usize;
+        let entry = u16::from_le_bytes(out[ptr + 8..ptr + 10].try_into().unwrap());
+        assert_eq!(entry >> 12, IMAGE_REL_BASED_HIGHLOW);
+    }
+
+    #[test]
+    fn test_coff_without_absolute_relocs_has_no_base_reloc() {
+        let text = [0xC3];
+        let obj = coff_object(
+            &[text_section(&text, &[])],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        assert_eq!(pe_base_reloc_dir(&out), (0, 0));
     }
 }
