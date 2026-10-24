@@ -24,6 +24,7 @@ pub enum SectionType {
 
 const SHT_NULL: u32 = 0;
 const SHT_NOBITS: u32 = 8;
+const MAX_SECTION_ALIGN: u64 = 1 << 21;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
@@ -394,7 +395,18 @@ pub fn parse_elf64_slice(
     }
 
     for (i, sh) in sections.iter().enumerate() {
-        if sh.sh_type == SHT_NULL || sh.sh_type == SHT_NOBITS {
+        if sh.sh_type == SHT_NULL {
+            continue;
+        }
+        if sh.sh_addralign > 1
+            && (!sh.sh_addralign.is_power_of_two() || sh.sh_addralign > MAX_SECTION_ALIGN)
+        {
+            return Err(format!(
+                "section {i} has unsupported alignment {}",
+                sh.sh_addralign
+            ));
+        }
+        if sh.sh_type == SHT_NOBITS {
             continue;
         }
         if sh
