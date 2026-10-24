@@ -651,6 +651,12 @@ fn parse_coff_object(
     coff: &[u8],
 ) -> Result<(Vec<CoffSymbol>, Vec<Option<CoffSection<'_>>>)> {
     let truncated = || coff_error(format!("truncated COFF object {object}"));
+    let machine = coff_read_u16(coff, 0).ok_or_else(truncated)?;
+    if machine != IMAGE_FILE_MACHINE_AMD64 {
+        return Err(coff_error(format!(
+            "object {object} has machine type {machine:#06x}; only x86-64 objects can be linked"
+        )));
+    }
     let n_sections = coff_read_u16(coff, 2).ok_or_else(truncated)? as usize;
     let opt_size = coff_read_u16(coff, 16).ok_or_else(truncated)? as usize;
     let sym_table_off = coff_read_u32(coff, 8).ok_or_else(truncated)? as usize;
@@ -2117,6 +2123,16 @@ mod tests {
             entry,
             (IMAGE_REL_BASED_DIR64 << 12) | (data_rva & 0xFFF) as u16
         );
+    }
+
+    #[test]
+    fn test_coff_non_amd64_object_is_rejected() {
+        let mut obj = absolute_pointer_object(IMAGE_REL_AMD64_ADDR32NB);
+        obj[0..2].copy_from_slice(&0xAA64u16.to_le_bytes());
+        let mut out = Vec::new();
+        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+            .expect_err("arm64 must be rejected");
+        assert!(err.to_string().contains("0xaa64"), "{err}");
     }
 
     #[test]
