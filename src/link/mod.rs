@@ -616,7 +616,9 @@ fn link_multi_object_parsed(
         };
         let strings = get_strtab_from_section(&obj.data, &obj.sections[table.sh_link as usize]);
         for (index, record) in get_strtab_from_section(&obj.data, table)
-            .chunks_exact(24)
+            .as_chunks::<24>()
+            .0
+            .iter()
             .enumerate()
         {
             let shndx = u16::from_le_bytes(record[6..8].try_into().unwrap()) as usize;

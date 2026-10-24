@@ -152,7 +152,9 @@ pub(super) fn finish(
     let dynidx = layout.section_by_name[".dynamic"];
     let existing_size = layout.sections[dynidx]
         .data
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .find_map(|record| {
             (u64::from_le_bytes(record[..8].try_into().unwrap()) == 8)
                 .then(|| u64::from_le_bytes(record[8..].try_into().unwrap()) as usize)
