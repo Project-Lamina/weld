@@ -32,11 +32,14 @@ const COFF_MACHINE_RISCV64: u16 = 0x5064;
 
 const IMAGE_SYM_UNDEFINED: i16 = 0;
 const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
+const IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
 
 #[derive(Default, Clone)]
 struct ObjectSymbolSummary {
     defined: HashSet<String>,
     undefined: HashSet<String>,
+    /// (weak name, default name) pairs from COFF weak externals.
+    weak_defaults: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -225,6 +228,18 @@ fn collect_coff_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
         &data[strtab_off.min(data.len())..]
     };
 
+    let referenced = coff_relocated_symbols(data);
+    let mut weak_tags: HashSet<usize> = HashSet::default();
+    let mut i = 0usize;
+    while i < sym_count {
+        let rec_off = sym_table_off + i * 18;
+        if data[rec_off + 16] == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
+            let tag = read_u32_le(data, rec_off + 18).unwrap_or(0) as usize;
+            weak_tags.insert(tag);
+        }
+        i += 1 + data[rec_off + 17] as usize;
+    }
+
     let mut summary = ObjectSymbolSummary::default();
     let mut i = 0usize;
     while i < sym_count {
@@ -232,14 +247,23 @@ fn collect_coff_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
         let section_number = i16::from_le_bytes([data[rec_off + 12], data[rec_off + 13]]);
         let storage_class = data[rec_off + 16];
         let num_aux = data[rec_off + 17] as usize;
+        let name = coff_symbol_name(&data[rec_off..rec_off + 8], strtab);
 
-        if storage_class == IMAGE_SYM_CLASS_EXTERNAL {
-            let name = coff_symbol_name(&data[rec_off..rec_off + 8], strtab);
-            if !name.is_empty() {
-                if section_number == IMAGE_SYM_UNDEFINED {
-                    summary.undefined.insert(name);
-                } else {
-                    summary.defined.insert(name);
+        if storage_class == IMAGE_SYM_CLASS_EXTERNAL && !name.is_empty() {
+            if section_number != IMAGE_SYM_UNDEFINED {
+                summary.defined.insert(name);
+            } else if referenced.contains(&i) || !weak_tags.contains(&i) {
+                summary.undefined.insert(name);
+            }
+        } else if storage_class == IMAGE_SYM_CLASS_WEAK_EXTERNAL && num_aux > 0 && !name.is_empty()
+        {
+            let tag = read_u32_le(data, rec_off + 18).unwrap_or(0) as usize;
+            if tag < sym_count {
+                let tag_off = sym_table_off + tag * 18;
+                let default = coff_symbol_name(&data[tag_off..tag_off + 8], strtab);
+                if referenced.contains(&i) && !default.is_empty() {
+                    summary.undefined.insert(name.clone());
+                    summary.weak_defaults.push((name, default));
                 }
             }
         }
@@ -251,6 +275,37 @@ fn collect_coff_symbol_summary(data: &[u8]) -> Option<ObjectSymbolSummary> {
         .undefined
         .retain(|sym| !summary.defined.contains(sym));
     Some(summary)
+}
+
+/// Symbol-table indices named by any relocation in the object. Overflowed
+/// relocation counts are not followed, so such an object is read as referencing
+/// only the relocations it lists directly.
+fn coff_relocated_symbols(data: &[u8]) -> HashSet<usize> {
+    let mut referenced = HashSet::default();
+    let Some(n_sections) = data
+        .get(2..4)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+    else {
+        return referenced;
+    };
+    let opt_size = data
+        .get(16..18)
+        .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize);
+    for s in 0..n_sections {
+        let sh = 20 + opt_size + s * 40;
+        let (Some(ptr), Some(count)) = (read_u32_le(data, sh + 24), data.get(sh + 32..sh + 34))
+        else {
+            break;
+        };
+        let count = u16::from_le_bytes([count[0], count[1]]) as usize;
+        for r in 0..count {
+            let Some(sym) = read_u32_le(data, ptr as usize + r * 10 + 4) else {
+                break;
+            };
+            referenced.insert(sym as usize);
+        }
+    }
+    referenced
 }
 
 /// Decode a COFF symbol name: either inline (≤8 bytes, NUL-padded) or a
@@ -352,6 +407,7 @@ fn apply_symbol_summary(
     summary: &ObjectSymbolSummary,
     defined_symbols: &mut HashSet<String>,
     unresolved_symbols: &mut HashSet<String>,
+    weak_defaults: &mut Vec<(String, String)>,
 ) {
     for sym in &summary.defined {
         defined_symbols.insert(sym.clone());
@@ -362,6 +418,7 @@ fn apply_symbol_summary(
             unresolved_symbols.insert(sym.clone());
         }
     }
+    weak_defaults.extend(summary.weak_defaults.iter().cloned());
 }
 
 /// Opens a static library, reading only its member headers and symbol index when
@@ -439,10 +496,12 @@ fn load_archive_entries(data: Vec<u8>, position: usize) -> Option<ArchiveEntries
         });
     }
     let index = archive.index.and_then(|index| {
-        if members
-            .iter()
-            .any(|entry| !is_elf(data.get(entry.start..entry.start + entry.len).unwrap_or(&[])))
-        {
+        if members.iter().any(|entry| {
+            !is_elf(
+                data.get(entry.start..entry.start + entry.len)
+                    .unwrap_or(&[]),
+            )
+        }) {
             return None;
         }
         index
@@ -458,7 +517,9 @@ fn load_archive_entries(data: Vec<u8>, position: usize) -> Option<ArchiveEntries
     });
     if index.is_none() {
         for entry in &mut members {
-            let body = data.get(entry.start..entry.start + entry.len).unwrap_or(&[]);
+            let body = data
+                .get(entry.start..entry.start + entry.len)
+                .unwrap_or(&[]);
             entry.symbols = Some(collect_object_symbol_summary(body).unwrap_or_default());
         }
     }
@@ -475,12 +536,47 @@ fn load_archive_entries(data: Vec<u8>, position: usize) -> Option<ArchiveEntries
     })
 }
 
+/// A weak external's default is only needed if nothing else defines the weak
+/// name, so defaults are requested after the ordinary selection has settled.
+fn select_with_weak_defaults(
+    archives: &mut [ArchiveEntries],
+    objects: &mut Vec<Vec<u8>>,
+    positions: &mut Vec<usize>,
+    defined_symbols: &mut HashSet<String>,
+    unresolved_symbols: &mut HashSet<String>,
+    weak_defaults: &mut Vec<(String, String)>,
+) {
+    loop {
+        select_archive_members(
+            archives,
+            objects,
+            positions,
+            defined_symbols,
+            unresolved_symbols,
+            weak_defaults,
+        );
+        let mut requested = false;
+        for (weak, default) in weak_defaults.iter() {
+            if !defined_symbols.contains(weak)
+                && !defined_symbols.contains(default)
+                && unresolved_symbols.insert(default.clone())
+            {
+                requested = true;
+            }
+        }
+        if !requested {
+            break;
+        }
+    }
+}
+
 fn select_archive_members(
     archives: &mut [ArchiveEntries],
     objects: &mut Vec<Vec<u8>>,
     positions: &mut Vec<usize>,
     defined_symbols: &mut HashSet<String>,
     unresolved_symbols: &mut HashSet<String>,
+    weak_defaults: &mut Vec<(String, String)>,
 ) {
     loop {
         let mut changed = false;
@@ -523,7 +619,7 @@ fn select_archive_members(
                 log::trace!("archive select member {i} at position {}", entry.position);
                 let position = entry.position;
                 let symbols = entry.symbols.clone().expect("summary just set");
-                apply_symbol_summary(&symbols, defined_symbols, unresolved_symbols);
+                apply_symbol_summary(&symbols, defined_symbols, unresolved_symbols, weak_defaults);
                 objects.push(normalize_macho_container(body_owned));
                 positions.push(position);
                 changed = true;
@@ -598,6 +694,7 @@ pub fn load_objects_with_positions(
     let mut dylib_paths: Vec<PathBuf> = Vec::new();
     let mut defined_symbols: HashSet<String> = HashSet::default();
     let mut unresolved_symbols: HashSet<String> = entries.iter().cloned().collect();
+    let mut weak_defaults: Vec<(String, String)> = Vec::new();
 
     let loaded = crate::parallel::map(paths.to_vec(), |path| {
         std::fs::read(path).ok().map(normalize_macho_container)
@@ -614,7 +711,12 @@ pub fn load_objects_with_positions(
             for obj in expand_data_to_objects(data)? {
                 if need_summaries {
                     let symbols = collect_object_symbol_summary(&obj).unwrap_or_default();
-                    apply_symbol_summary(&symbols, &mut defined_symbols, &mut unresolved_symbols);
+                    apply_symbol_summary(
+                        &symbols,
+                        &mut defined_symbols,
+                        &mut unresolved_symbols,
+                        &mut weak_defaults,
+                    );
                 }
                 all_objects.push(obj);
                 positions.push(position);
@@ -634,12 +736,13 @@ pub fn load_objects_with_positions(
         archives.push(open_library_entries(path, position)?);
     }
 
-    select_archive_members(
+    select_with_weak_defaults(
         &mut archives,
         &mut all_objects,
         &mut positions,
         &mut defined_symbols,
         &mut unresolved_symbols,
+        &mut weak_defaults,
     );
 
     if all_objects.is_empty() {
@@ -888,6 +991,7 @@ mod archive_selection_tests {
                 &mut positions,
                 &mut defined,
                 &mut unresolved,
+                &mut Vec::new(),
             );
             assert!(unresolved.is_empty());
             assert_eq!(positions, [7, 7, 7]);
@@ -958,5 +1062,173 @@ mod archive_selection_tests {
         assert!(defines("used_fn"));
         assert!(defines("dep_fn"));
         assert!(!defines("unused_fn"));
+    }
+}
+
+#[cfg(test)]
+mod coff_weak_selection_tests {
+    use super::*;
+
+    /// Symbol tuples are (name, section, class, tag); `tag` is only used for weak externals.
+    /// `relocs` lists the symbol indices referenced by one relocation each.
+    fn coff_object(symbols: &[(&str, i16, u8, u32)], relocs: &[u32]) -> Vec<u8> {
+        let mut records = Vec::new();
+        let mut count = 0u32;
+        for &(name, section, class, tag) in symbols {
+            let mut name_field = [0u8; 8];
+            name_field[..name.len()].copy_from_slice(name.as_bytes());
+            records.extend_from_slice(&name_field);
+            records.extend_from_slice(&0u32.to_le_bytes());
+            records.extend_from_slice(&section.to_le_bytes());
+            records.extend_from_slice(&0u16.to_le_bytes());
+            records.push(class);
+            if class == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
+                records.push(1);
+                records.extend_from_slice(&tag.to_le_bytes());
+                records.extend_from_slice(&[0u8; 14]);
+                count += 2;
+            } else {
+                records.push(0);
+                count += 1;
+            }
+        }
+        let section_count = u16::from(!relocs.is_empty());
+        let reloc_off = 20 + 40 * usize::from(section_count);
+        let sym_off = reloc_off + 10 * relocs.len();
+        let mut data = vec![0u8; 20];
+        data[0..2].copy_from_slice(&COFF_MACHINE_AMD64.to_le_bytes());
+        data[2..4].copy_from_slice(&section_count.to_le_bytes());
+        data[8..12].copy_from_slice(&(sym_off as u32).to_le_bytes());
+        data[12..16].copy_from_slice(&count.to_le_bytes());
+        if !relocs.is_empty() {
+            let mut sh = [0u8; 40];
+            sh[..6].copy_from_slice(b".text\0");
+            sh[24..28].copy_from_slice(&(reloc_off as u32).to_le_bytes());
+            sh[32..34].copy_from_slice(&(relocs.len() as u16).to_le_bytes());
+            data.extend_from_slice(&sh);
+        }
+        for &sym in relocs {
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&sym.to_le_bytes());
+            data.extend_from_slice(&IMAGE_REL_AMD64_ADDR64_TEST.to_le_bytes());
+        }
+        data.extend_from_slice(&records);
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data
+    }
+
+    const IMAGE_REL_AMD64_ADDR64_TEST: u16 = 1;
+
+    fn archive(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        for (name, body) in members {
+            let header = format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                format!("{name}/"),
+                0,
+                0,
+                0,
+                644,
+                body.len()
+            );
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                out.push(b'\n');
+            }
+        }
+        out
+    }
+
+    fn selected_members(input: &[u8], archive_data: Vec<u8>) -> Vec<usize> {
+        let mut archives = vec![load_archive_entries(archive_data, 1).unwrap()];
+        let mut objects = vec![input.to_vec()];
+        let mut positions = vec![0];
+        let mut defined = HashSet::default();
+        let mut unresolved = HashSet::default();
+        let mut weak_defaults = Vec::new();
+        let summary = collect_object_symbol_summary(input).unwrap();
+        apply_symbol_summary(&summary, &mut defined, &mut unresolved, &mut weak_defaults);
+        select_with_weak_defaults(
+            &mut archives,
+            &mut objects,
+            &mut positions,
+            &mut defined,
+            &mut unresolved,
+            &mut weak_defaults,
+        );
+        archives[0]
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.selected)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn caller(relocs: &[u32]) -> Vec<u8> {
+        coff_object(
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("dflt", IMAGE_SYM_UNDEFINED, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("foo", IMAGE_SYM_UNDEFINED, IMAGE_SYM_CLASS_WEAK_EXTERNAL, 1),
+            ],
+            relocs,
+        )
+    }
+
+    fn lib_with(names: &[&str]) -> Vec<u8> {
+        let mut members = vec![(
+            "other.o",
+            coff_object(&[("other", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)], &[]),
+        )];
+        for name in names {
+            members.push((
+                name,
+                coff_object(&[(name, 1, IMAGE_SYM_CLASS_EXTERNAL, 0)], &[]),
+            ));
+        }
+        let members: Vec<(&str, Vec<u8>)> = members.into_iter().map(|(n, b)| (n, b)).collect();
+        archive(&members)
+    }
+
+    #[test]
+    fn weak_external_summary_names_default() {
+        let summary = collect_coff_symbol_summary(&caller(&[2])).unwrap();
+        assert!(summary.undefined.contains("foo"));
+        assert!(!summary.undefined.contains("dflt"));
+        assert_eq!(
+            summary.weak_defaults,
+            [("foo".to_string(), "dflt".to_string())]
+        );
+    }
+
+    #[test]
+    fn strong_definition_of_weak_name_is_selected_over_default() {
+        let lib = archive(&[
+            (
+                "other.o",
+                coff_object(&[("other", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)], &[]),
+            ),
+            (
+                "dflt.o",
+                coff_object(&[("dflt", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)], &[]),
+            ),
+            (
+                "foo.o",
+                coff_object(&[("foo", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)], &[]),
+            ),
+        ]);
+        assert_eq!(selected_members(&caller(&[2]), lib), [2]);
+    }
+
+    #[test]
+    fn default_is_selected_when_nothing_defines_weak_name() {
+        assert_eq!(selected_members(&caller(&[2]), lib_with(&["dflt"])), [1]);
+    }
+
+    #[test]
+    fn direct_reference_to_default_selects_it() {
+        assert_eq!(selected_members(&caller(&[1, 2]), lib_with(&["dflt"])), [1]);
     }
 }
