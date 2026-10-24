@@ -110,10 +110,10 @@ fn parse_index(data: &[u8]) -> Option<HashMap<String, Vec<usize>>> {
     let offsets = data.get(4..names_start)?;
     let mut names = data.get(names_start..)?;
     let mut index: HashMap<String, Vec<usize>> = HashMap::default();
-    for offset in offsets.chunks_exact(4) {
+    for offset in offsets.as_chunks::<4>().0 {
         let end = names.iter().position(|&b| b == 0)?;
         let name = std::str::from_utf8(&names[..end]).ok()?.to_string();
-        let offset = u32::from_be_bytes(offset.try_into().ok()?) as usize;
+        let offset = u32::from_be_bytes(*offset) as usize;
         index.entry(name).or_default().push(offset);
         names = &names[end + 1..];
     }
