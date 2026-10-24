@@ -155,3 +155,26 @@ fn rejects_pc_relative_relocation_that_does_not_fit() {
     assert!(!dir.join("output").exists());
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn rejects_duplicate_strong_definitions() {
+    let dir = std::env::temp_dir().join(format!("weld-dupdef-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(
+        dir.join("a.c"),
+        "int dupsym = 1; int main(void) { return dupsym; }",
+    )
+    .unwrap();
+    fs::write(dir.join("b.c"), "int dupsym = 2;").unwrap();
+    let output = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-Bdrv", "a.c", "b.c", "-o", "output"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("multiple definition of dupsym"), "{stderr}");
+    assert!(!dir.join("output").exists());
+    fs::remove_dir_all(dir).unwrap();
+}

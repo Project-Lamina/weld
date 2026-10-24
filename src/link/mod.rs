@@ -243,13 +243,21 @@ fn link_multi_object_parsed(
                 &section_contribs[obj_idx],
             )
         });
+    let mut strong_definitions: HashSet<String> = HashSet::default();
     for resolution in resolutions {
         let (resolved, by_index) = resolution?;
         resolved_by_index_per_object.push(by_index);
 
         for (name, r) in resolved {
-            if let Some(addr) = r.address {
+            let Some(addr) = r.address else {
+                continue;
+            };
+            if r.is_weak {
                 global_symbols.entry(name).or_insert(addr);
+            } else if !strong_definitions.insert(name.clone()) {
+                return Err(format!("multiple definition of {name}"));
+            } else {
+                global_symbols.insert(name, addr);
             }
         }
     }
