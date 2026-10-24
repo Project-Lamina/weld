@@ -79,13 +79,31 @@ fn rejects_malformed_object_sections_before_allocating() {
     assert!(status.success());
     let original = fs::read(dir.join("input.o")).unwrap();
 
-    // SHT_SYMTAB (2) sh_size and SHT_PROGBITS (1) sh_offset, both pointing past EOF.
+    // SHT_SYMTAB (2) sh_size, SHT_PROGBITS (1) sh_offset past EOF, and sh_addralign of
+    // .text: not a power of two, then far past any real alignment.
     let symtab = elf_section_field(&original, 2).unwrap();
     let progbits = elf_section_field(&original, 1).unwrap();
     let past_end = original.len() as u64 + 16;
-    for (name, field, value) in [
-        ("symtab size", symtab + 32, 1u64 << 60),
-        ("progbits offset", progbits + 24, past_end),
+    for (name, field, value, diagnostic) in [
+        (
+            "symtab size",
+            symtab + 32,
+            1u64 << 60,
+            "extends past end of file",
+        ),
+        (
+            "progbits offset",
+            progbits + 24,
+            past_end,
+            "extends past end of file",
+        ),
+        ("alignment 3", progbits + 48, 3, "unsupported alignment 3"),
+        (
+            "alignment 2^40",
+            progbits + 48,
+            1u64 << 40,
+            "unsupported alignment",
+        ),
     ] {
         let mut mutant = original.clone();
         mutant[field..field + 8].copy_from_slice(&value.to_le_bytes());
@@ -97,10 +115,7 @@ fn rejects_malformed_object_sections_before_allocating() {
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{name}: {stderr}");
-        assert!(
-            stderr.contains("extends past end of file"),
-            "{name}: {stderr}"
-        );
+        assert!(stderr.contains(diagnostic), "{name}: {stderr}");
         assert!(!stderr.contains("panicked"), "{name}: {stderr}");
         assert!(!dir.join("output").exists());
     }
