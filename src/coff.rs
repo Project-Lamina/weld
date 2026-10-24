@@ -259,7 +259,8 @@ fn read_sections<'a>(
                 return;
             }
         };
-        let mut relocs = Vec::with_capacity(count);
+        let readable = coff.len().saturating_sub(relocs_at) / RELOC_SIZE;
+        let mut relocs = Vec::with_capacity(count.min(readable));
         for r in 0..count {
             let o = relocs_at + r * RELOC_SIZE;
             let Some(rec) = coff.get(o..o + RELOC_SIZE) else {
@@ -350,5 +351,18 @@ mod tests {
         );
         assert_eq!(coff_reloc_span(&data, 20, 3, 0), Some((20, 3)));
         assert_eq!(coff_reloc_span(&data, 20, u16::MAX, 0), Some((20, 65535)));
+    }
+
+    #[test]
+    fn unreadable_relocation_records_reserve_nothing() {
+        let mut data = vec![0u8; 64];
+        data[2..4].copy_from_slice(&1u16.to_le_bytes());
+        data[56..60].copy_from_slice(&IMAGE_SCN_LNK_NRELOC_OVFL.to_le_bytes());
+        data[44..48].copy_from_slice(&60u32.to_le_bytes());
+        data[52..54].copy_from_slice(&u16::MAX.to_le_bytes());
+        data[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
+        let object = parse(&data);
+        assert!(object.sections[0].relocs.is_empty());
+        assert!(object.sections[0].relocs.capacity() < 1024);
     }
 }
