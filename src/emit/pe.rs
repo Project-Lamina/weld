@@ -785,18 +785,35 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         }
     }
 
+    let mut referenced: HashSet<(usize, usize)> = HashSet::default();
+    for sec in sections.iter().filter(|sec| sec.keep) {
+        for &(_, sym_idx, _) in &sec.relocs {
+            referenced.insert((sec.object, sym_idx as usize));
+        }
+    }
+    let weak_defaults: HashSet<(usize, usize)> = syms_of
+        .iter()
+        .enumerate()
+        .flat_map(|(oi, syms)| {
+            syms.iter()
+                .filter(|rec| rec.class == IMAGE_SYM_CLASS_WEAK_EXTERNAL)
+                .map(move |rec| (oi, rec.tag))
+        })
+        .collect();
     let mut undefined: Vec<&str> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::default();
-    for syms in &syms_of {
-        for rec in syms {
+    for (oi, syms) in syms_of.iter().enumerate() {
+        for (ri, rec) in syms.iter().enumerate() {
             let s = if rec.class == IMAGE_SYM_CLASS_WEAK_EXTERNAL {
-                if defs.contains_key(rec.name.as_str()) {
+                if defs.contains_key(rec.name.as_str()) || !referenced.contains(&(oi, ri)) {
                     continue;
                 }
                 match syms.get(rec.tag) {
                     Some(default) => default,
                     None => continue,
                 }
+            } else if weak_defaults.contains(&(oi, ri)) && !referenced.contains(&(oi, ri)) {
+                continue;
             } else {
                 rec
             };
@@ -2240,5 +2257,31 @@ mod tests {
         obj[8..12].copy_from_slice(&0u32.to_le_bytes());
         let mut out = Vec::new();
         assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+    }
+
+    #[test]
+    fn test_coff_unreferenced_weak_external_does_not_import_its_default() {
+        let text = [0xC3, 0xC3, 0x90, 0xC3];
+        let obj = coff_object(
+            &[text_section(&text, &[])],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                (
+                    "dflt",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_EXTERNAL,
+                    0,
+                ),
+                (
+                    "foo",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_WEAK_EXTERNAL,
+                    3,
+                ),
+            ],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        assert!(!out.windows(5).any(|w| w == b"dflt\0"));
     }
 }
