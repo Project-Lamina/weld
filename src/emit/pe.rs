@@ -582,6 +582,24 @@ fn coff_symbol_name(name_bytes: &[u8; 8], strtab: &[u8]) -> String {
     String::from_utf8_lossy(&name_bytes[..end]).into_owned()
 }
 
+/// Section names longer than 8 bytes are stored as `/` followed by the decimal
+/// offset of the name in the string table.
+fn coff_section_name(raw: &[u8], strtab: &[u8]) -> String {
+    if raw[0] == b'/' {
+        let digits = raw[1..].split(|&b| b == 0).next().unwrap_or(&[]);
+        let offset = std::str::from_utf8(digits)
+            .ok()
+            .and_then(|d| d.parse::<usize>().ok());
+        if let Some(off) = offset.filter(|&off| off >= 4) {
+            let s = strtab.get(off..).unwrap_or(&[]);
+            let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
+            return String::from_utf8_lossy(&s[..end]).into_owned();
+        }
+    }
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).into_owned()
+}
+
 fn coff_duplicate_symbol(name: &str, first: usize, second: usize) -> std::io::Error {
     coff_error(format!(
         "duplicate symbol {name} defined in object {first} and object {second}"
@@ -630,8 +648,12 @@ fn parse_coff_object(
     let n_syms = coff_read_u32(coff, 12).ok_or_else(truncated)? as usize;
 
     let strtab_off = sym_table_off + n_syms * SIZEOF_COFF_SYMBOL;
-    let strtab_size = coff_read_u32(coff, strtab_off).unwrap_or(4) as usize;
-    let strtab = &coff[strtab_off.min(coff.len())..(strtab_off + strtab_size).min(coff.len())];
+    let strtab: &[u8] = if n_syms == 0 {
+        &[]
+    } else {
+        let strtab_size = coff_read_u32(coff, strtab_off).unwrap_or(4) as usize;
+        &coff[strtab_off.min(coff.len())..(strtab_off + strtab_size).min(coff.len())]
+    };
 
     // Indexed by raw table index; auxiliary records get empty names.
     let mut syms: Vec<CoffSymbol> = Vec::with_capacity(n_syms);
@@ -684,9 +706,7 @@ fn parse_coff_object(
         let raw_ptr = coff_read_u32(coff, sh + 20).ok_or_else(truncated)? as usize;
         let relocs_ptr = coff_read_u32(coff, sh + 24).ok_or_else(truncated)? as usize;
         let n_relocs = coff_read_u16(coff, sh + 32).ok_or_else(truncated)? as usize;
-        let name = String::from_utf8_lossy(&coff[sh..sh + 8])
-            .trim_end_matches('\0')
-            .to_string();
+        let name = coff_section_name(&coff[sh..sh + 8], strtab);
 
         let uninitialized = flags & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0;
         let region = if name == ".pdata" || name.starts_with(".pdata$") {
@@ -1560,6 +1580,15 @@ mod tests {
     /// auxiliary record; `symbols` follow them, so the first of them has
     /// index `2 * sections.len()`.
     fn coff_object(sections: &[TestSection], symbols: &[(&str, i16, u8, u32)]) -> Vec<u8> {
+        coff_object_with_strtab(sections, symbols, &[])
+    }
+
+    /// `strtab_tail` is appended after the 4-byte string table size.
+    fn coff_object_with_strtab(
+        sections: &[TestSection],
+        symbols: &[(&str, i16, u8, u32)],
+        strtab_tail: &[u8],
+    ) -> Vec<u8> {
         let n = sections.len();
         let mut at = 20 + n * SIZEOF_COFF_SECTION_HEADER;
         let mut raw_ptrs = Vec::new();
@@ -1625,7 +1654,8 @@ mod tests {
             o.push(class);
             o.push(0);
         }
-        o.extend_from_slice(&4u32.to_le_bytes());
+        o.extend_from_slice(&((4 + strtab_tail.len()) as u32).to_le_bytes());
+        o.extend_from_slice(strtab_tail);
         o
     }
 
@@ -1948,6 +1978,29 @@ mod tests {
             ],
             symbols,
         )
+    }
+
+    #[test]
+    fn test_coff_long_section_name_is_read_from_string_table() {
+        let record = [0u8; 12];
+        let obj = coff_object_with_strtab(
+            &[
+                text_section(&[0x90; 8], &[]),
+                TestSection {
+                    name: "/4",
+                    flags: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+                    data: &record,
+                    relocs: &[],
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+            b".pdata$longname\0",
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        assert_eq!(pe_data_dir(&out, DATA_DIR_EXCEPTION), (0x3000, 12));
     }
 
     #[test]
