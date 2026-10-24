@@ -582,6 +582,9 @@ fn build_base_relocs(sites: &[(u32, u16)]) -> Vec<u8> {
 fn coff_problem(problem: coff::Problem, object: usize) -> std::io::Error {
     coff_error(match problem {
         coff::Problem::Truncated => format!("truncated COFF object {object}"),
+        coff::Problem::SymbolTable => {
+            format!("symbol table of object {object} lies outside the object")
+        }
         coff::Problem::SectionData(name) => {
             format!("section {name} data lies outside the object")
         }
@@ -2199,6 +2202,42 @@ mod tests {
             &[],
             &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
+        let mut out = Vec::new();
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+    }
+
+    #[test]
+    fn test_coff_symbol_table_past_object_is_error() {
+        let text = [0xC3; 4];
+        let mut obj = coff_object(
+            &[text_section(&text, &[])],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        obj[12..16].copy_from_slice(&1000u32.to_le_bytes());
+        let mut out = Vec::new();
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+    }
+
+    #[test]
+    fn test_coff_huge_symbol_count_is_error() {
+        let text = [0xC3; 4];
+        let mut obj = coff_object(
+            &[text_section(&text, &[])],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        obj[12..16].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        let mut out = Vec::new();
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+    }
+
+    #[test]
+    fn test_coff_symbol_table_at_offset_zero_is_error() {
+        let text = [0xC3; 4];
+        let mut obj = coff_object(
+            &[text_section(&text, &[])],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        obj[8..12].copy_from_slice(&0u32.to_le_bytes());
         let mut out = Vec::new();
         assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
     }
