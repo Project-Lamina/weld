@@ -14,7 +14,7 @@ pub(super) fn sha1(bytes: &[u8]) -> [u8; 20] {
     compress_blocks(&mut state, &tail[..tail_len]);
 
     let mut digest = [0u8; 20];
-    for (output, word) in digest.chunks_exact_mut(4).zip(state) {
+    for (output, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
         output.copy_from_slice(&word.to_be_bytes());
     }
     digest
@@ -36,10 +36,10 @@ fn compress_blocks(state: &mut [u32; 5], blocks: &[u8]) {
 }
 
 fn compress_blocks_scalar(state: &mut [u32; 5], blocks: &[u8]) {
-    for block in blocks.chunks_exact(64) {
+    for block in blocks.as_chunks::<64>().0 {
         let mut words = [0u32; 80];
-        for (word, input) in words.iter_mut().zip(block.chunks_exact(4)) {
-            *word = u32::from_be_bytes(input.try_into().unwrap());
+        for (word, input) in words.iter_mut().zip(block.as_chunks::<4>().0.iter()) {
+            *word = u32::from_be_bytes(*input);
         }
         for i in 16..80 {
             words[i] = (words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16]).rotate_left(1);
@@ -78,7 +78,7 @@ mod shani {
     pub(super) unsafe fn compress_blocks(state: &mut [u32; 5], blocks: &[u8]) {
         let byte_order = _mm_set_epi64x(0x0001020304050607, 0x08090a0b0c0d0e0f);
         let mut abcd = _mm_shuffle_epi32::<0x1b>(unsafe { _mm_loadu_si128(state.as_ptr().cast()) });
-        for block in blocks.chunks_exact(64) {
+        for block in blocks.as_chunks::<64>().0 {
             let saved_abcd = abcd;
             let saved_e = state[4];
             let e_start = _mm_set_epi32(saved_e as i32, 0, 0, 0);
@@ -160,7 +160,7 @@ mod tests {
             tail[tail_len - 8..tail_len].copy_from_slice(&((len as u64) * 8).to_be_bytes());
             compress_blocks_scalar(&mut scalar, &tail[..tail_len]);
             let mut expected = [0u8; 20];
-            for (output, word) in expected.chunks_exact_mut(4).zip(scalar) {
+            for (output, word) in expected.as_chunks_mut::<4>().0.iter_mut().zip(scalar) {
                 output.copy_from_slice(&word.to_be_bytes());
             }
             assert_eq!(sha1(&data[..len]), expected, "length {len}");
