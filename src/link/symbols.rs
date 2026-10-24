@@ -25,6 +25,7 @@ pub struct ResolvedSymbol {
     pub address: Option<u64>,
     pub size: u64,
     pub is_defined: bool,
+    pub is_weak: bool,
 }
 #[derive(Debug, Clone)]
 pub struct OutputSymbol {
@@ -157,6 +158,7 @@ where
                     address,
                     size: sym.st_size,
                     is_defined,
+                    is_weak: sym.bind == STB_WEAK,
                 },
             );
         }
