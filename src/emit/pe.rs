@@ -596,10 +596,13 @@ fn coff_problem(problem: coff::Problem, object: usize) -> std::io::Error {
 
 /// Parse one COFF object. Sections that are not linked are `None`, so the
 /// index of an entry is its section number minus one.
-fn parse_coff_object(
-    object: usize,
-    coff_data: &[u8],
-) -> Result<(Vec<coff::Symbol>, Vec<Option<CoffSection<'_>>>)> {
+struct ParsedCoff<'a> {
+    symbols: Vec<coff::Symbol>,
+    sections: Vec<Option<CoffSection<'a>>>,
+    deferred_error: Option<std::io::Error>,
+}
+
+fn parse_coff_object(object: usize, coff_data: &[u8]) -> Result<ParsedCoff<'_>> {
     let machine = coff::read_u16(coff_data, 0)
         .ok_or_else(|| coff_problem(coff::Problem::Truncated, object))?;
     if machine != MACHINE_AMD64 {
@@ -608,9 +611,13 @@ fn parse_coff_object(
         )));
     }
     let parsed = coff::parse(coff_data);
-    if let Some(problem) = parsed.problem {
-        return Err(coff_problem(problem, object));
-    }
+    let deferred = match parsed.problem {
+        Some(coff::Problem::SymbolTable) if parsed.symbol_table_offset != 0 => {
+            Some(coff_problem(coff::Problem::SymbolTable, object))
+        }
+        Some(problem) => return Err(coff_problem(problem, object)),
+        None => None,
+    };
     let comdat_aux = parsed.comdat_aux;
     let sections = parsed
         .sections
@@ -652,7 +659,11 @@ fn parse_coff_object(
             })
         })
         .collect();
-    Ok((parsed.symbols, sections))
+    Ok(ParsedCoff {
+        symbols: parsed.symbols,
+        sections,
+        deferred_error: deferred,
+    })
 }
 
 /// Link COFF objects and emit a PE32+ executable directly.
@@ -663,8 +674,14 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
     let mut syms_of: Vec<Vec<coff::Symbol>> = Vec::with_capacity(objects.len());
     let mut slot_of: Vec<Vec<Option<usize>>> = Vec::with_capacity(objects.len());
     let mut sections: Vec<CoffSection> = Vec::new();
+    let mut deferred_error: Option<std::io::Error> = None;
     for (oi, coff) in objects.iter().enumerate() {
-        let (syms, parsed) = parse_coff_object(oi, coff)?;
+        let ParsedCoff {
+            symbols: syms,
+            sections: parsed,
+            deferred_error: deferred,
+        } = parse_coff_object(oi, coff)?;
+        deferred_error = deferred_error.or(deferred);
         let mut slots = Vec::with_capacity(parsed.len());
         for sec in parsed {
             slots.push(sec.map(|s| {
@@ -1280,6 +1297,9 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         file_off += sec.raw_size();
     }
     let size_of_image = align_up(image_end, SECTION_ALIGN) as u32;
+    if let Some(error) = deferred_error {
+        return Err(error);
+    }
 
     emit_pe_raw(
         out,
@@ -2318,5 +2338,21 @@ mod tests {
         assert!(
             link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], &mut out).is_err()
         );
+    }
+
+    #[test]
+    fn test_coff_section_error_precedes_symbol_table_error() {
+        let text = [0xC3; 4];
+        let mut obj = coff_object(
+            &[text_section(&text, &[])],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        obj[20 + 16..20 + 20].copy_from_slice(&1000u32.to_le_bytes());
+        obj[12..16].copy_from_slice(&1000u32.to_le_bytes());
+        let mut out = Vec::new();
+        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("data lies outside"), "{message}");
     }
 }
