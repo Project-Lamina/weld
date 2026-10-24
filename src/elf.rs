@@ -25,6 +25,7 @@ pub enum SectionType {
 const SHT_NULL: u32 = 0;
 const SHT_NOBITS: u32 = 8;
 const MAX_SECTION_ALIGN: u64 = 1 << 21;
+const MAX_NOBITS_SIZE: u64 = 1 << 32;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
@@ -407,6 +408,9 @@ pub fn parse_elf64_slice(
             ));
         }
         if sh.sh_type == SHT_NOBITS {
+            if sh.sh_size > MAX_NOBITS_SIZE {
+                return Err(format!("section {i} size {} is too large", sh.sh_size));
+            }
             continue;
         }
         if sh
