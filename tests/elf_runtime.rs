@@ -340,3 +340,30 @@ int main(void) {
     assert_eq!(run("./output", &[], &dir), "1 1\n");
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn atexit_resolves_from_libc_linker_script_archive() {
+    let dir = std::env::temp_dir().join(format!("weld-atexit-runtime-{}", std::process::id()));
+    fs::create_dir_all(dir.join("prefix")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
+    fs::write(
+        dir.join("input.c"),
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+static void bye(void) { puts("bye"); }
+int main(void) {
+    if (atexit(bye) != 0) return 1;
+    puts("hi");
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    run("gcc", &["-c", "input.c", "-o", "input.o"], &dir);
+    run("gcc", &["input.o", "-o", "reference"], &dir);
+    run("gcc", &["-Bprefix", "input.o", "-o", "output"], &dir);
+    assert_eq!(run("./reference", &[], &dir), "hi\nbye\n");
+    assert_eq!(run("./output", &[], &dir), "hi\nbye\n");
+    fs::remove_dir_all(dir).unwrap();
+}
