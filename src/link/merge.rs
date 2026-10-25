@@ -1,12 +1,12 @@
 //! Merge input object sections into one output layout.
 
 use super::{
-    SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_UNDEF, SHT_NOBITS, SHT_PROGBITS, parse_symtab_view,
-    runtime,
+    SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_COMMON, SHN_UNDEF, SHT_NOBITS, SHT_PROGBITS,
+    parse_symtab_view, runtime,
 };
 use crate::{
     collections::HashMap,
-    elf::{SectionHeader, get_strtab_string, parse_elf64_slice},
+    elf::{MAX_NOBITS_SIZE, MAX_SECTION_ALIGN, SectionHeader, get_strtab_string, parse_elf64_slice},
 };
 use std::path::Path;
 
@@ -464,10 +464,82 @@ pub(super) fn remap_merge_offsets(
     Ok(())
 }
 
+/// Every common symbol name with the largest size and alignment any object gives it,
+/// sorted by name so the layout does not depend on hash order.
+fn common_symbol_requirements(objects: &[&[u8]]) -> Result<Vec<(String, u64, u64)>, String> {
+    let mut requirements: HashMap<String, (u64, u64)> = HashMap::default();
+    for &obj_data in objects {
+        let (_, sections, _) = parse_elf64_slice(obj_data)?;
+        let Some((symbols, strings)) = parse_symtab_view(obj_data, &sections)? else {
+            continue;
+        };
+        for sym in symbols.iter().filter(|sym| sym.st_shndx == SHN_COMMON) {
+            let Some(name) = get_strtab_string(strings, sym.name_offset) else {
+                continue;
+            };
+            let entry = requirements.entry(name).or_insert((0, 1));
+            entry.0 = entry.0.max(sym.st_size);
+            entry.1 = entry.1.max(sym.st_value);
+        }
+    }
+    let mut sorted: Vec<(String, u64, u64)> = requirements
+        .into_iter()
+        .map(|(name, (size, align))| (name, size, align))
+        .collect();
+    sorted.sort_unstable();
+    Ok(sorted)
+}
+
+/// Places common symbols at the end of `.bss` and returns each name's offset there.
+fn place_common_symbols(
+    objects: &[&[u8]],
+    merged_data: &mut HashMap<String, Vec<(Vec<u8>, u64)>>,
+    section_aligns: &mut HashMap<String, u64>,
+    section_flags: &mut HashMap<String, u64>,
+    section_types: &mut HashMap<String, (u32, u64)>,
+) -> Result<HashMap<String, u64>, String> {
+    let mut offsets = HashMap::default();
+    let requirements = common_symbol_requirements(objects)?;
+    if requirements.is_empty() {
+        return Ok(offsets);
+    }
+    section_types.entry(".bss".into()).or_insert((SHT_NOBITS, 0));
+    section_flags
+        .entry(".bss".into())
+        .or_insert(SHF_ALLOC | SHF_WRITE);
+    let bss_align = section_aligns.entry(".bss".into()).or_insert(1);
+    let bss = merged_data.entry(".bss".into()).or_default();
+    let mut end: u64 = bss.iter().map(|(_, size)| *size).sum();
+    for (name, size, align) in requirements {
+        if !align.is_power_of_two() || align > MAX_SECTION_ALIGN {
+            return Err(format!("common symbol {name} has unsupported alignment {align}"));
+        }
+        let offset = align_up(end, align);
+        if offset.checked_add(size).is_none_or(|stop| stop > MAX_NOBITS_SIZE) {
+            return Err("common symbols are too large".into());
+        }
+        if offset > end {
+            bss.push((vec![0; (offset - end) as usize], offset - end));
+        }
+        bss.push((vec![0; size as usize], size));
+        offsets.insert(name, offset);
+        end = offset + size;
+        *bss_align = (*bss_align).max(align);
+    }
+    Ok(offsets)
+}
+
 /// Merge sections from multiple objects. Same e_machine required.
 pub fn merge_sections_multi_object(
     objects: &[&[u8]],
-) -> Result<(MergedLayout, Vec<HashMap<String, ObjectSectionContrib>>), String> {
+) -> Result<
+    (
+        MergedLayout,
+        Vec<HashMap<String, ObjectSectionContrib>>,
+        HashMap<String, u64>,
+    ),
+    String,
+> {
     if objects.is_empty() {
         return Err("no objects to merge".to_string());
     }
@@ -579,6 +651,14 @@ pub fn merge_sections_multi_object(
         section_contribs.push(obj_contribs);
     }
 
+    let common_offsets = place_common_symbols(
+        objects,
+        &mut merged_data,
+        &mut section_aligns,
+        &mut section_flags,
+        &mut section_types,
+    )?;
+
     let section_order = [".text", ".rodata", ".data", ".bss"];
     let mut layout = MergedLayout {
         sections: Vec::new(),
@@ -629,7 +709,7 @@ pub fn merge_sections_multi_object(
             layout.section_by_name.insert(name.clone(), index);
         }
     }
-    Ok((layout, section_contribs))
+    Ok((layout, section_contribs, common_offsets))
 }
 
 #[cfg(test)]

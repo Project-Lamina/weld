@@ -72,6 +72,7 @@ fn parse_object(data: Vec<u8>) -> Result<ParsedObject, String> {
 
 const SHN_UNDEF: u16 = 0;
 const SHN_ABS: u16 = 0xfff1;
+const SHN_COMMON: u16 = 0xfff2;
 const STB_LOCAL: u8 = 0;
 const STB_GLOBAL: u8 = 1;
 const STB_WEAK: u8 = 2;
@@ -215,7 +216,7 @@ fn link_multi_object_parsed(
     }
     let mut timer = crate::timing::PhaseTimer::new();
     let objects: Vec<&[u8]> = parsed.iter().map(|p| p.data.as_slice()).collect();
-    let (mut layout, section_contribs) = merge_sections_multi_object(&objects)?;
+    let (mut layout, section_contribs, common_offsets) = merge_sections_multi_object(&objects)?;
     notes::merge_properties(&mut layout, parsed)?;
     merge::remap_merge_offsets(parsed, &section_contribs)?;
     let e_machine = parsed[0].header.e_machine;
@@ -241,6 +242,7 @@ fn link_multi_object_parsed(
                 &obj.sections,
                 &obj.names,
                 &section_contribs[obj_idx],
+                &common_offsets,
             )
         });
     let mut strong_definitions: HashSet<String> = HashSet::default();
@@ -680,7 +682,10 @@ fn link_multi_object_parsed(
             .map(|(symbols, _)| {
                 symbols
                     .iter()
-                    .map(|sym| sym.bind == STB_WEAK && sym.st_shndx != SHN_UNDEF)
+                    .map(|sym| {
+                        (sym.bind == STB_WEAK || sym.st_shndx == SHN_COMMON)
+                            && sym.st_shndx != SHN_UNDEF
+                    })
                     .collect()
             })
             .unwrap_or_default();

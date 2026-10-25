@@ -3,7 +3,8 @@
 use std::borrow::Cow;
 
 use super::{
-    MergedLayout, ObjectSectionContrib, SHN_ABS, SHN_UNDEF, SHT_SYMTAB, STB_LOCAL, STB_WEAK,
+    MergedLayout, ObjectSectionContrib, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_SYMTAB, STB_LOCAL,
+    STB_WEAK,
     merge_sections_single_object,
 };
 use crate::{
@@ -112,6 +113,7 @@ pub(super) fn resolve_symbols_with_offsets<F>(
     layout: &MergedLayout,
     sections: &[SectionHeader],
     names: &[String],
+    commons: &HashMap<String, u64>,
     mut section_offset: F,
 ) -> Result<ResolvedSymbols, String>
 where
@@ -131,6 +133,13 @@ where
         let (address, is_defined) = match sym.st_shndx {
             SHN_UNDEF => (None, false),
             SHN_ABS => (Some(sym.st_value), true),
+            SHN_COMMON => {
+                let bss = layout.section_by_name.get(".bss").map(|&i| &layout.sections[i]);
+                match (bss, commons.get(&name)) {
+                    (Some(bss), Some(&offset)) => (Some(bss.vaddr + offset), true),
+                    _ => (None, false),
+                }
+            }
             shndx => {
                 let section_name = names.get(shndx as usize).map(String::as_str).unwrap_or("");
                 if let Some(&merged_idx) = layout.section_by_name.get(section_name) {
@@ -158,7 +167,7 @@ where
                     address,
                     size: sym.st_size,
                     is_defined,
-                    is_weak: sym.bind == STB_WEAK,
+                    is_weak: sym.bind == STB_WEAK || sym.st_shndx == SHN_COMMON,
                 },
             );
         }
@@ -250,7 +259,7 @@ pub fn resolve_symbols(
     sections: &[SectionHeader],
     names: &[String],
 ) -> Result<ResolvedSymbols, String> {
-    resolve_symbols_with_offsets(data, layout, sections, names, |_| Some(0))
+    resolve_symbols_with_offsets(data, layout, sections, names, &HashMap::default(), |_| Some(0))
 }
 
 pub(super) fn resolve_symbols_for_object(
@@ -259,8 +268,9 @@ pub(super) fn resolve_symbols_for_object(
     sections: &[SectionHeader],
     names: &[String],
     obj_contribs: &HashMap<String, ObjectSectionContrib>,
+    commons: &HashMap<String, u64>,
 ) -> Result<ResolvedSymbols, String> {
-    resolve_symbols_with_offsets(data, layout, sections, names, |section_name| {
+    resolve_symbols_with_offsets(data, layout, sections, names, commons, |section_name| {
         obj_contribs
             .get(section_name)
             .map(|contrib| contrib.offset_in_merged)
