@@ -1,6 +1,7 @@
 //! x86_64 relocation application.
 
 use super::SHF_ALLOC;
+use super::merge::tls_segment;
 use crate::collections::HashMap;
 use crate::elf::reloc_type;
 use crate::elf::{SectionHeader, parse_rela_section};
@@ -55,6 +56,19 @@ fn pc_relative_field(displacement: i64, r_type: u32) -> Result<u32, String> {
         })
 }
 
+/// Thread-pointer offset of a thread-local symbol at `address + addend`. On x86_64
+/// the thread pointer sits just past the static TLS block, so offsets are negative.
+fn local_exec_offset(
+    tls: Option<&super::merge::TlsSegment>,
+    address: u64,
+    addend: i64,
+) -> Result<i64, String> {
+    let tls = tls.ok_or("thread-local relocation without a thread-local block")?;
+    let block = tls.memsz.div_ceil(tls.align) * tls.align;
+    let target = i128::from(address) + i128::from(addend) - i128::from(tls.vaddr);
+    i64::try_from(target - i128::from(block)).map_err(|_| "thread-local offset overflows".into())
+}
+
 /// Apply all x86_64 `SHT_RELA` relocations from `data` into `layout`.
 ///
 /// `symbol_addrs[i]` is the resolved virtual address of ELF symbol index `i`,
@@ -71,6 +85,7 @@ pub fn apply_relocations(
     section_offset: Option<&HashMap<String, u64>>,
 ) -> Result<(), String> {
     const SHT_RELA: u32 = 4;
+    let tls = tls_segment(layout)?;
 
     for rela_sh in sections.iter() {
         if rela_sh.sh_type != SHT_RELA {
@@ -166,6 +181,32 @@ pub fn apply_relocations(
                         return Err(format!("relocation offset {} out of bounds", rel.r_offset));
                     }
                     write_u32_le(&mut merged.data, off, val);
+                }
+                reloc_type::R_X86_64_TPOFF32 | reloc_type::R_X86_64_TPOFF64 => {
+                    let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
+                        return Err(format!("undefined symbol index {}", rel.r_sym));
+                    };
+                    let tp_offset = local_exec_offset(tls.as_ref(), *s_addr, a)?;
+                    if rel.r_type == reloc_type::R_X86_64_TPOFF64 {
+                        if merged.data.len() < off + 8 {
+                            return Err(format!(
+                                "relocation offset {} out of bounds",
+                                rel.r_offset
+                            ));
+                        }
+                        write_u64_le(&mut merged.data, off, tp_offset as u64);
+                    } else {
+                        let value = i32::try_from(tp_offset).map_err(|_| {
+                            format!("R_X86_64_TPOFF32 value {tp_offset} does not fit in i32")
+                        })?;
+                        if merged.data.len() < off + 4 {
+                            return Err(format!(
+                                "relocation offset {} out of bounds",
+                                rel.r_offset
+                            ));
+                        }
+                        write_u32_le(&mut merged.data, off, value as u32);
+                    }
                 }
                 reloc_type::R_X86_64_TLSGD
                 | reloc_type::R_X86_64_TLSLD
