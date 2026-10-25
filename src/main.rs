@@ -236,18 +236,27 @@ fn static_library_inputs(args: &ParsedArgs) -> Vec<(PathBuf, usize)> {
     args.libraries
         .iter()
         .enumerate()
-        .filter_map(|(i, name)| {
+        .flat_map(|(i, name)| {
+            let position = args.library_positions.get(i).copied().unwrap_or(usize::MAX);
             let library = if args.static_link {
-                resolver.resolve_static(name)?
+                resolver.resolve_static(name)
             } else {
-                resolver.resolve(name)?
+                resolver.resolve(name)
             };
-            library.is_static.then(|| {
-                (
-                    library.path,
-                    args.library_positions.get(i).copied().unwrap_or(usize::MAX),
-                )
-            })
+            let Some(library) = library else {
+                return Vec::new();
+            };
+            if library.is_static {
+                return vec![(library.path, position)];
+            }
+            if args.static_link {
+                return Vec::new();
+            }
+            resolver
+                .linker_script_archives(name)
+                .into_iter()
+                .map(|path| (path, position))
+                .collect()
         })
         .collect()
 }
