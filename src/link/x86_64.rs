@@ -1,9 +1,43 @@
 //! x86_64 relocation application.
 
+use super::SHF_ALLOC;
 use crate::collections::HashMap;
 use crate::elf::reloc_type;
 use crate::elf::{SectionHeader, parse_rela_section};
 use crate::link::MergedLayout;
+
+/// Rejects relocations of the general-dynamic TLS model, which needs
+/// `__tls_get_addr` and dynamic TLS that weld does not provide.
+pub(super) fn reject_general_dynamic_tls(
+    data: &[u8],
+    sections: &[SectionHeader],
+    names: &[String],
+) -> Result<(), String> {
+    const SHT_RELA: u32 = 4;
+    for rela_sh in sections.iter().filter(|s| s.sh_type == SHT_RELA) {
+        let Some(target) = sections.get(rela_sh.sh_info as usize) else {
+            continue;
+        };
+        if target.sh_flags & SHF_ALLOC == 0 {
+            continue;
+        }
+        for rel in parse_rela_section(data, rela_sh)? {
+            let kind = match rel.r_type {
+                reloc_type::R_X86_64_TLSGD => "R_X86_64_TLSGD",
+                reloc_type::R_X86_64_TLSLD => "R_X86_64_TLSLD",
+                reloc_type::R_X86_64_DTPOFF32 => "R_X86_64_DTPOFF32",
+                _ => continue,
+            };
+            let section = names
+                .get(rela_sh.sh_info as usize)
+                .map_or("?", String::as_str);
+            return Err(format!(
+                "general dynamic TLS is not supported ({kind} in section {section}); only the initial-exec and local-exec models are planned"
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
