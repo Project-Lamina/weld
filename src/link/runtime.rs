@@ -269,8 +269,10 @@ pub(super) fn prepare(
         layout.sections[dynsym_idx].data[record + 4] = (binding << 4) | kind;
         if kind == 1 {
             let export = &exports[name];
-            let size =
-                usize::try_from(export.symbol.st_size).map_err(|_| "imported data too large")?;
+            let size = usize::try_from(export.symbol.st_size)
+                .ok()
+                .filter(|&size| size as u64 <= crate::elf::MAX_NOBITS_SIZE)
+                .ok_or_else(|| format!("imported data {name} is too large"))?;
             let section = layout.section_by_name.get(".dynbss").copied();
             let idx = if let Some(idx) = section {
                 idx
