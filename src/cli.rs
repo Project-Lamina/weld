@@ -21,6 +21,7 @@ pub struct ParsedArgs {
     pub map_file: Option<PathBuf>,
     pub input_files: Vec<PathBuf>,
     pub input_positions: Vec<usize>,
+    pub groups: Vec<(usize, usize)>,
 }
 
 pub enum ParseAction {
@@ -143,7 +144,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
     let mut i = 0;
     let mut as_needed = false;
     let mut states = Vec::new();
-    let mut group_depth = 0usize;
+    let mut group_starts: Vec<usize> = Vec::new();
 
     while i < argv.len() {
         let a = &argv[i];
@@ -221,9 +222,12 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
                 args.static_link = true;
                 args.pie = false;
             }
-            "--start-group" | "-(" => group_depth += 1,
+            "--start-group" | "-(" => group_starts.push(i),
             "--end-group" | "-)" => {
-                group_depth = group_depth.checked_sub(1).ok_or("unmatched --end-group")?;
+                let start = group_starts.pop().ok_or("unmatched --end-group")?;
+                if group_starts.is_empty() {
+                    args.groups.push((start, i));
+                }
             }
             "-pie" | "--pie" => args.pie = true,
             "-no-pie" | "--no-pie" => args.pie = false,
@@ -276,7 +280,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
         }
     }
 
-    if group_depth != 0 {
+    if !group_starts.is_empty() {
         return Err("unclosed --start-group".into());
     }
     if args.static_link && args.pie {

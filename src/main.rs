@@ -446,6 +446,7 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
         &entry_seeds(args),
         &args.input_positions,
         &library_positions,
+        &args.groups,
     )?;
     if loaded.format == ObjectFormat::Coff {
         return try_weld_link_coff(args, loaded.objects);
@@ -511,6 +512,7 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         &entry_seeds(args),
         &args.input_positions,
         &library_positions,
+        &args.groups,
     )?;
     if let Err(error) = object::reject_lto_objects(&loaded.objects) {
         eprintln!("weld: {error}");

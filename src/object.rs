@@ -35,7 +35,6 @@ struct ObjectSymbolSummary {
 
 #[derive(Clone)]
 struct ArchiveEntry {
-    position: usize,
     start: usize,
     len: usize,
     symbols: Option<ObjectSymbolSummary>,
@@ -325,15 +324,15 @@ fn apply_symbol_summary(
 
 /// Opens a static library, reading only its member headers and symbol index when
 /// every member is an object with an index. Other archives are read in full.
-fn open_library_entries(path: &Path, position: usize) -> Option<ArchiveEntries> {
-    if let Some(entries) = scan_indexed_library(path, position) {
+fn open_library_entries(path: &Path) -> Option<ArchiveEntries> {
+    if let Some(entries) = scan_indexed_library(path) {
         return Some(entries);
     }
     let data = normalize_macho_container(std::fs::read(path).ok()?);
-    load_archive_entries(data, position)
+    load_archive_entries(data)
 }
 
-fn scan_indexed_library(path: &Path, position: usize) -> Option<ArchiveEntries> {
+fn scan_indexed_library(path: &Path) -> Option<ArchiveEntries> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let scan = archive::scan_headers(&mut file, len).ok()?;
@@ -354,7 +353,6 @@ fn scan_indexed_library(path: &Path, position: usize) -> Option<ArchiveEntries> 
         }
         offsets.insert(member.offset, members.len());
         members.push(ArchiveEntry {
-            position,
             start: member.start,
             len: member.len,
             symbols: None,
@@ -379,7 +377,7 @@ fn scan_indexed_library(path: &Path, position: usize) -> Option<ArchiveEntries> 
     })
 }
 
-fn load_archive_entries(data: Vec<u8>, position: usize) -> Option<ArchiveEntries> {
+fn load_archive_entries(data: Vec<u8>) -> Option<ArchiveEntries> {
     let archive = archive::parse_members(&data).ok()?;
     let mut offsets = HashMap::default();
     let mut members = Vec::new();
@@ -390,7 +388,6 @@ fn load_archive_entries(data: Vec<u8>, position: usize) -> Option<ArchiveEntries
         }
         offsets.insert(member.offset, members.len());
         members.push(ArchiveEntry {
-            position,
             start: member.start,
             len: member.len,
             symbols: None,
@@ -438,55 +435,47 @@ fn load_archive_entries(data: Vec<u8>, position: usize) -> Option<ArchiveEntries
     })
 }
 
-/// A weak external's default is only needed if nothing else defines the weak
-/// name, so defaults are requested after the ordinary selection has settled.
-fn select_with_weak_defaults(
-    archives: &mut [ArchiveEntries],
-    objects: &mut Vec<Vec<u8>>,
-    positions: &mut Vec<usize>,
-    defined_symbols: &mut HashSet<String>,
-    unresolved_symbols: &mut HashSet<String>,
-    weak_defaults: &mut Vec<(String, String)>,
-) {
-    loop {
-        select_archive_members(
-            archives,
-            objects,
-            positions,
-            defined_symbols,
-            unresolved_symbols,
-            weak_defaults,
-        );
-        let mut requested = false;
-        for (weak, default) in weak_defaults.iter() {
-            if !defined_symbols.contains(weak)
-                && !defined_symbols.contains(default)
-                && unresolved_symbols.insert(default.clone())
-            {
-                requested = true;
-            }
-        }
-        if !requested {
-            break;
-        }
-    }
+struct Selection {
+    objects: Vec<Vec<u8>>,
+    positions: Vec<usize>,
+    defined_symbols: HashSet<String>,
+    unresolved_symbols: HashSet<String>,
+    weak_defaults: Vec<(String, String)>,
+    track_symbols: bool,
 }
 
-fn select_archive_members(
-    archives: &mut [ArchiveEntries],
-    objects: &mut Vec<Vec<u8>>,
-    positions: &mut Vec<usize>,
-    defined_symbols: &mut HashSet<String>,
-    unresolved_symbols: &mut HashSet<String>,
-    weak_defaults: &mut Vec<(String, String)>,
-) {
-    loop {
-        let mut changed = false;
-        for archive in archives.iter_mut() {
+impl Selection {
+    fn add_input(&mut self, input: Input, position: usize, archives: &mut [ArchiveEntries]) {
+        match input {
+            Input::Object(obj) => self.add_object(obj, position),
+            Input::Archive(index) => self.scan_archive(&mut archives[index], position),
+        }
+    }
+
+    fn add_object(&mut self, obj: Vec<u8>, position: usize) {
+        if self.track_symbols {
+            let symbols = collect_object_symbol_summary(&obj).unwrap_or_default();
+            apply_symbol_summary(
+                &symbols,
+                &mut self.defined_symbols,
+                &mut self.unresolved_symbols,
+                &mut self.weak_defaults,
+            );
+        }
+        self.objects.push(obj);
+        self.positions.push(position);
+    }
+
+    /// Scans one archive until a pass pulls no member: a pulled member can
+    /// define symbols that earlier members of the same archive need.
+    fn scan_archive(&mut self, archive: &mut ArchiveEntries, position: usize) {
+        loop {
+            let mut changed = false;
             let mut cursor = 0;
             loop {
+                let unresolved = &self.unresolved_symbols;
                 let next = if let Some(index) = &archive.index {
-                    unresolved_symbols
+                    unresolved
                         .iter()
                         .filter_map(|name| index.get(name))
                         .flatten()
@@ -502,7 +491,7 @@ fn select_archive_members(
                                 .as_ref()
                                 .unwrap()
                                 .defined
-                                .is_disjoint(unresolved_symbols)
+                                .is_disjoint(unresolved)
                     })
                 };
                 let Some(i) = next else { break };
@@ -514,21 +503,51 @@ fn select_archive_members(
                 }
                 let entry = &mut archive.members[i];
                 let symbols = entry.symbols.as_ref().expect("summary just set");
-                if symbols.defined.is_disjoint(unresolved_symbols) {
+                if symbols.defined.is_disjoint(&self.unresolved_symbols) {
                     continue;
                 }
                 entry.selected = true;
-                log::trace!("archive select member {i} at position {}", entry.position);
-                let position = entry.position;
-                let symbols = entry.symbols.clone().expect("summary just set");
-                apply_symbol_summary(&symbols, defined_symbols, unresolved_symbols, weak_defaults);
-                objects.push(normalize_macho_container(body_owned));
-                positions.push(position);
+                log::trace!("archive select member {i} at position {position}");
+                let symbols = symbols.clone();
+                apply_symbol_summary(
+                    &symbols,
+                    &mut self.defined_symbols,
+                    &mut self.unresolved_symbols,
+                    &mut self.weak_defaults,
+                );
+                self.objects.push(normalize_macho_container(body_owned));
+                self.positions.push(position);
                 changed = true;
             }
+            if !changed {
+                break;
+            }
         }
-        if !changed {
-            break;
+    }
+
+    /// A weak external's default is only needed if nothing else defines the weak
+    /// name, so defaults are requested after the ordered selection has settled.
+    fn settle_weak_defaults(
+        &mut self,
+        archives: &mut [ArchiveEntries],
+        archive_positions: &[usize],
+    ) {
+        loop {
+            let mut requested = false;
+            for (weak, default) in &self.weak_defaults {
+                if !self.defined_symbols.contains(weak)
+                    && !self.defined_symbols.contains(default)
+                    && self.unresolved_symbols.insert(default.clone())
+                {
+                    requested = true;
+                }
+            }
+            if !requested {
+                break;
+            }
+            for (archive, position) in archives.iter_mut().zip(archive_positions) {
+                self.scan_archive(archive, *position);
+            }
         }
     }
 }
@@ -568,7 +587,7 @@ pub fn load_objects(
     libs: &[PathBuf],
     entries: &[String],
 ) -> Option<(ObjectFormat, Vec<Vec<u8>>, Vec<PathBuf>)> {
-    let loaded = load_objects_with_positions(paths, libs, entries, &[], &[])?;
+    let loaded = load_objects_with_positions(paths, libs, entries, &[], &[], &[])?;
     Some((loaded.format, loaded.objects, loaded.dylibs))
 }
 
@@ -579,73 +598,116 @@ pub struct LoadedObjects {
     pub positions: Vec<usize>,
 }
 
+enum Input {
+    Object(Vec<u8>),
+    Archive(usize),
+}
+
+/// Inputs that share a `--start-group` range, or a single ungrouped input.
+type InputUnit = (Option<usize>, Vec<(usize, Input)>);
+
 pub fn load_objects_with_positions(
     paths: &[PathBuf],
     libs: &[PathBuf],
     entries: &[String],
     path_positions: &[usize],
     library_positions: &[usize],
+    groups: &[(usize, usize)],
 ) -> Option<LoadedObjects> {
     if paths.is_empty() {
         return None;
     }
 
-    let mut all_objects: Vec<Vec<u8>> = Vec::new();
-    let mut positions = Vec::new();
+    let mut inputs: Vec<(usize, Input)> = Vec::new();
     let mut archives: Vec<ArchiveEntries> = Vec::new();
+    let mut archive_positions: Vec<usize> = Vec::new();
     let mut dylib_paths: Vec<PathBuf> = Vec::new();
-    let mut defined_symbols: HashSet<String> = HashSet::default();
-    let mut unresolved_symbols: HashSet<String> = entries.iter().cloned().collect();
-    let mut weak_defaults: Vec<(String, String)> = Vec::new();
 
     let loaded = crate::parallel::map(paths.to_vec(), |path| {
         std::fs::read(path).ok().map(normalize_macho_container)
     });
     let loaded: Vec<_> = loaded.into_iter().collect::<Option<_>>()?;
-    let need_summaries = !libs.is_empty() || loaded.iter().any(|data| archive::is_archive(data));
+    let track_symbols = !libs.is_empty() || loaded.iter().any(|data| archive::is_archive(data));
     for (i, (path, data)) in paths.iter().zip(loaded).enumerate() {
         let position = path_positions.get(i).copied().unwrap_or(i + 1);
         if is_macho_dylib(&data) {
             dylib_paths.push(path.clone());
         } else if archive::is_archive(&data) {
-            archives.push(load_archive_entries(data, position)?);
+            archives.push(load_archive_entries(data)?);
+            archive_positions.push(position);
+            inputs.push((position, Input::Archive(archives.len() - 1)));
         } else {
             for obj in expand_data_to_objects(data)? {
-                if need_summaries {
-                    let symbols = collect_object_symbol_summary(&obj).unwrap_or_default();
-                    apply_symbol_summary(
-                        &symbols,
-                        &mut defined_symbols,
-                        &mut unresolved_symbols,
-                        &mut weak_defaults,
-                    );
-                }
-                all_objects.push(obj);
-                positions.push(position);
+                inputs.push((position, Input::Object(obj)));
             }
         }
     }
-    // gcc passes -lgcc twice; the fixed point below makes a second copy redundant.
-    let mut seen_libs: HashSet<PathBuf> = HashSet::default();
+    let mut library_archives: HashMap<PathBuf, usize> = HashMap::default();
     for (i, path) in libs.iter().enumerate() {
-        if !seen_libs.insert(path.clone()) {
-            continue;
-        }
         let position = library_positions
             .get(i)
             .copied()
             .unwrap_or(paths.len() + i + 1);
-        archives.push(open_library_entries(path, position)?);
+        let index = match library_archives.get(path) {
+            Some(&index) => index,
+            None => {
+                archives.push(open_library_entries(path)?);
+                archive_positions.push(position);
+                library_archives.insert(path.clone(), archives.len() - 1);
+                archives.len() - 1
+            }
+        };
+        inputs.push((position, Input::Archive(index)));
+    }
+    inputs.sort_by_key(|(position, _)| *position);
+
+    let mut units: Vec<InputUnit> = Vec::new();
+    for (position, input) in inputs {
+        let group = groups
+            .iter()
+            .position(|&(start, end)| start < position && position < end);
+        match units.last_mut() {
+            Some((Some(current), items)) if group == Some(*current) => {
+                items.push((position, input))
+            }
+            _ => units.push((group, vec![(position, input)])),
+        }
     }
 
-    select_with_weak_defaults(
-        &mut archives,
-        &mut all_objects,
-        &mut positions,
-        &mut defined_symbols,
-        &mut unresolved_symbols,
-        &mut weak_defaults,
-    );
+    let mut selection = Selection {
+        objects: Vec::new(),
+        positions: Vec::new(),
+        defined_symbols: HashSet::default(),
+        unresolved_symbols: entries.iter().cloned().collect(),
+        weak_defaults: Vec::new(),
+        track_symbols,
+    };
+    for (group, items) in units {
+        let archive_refs: Vec<(usize, usize)> = items
+            .iter()
+            .filter_map(|(position, input)| match input {
+                Input::Archive(index) => Some((*position, *index)),
+                Input::Object(_) => None,
+            })
+            .collect();
+        for (position, input) in items {
+            selection.add_input(input, position, &mut archives);
+        }
+        if group.is_some() {
+            loop {
+                let before = selection.positions.len();
+                for &(position, index) in &archive_refs {
+                    selection.scan_archive(&mut archives[index], position);
+                }
+                if selection.positions.len() == before {
+                    break;
+                }
+            }
+        }
+    }
+    selection.settle_weak_defaults(&mut archives, &archive_positions);
+    let all_objects = selection.objects;
+    let positions = selection.positions;
 
     if all_objects.is_empty() {
         return None;
@@ -861,10 +923,10 @@ mod archive_selection_tests {
                 .success()
         );
         let data = std::fs::read(&lib).unwrap();
-        let mut indexed = load_archive_entries(data.clone(), 7).unwrap();
+        let mut indexed = load_archive_entries(data.clone()).unwrap();
         assert!(indexed.index.is_some());
         assert!(indexed.members.iter().all(|entry| entry.symbols.is_none()));
-        let mut eager = load_archive_entries(data, 7).unwrap();
+        let mut eager = load_archive_entries(data).unwrap();
         eager.index = None;
         for i in 0..eager.members.len() {
             let body = {
@@ -874,21 +936,18 @@ mod archive_selection_tests {
             eager.members[i].symbols = Some(collect_object_symbol_summary(&body).unwrap());
         }
         let select = |archive: &mut ArchiveEntries| {
-            let mut objects = Vec::new();
-            let mut positions = Vec::new();
-            let mut defined = HashSet::default();
-            let mut unresolved = HashSet::from_iter(["dep".to_string()]);
-            select_archive_members(
-                std::slice::from_mut(archive),
-                &mut objects,
-                &mut positions,
-                &mut defined,
-                &mut unresolved,
-                &mut Vec::new(),
-            );
-            assert!(unresolved.is_empty());
-            assert_eq!(positions, [7, 7, 7]);
-            objects
+            let mut selection = Selection {
+                objects: Vec::new(),
+                positions: Vec::new(),
+                defined_symbols: HashSet::default(),
+                unresolved_symbols: HashSet::from_iter(["dep".to_string()]),
+                weak_defaults: Vec::new(),
+                track_symbols: true,
+            };
+            selection.scan_archive(archive, 7);
+            assert!(selection.unresolved_symbols.is_empty());
+            assert_eq!(selection.positions, [7, 7, 7]);
+            selection.objects
         };
         let objects = select(&mut indexed);
         assert_eq!(objects, select(&mut eager));
@@ -913,7 +972,7 @@ mod archive_selection_tests {
                 .unwrap()
                 .success()
         );
-        let mut fallback = load_archive_entries(std::fs::read(unindexed).unwrap(), 7).unwrap();
+        let mut fallback = load_archive_entries(std::fs::read(unindexed).unwrap()).unwrap();
         assert!(fallback.index.is_none());
         assert!(fallback.members.iter().all(|entry| entry.symbols.is_some()));
         assert_eq!(objects, select(&mut fallback));
@@ -1034,22 +1093,18 @@ mod coff_weak_selection_tests {
     }
 
     fn selected_members(input: &[u8], archive_data: Vec<u8>) -> Vec<usize> {
-        let mut archives = vec![load_archive_entries(archive_data, 1).unwrap()];
-        let mut objects = vec![input.to_vec()];
-        let mut positions = vec![0];
-        let mut defined = HashSet::default();
-        let mut unresolved = HashSet::default();
-        let mut weak_defaults = Vec::new();
-        let summary = collect_object_symbol_summary(input).unwrap();
-        apply_symbol_summary(&summary, &mut defined, &mut unresolved, &mut weak_defaults);
-        select_with_weak_defaults(
-            &mut archives,
-            &mut objects,
-            &mut positions,
-            &mut defined,
-            &mut unresolved,
-            &mut weak_defaults,
-        );
+        let mut archives = vec![load_archive_entries(archive_data).unwrap()];
+        let mut selection = Selection {
+            objects: Vec::new(),
+            positions: Vec::new(),
+            defined_symbols: HashSet::default(),
+            unresolved_symbols: HashSet::default(),
+            weak_defaults: Vec::new(),
+            track_symbols: true,
+        };
+        selection.add_object(input.to_vec(), 0);
+        selection.scan_archive(&mut archives[0], 1);
+        selection.settle_weak_defaults(&mut archives, &[1]);
         archives[0]
             .members
             .iter()
