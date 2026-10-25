@@ -69,6 +69,109 @@ fn half(bytes: &[u8], offset: usize) -> Result<u16, String> {
     ))
 }
 
+fn version_names(data: &[u8], sections: &[SectionHeader]) -> Result<HashMap<u16, String>, String> {
+    let mut versions = HashMap::default();
+    for section in sections.iter().filter(|s| s.sh_type == 0x6ffffffd) {
+        let bytes = get_strtab_from_section(data, section);
+        let strings = get_strtab_from_section(data, &sections[section.sh_link as usize]);
+        let mut off = 0;
+        while off < bytes.len() {
+            let index = half(bytes, off + 4)?;
+            let aux = word(bytes, off + 12)? as usize;
+            let name = get_strtab_string(strings, word(bytes, off + aux)?)
+                .ok_or("invalid version name")?;
+            versions.insert(index, name);
+            let next = word(bytes, off + 16)? as usize;
+            if next == 0 {
+                break;
+            }
+            off += next;
+        }
+    }
+    Ok(versions)
+}
+
+type SymbolGroups = HashMap<(u64, u64), Vec<(String, Option<String>)>>;
+
+/// Default-version data symbols that share an address and size with an imported
+/// data symbol. ld also defines these in the executable, so a copy relocation
+/// serves every name and the library's own references to the alias see the copy.
+pub(super) fn copy_aliases(
+    libs: &[String],
+    resolver: &LibraryResolver,
+    needed: &[String],
+    names: &[String],
+) -> Result<Vec<String>, String> {
+    let imports: HashMap<String, u32> = names.iter().map(|name| (name.clone(), 0)).collect();
+    let exported = exports(libs, resolver, needed, &imports)?;
+    let mut seen: HashSet<String> = names
+        .iter()
+        .map(|name| name.split('@').next().unwrap_or_default().to_string())
+        .collect();
+    let mut aliases = Vec::new();
+    for lib in libs {
+        let Some(lib) = resolver.resolve(lib) else {
+            continue;
+        };
+        if !needed.contains(&lib.soname) {
+            continue;
+        }
+        let (data, sections) = crate::elf::read_dynamic_tables(&lib.path)?;
+        let versions = version_names(&data, &sections)?;
+        let versym = sections
+            .iter()
+            .find(|s| s.sh_type == 0x6fffffff)
+            .map(|s| get_strtab_from_section(&data, s));
+        let mut groups: SymbolGroups = HashMap::default();
+        for section in sections.iter().filter(|s| s.sh_type == 11) {
+            let strings = get_strtab_from_section(&data, &sections[section.sh_link as usize]);
+            for (i, record) in get_strtab_from_section(&data, section)
+                .as_chunks::<24>()
+                .0
+                .iter()
+                .enumerate()
+            {
+                let symbol = crate::elf::parse_symbol_entry(record, 0)?;
+                if half(record, 6)? == SHN_UNDEF || symbol.bind == STB_LOCAL || symbol.sym_type != 1
+                {
+                    continue;
+                }
+                let Some(name) = symbol_name(strings, word(record, 0)?) else {
+                    continue;
+                };
+                let index = versym.map(|v| half(v, i * 2)).transpose()?.unwrap_or(1);
+                if index & 0x8000 != 0 {
+                    continue;
+                }
+                let version = versions.get(&(index & 0x7fff)).cloned();
+                groups
+                    .entry((symbol.st_value, symbol.st_size))
+                    .or_default()
+                    .push((name.to_string(), version));
+            }
+        }
+        for export in exported.values() {
+            if export.library != lib.soname || export.symbol.sym_type != 1 {
+                continue;
+            }
+            let Some(members) = groups.get(&(export.symbol.st_value, export.symbol.st_size)) else {
+                continue;
+            };
+            for (alias, version) in members {
+                if !seen.insert(alias.clone()) {
+                    continue;
+                }
+                aliases.push(match version {
+                    Some(version) => format!("{alias}@{version}"),
+                    None => alias.clone(),
+                });
+            }
+        }
+    }
+    aliases.sort();
+    Ok(aliases)
+}
+
 fn exports(
     libs: &[String],
     resolver: &LibraryResolver,
@@ -92,24 +195,7 @@ fn exports(
             continue;
         }
         let (data, sections) = crate::elf::read_dynamic_tables(&lib.path)?;
-        let mut versions = HashMap::default();
-        for section in sections.iter().filter(|s| s.sh_type == 0x6ffffffd) {
-            let bytes = get_strtab_from_section(&data, section);
-            let strings = get_strtab_from_section(&data, &sections[section.sh_link as usize]);
-            let mut off = 0;
-            while off < bytes.len() {
-                let index = half(bytes, off + 4)?;
-                let aux = word(bytes, off + 12)? as usize;
-                let name = get_strtab_string(strings, word(bytes, off + aux)?)
-                    .ok_or("invalid version name")?;
-                versions.insert(index, name);
-                let next = word(bytes, off + 16)? as usize;
-                if next == 0 {
-                    break;
-                }
-                off += next;
-            }
-        }
+        let versions = version_names(&data, &sections)?;
         let versym = sections
             .iter()
             .find(|s| s.sh_type == 0x6fffffff)
@@ -258,6 +344,7 @@ pub(super) fn prepare(
     }
     let mut copies = Vec::new();
     let mut copy_symbols = Vec::new();
+    let mut shared_copies: HashMap<(String, u64, usize), (u64, usize)> = HashMap::default();
     for name in &dynamic.plt_symbols {
         let index = imports[name];
         let record = index as usize * 24;
@@ -274,19 +361,26 @@ pub(super) fn prepare(
                 .ok()
                 .filter(|&size| size as u64 <= crate::elf::MAX_NOBITS_SIZE)
                 .ok_or_else(|| format!("imported data {name} is too large"))?;
-            let section = layout.section_by_name.get(".dynbss").copied();
-            let idx = if let Some(idx) = section {
-                idx
+            let key = (export.library.clone(), export.symbol.st_value, size);
+            let (address, idx) = if let Some(&copy) = shared_copies.get(&key) {
+                copy
             } else {
-                append(layout, ".dynbss", Vec::new(), 16, SHF_ALLOC | SHF_WRITE);
-                layout.sections.len() - 1
+                let section = layout.section_by_name.get(".dynbss").copied();
+                let idx = if let Some(idx) = section {
+                    idx
+                } else {
+                    append(layout, ".dynbss", Vec::new(), 16, SHF_ALLOC | SHF_WRITE);
+                    layout.sections.len() - 1
+                };
+                let section = &mut layout.sections[idx];
+                let offset = align_up(section.data.len() as u64, 16) as usize;
+                section.data.resize(offset + size, 0);
+                let address = section.vaddr + offset as u64;
+                copies.push((address, index));
+                shared_copies.insert(key, (address, idx));
+                (address, idx)
             };
-            let section = &mut layout.sections[idx];
-            let offset = align_up(section.data.len() as u64, 16) as usize;
-            section.data.resize(offset + size, 0);
-            let address = section.vaddr + offset as u64;
             globals.insert(name.clone(), address);
-            copies.push((address, index));
             copy_symbols.push((record, idx, address, size as u64));
         }
     }
