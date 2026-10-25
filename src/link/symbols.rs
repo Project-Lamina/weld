@@ -11,7 +11,6 @@ use crate::{
     elf::{
         SectionHeader, Symbol, get_strtab_from_section, get_strtab_string, parse_elf64_slice,
         parse_rela_section, parse_symtab,
-        reloc_type::{R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX},
     },
 };
 
@@ -182,9 +181,10 @@ where
 /// relocations in `data`. New names are appended to `out`; duplicates are
 /// skipped. `seen` carries membership across objects, because `out` holds GOT
 /// slot order and scanning it per relocation is quadratic under -fPIC.
-pub(super) fn collect_gotpcrel_symbol_names(
+pub(super) fn collect_got_symbol_names(
     data: &[u8],
     sections: &[SectionHeader],
+    kinds: &[u32],
     out: &mut Vec<String>,
     seen: &mut HashSet<String>,
 ) {
@@ -195,10 +195,7 @@ pub(super) fn collect_gotpcrel_symbol_names(
             continue;
         };
         for rel in relas {
-            if !matches!(
-                rel.r_type,
-                R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX
-            ) {
+            if !kinds.contains(&rel.r_type) {
                 continue;
             }
             let names = sym_names.get_or_insert_with(|| {
