@@ -121,12 +121,7 @@ fn static_glibc_and_unsupported_runtime_features_fail_before_emission() {
         (
             "int main(void) { return 0; }",
             vec![],
-            "static TLS is not supported",
-        ),
-        (
-            "__thread int value; int main(void) { return value; }",
-            vec!["-nostdlib"],
-            "static TLS is not supported",
+            "static GNU IFUNC is not supported",
         ),
         (
             "int impl(void) { return 0; } void *resolve(void) { return impl; } int func(void) __attribute__((ifunc(\"resolve\"))); int main(void) { return func(); }",

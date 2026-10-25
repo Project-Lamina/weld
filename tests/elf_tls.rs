@@ -155,3 +155,30 @@ fn local_exec_offsets_hold_across_object_files_with_ld() {
     );
     assert_eq!(output, "-96 -64 -32 -92 2 9 6 120\n");
 }
+
+#[test]
+fn static_link_without_libc_keeps_pt_tls_for_local_exec_thread_locals() {
+    let dir = std::env::temp_dir().join(format!("weld-tls-static-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(
+        dir.join("main.c"),
+        "__thread int value = 5; __thread long wide[3]; void _start(void) { value += (int)wide[0]; }",
+    )
+    .unwrap();
+    run("gcc", &["-fno-pic", "-c", "main.c", "-o", "main.o"], &dir);
+    run(
+        "gcc",
+        &["-static", "-nostdlib", "-B", "drv/", "main.o", "-o", "weld"],
+        &dir,
+    );
+    run(
+        "gcc",
+        &["-static", "-nostdlib", "main.o", "-o", "reference"],
+        &dir,
+    );
+    let weld = pt_tls(&dir, "weld");
+    let reference = pt_tls(&dir, "reference");
+    assert_eq!(weld[1..], reference[1..]);
+    fs::remove_dir_all(dir).unwrap();
+}
