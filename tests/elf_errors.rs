@@ -178,3 +178,29 @@ fn rejects_duplicate_strong_definitions() {
     assert!(!dir.join("output").exists());
     fs::remove_dir_all(dir).unwrap();
 }
+#[test]
+fn strong_definition_overrides_weak_in_either_order() {
+    let dir = std::env::temp_dir().join(format!("weld-weakdef-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(
+        dir.join("weak.c"),
+        "__attribute__((weak)) int wd(void) { return 11; } int main(void) { return wd(); }",
+    )
+    .unwrap();
+    fs::write(dir.join("strong.c"), "int wd(void) { return 42; }").unwrap();
+    for order in [["weak.c", "strong.c"], ["strong.c", "weak.c"]] {
+        let status = Command::new("gcc")
+            .current_dir(&dir)
+            .args(["-Bdrv", order[0], order[1], "-o", "output"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{order:?}");
+        assert_eq!(
+            Command::new(dir.join("output")).status().unwrap().code(),
+            Some(42),
+            "{order:?}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
