@@ -676,6 +676,14 @@ fn link_multi_object_parsed(
         let obj_by_index = &resolved_by_index_per_object[obj_idx];
         let symbol_names = symbol_names_by_index(&obj.data, &obj.sections)?;
 
+        let weak_definitions: Vec<bool> = parse_symtab_view(&obj.data, &obj.sections)?
+            .map(|(symbols, _)| {
+                symbols
+                    .iter()
+                    .map(|sym| sym.bind == STB_WEAK && sym.st_shndx != SHN_UNDEF)
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut by_index: Vec<Option<u64>> = Vec::with_capacity(obj_by_index.len());
         for (i, addr) in obj_by_index.iter().enumerate() {
             let resolved_addr = match addr {
@@ -685,6 +693,13 @@ fn link_multi_object_parsed(
                         .and_then(|name| global_symbols.get(name.as_ref()))
                         .copied()
                         .unwrap_or(0),
+                ),
+                Some(a) if weak_definitions.get(i) == Some(&true) => Some(
+                    symbol_names
+                        .get(i)
+                        .and_then(|name| global_symbols.get(name.as_ref()))
+                        .copied()
+                        .unwrap_or(*a),
                 ),
                 Some(a) => Some(*a),
                 None => symbol_names
