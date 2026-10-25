@@ -2,14 +2,21 @@
 
 use super::SHF_ALLOC;
 use super::merge::tls_segment;
-use crate::collections::HashMap;
+use super::symbols::symbol_names_by_index;
+use crate::collections::{HashMap, HashSet};
 use crate::elf::reloc_type;
-use crate::elf::{SectionHeader, parse_rela_section};
+use crate::elf::{RelaEntry, SectionHeader, parse_rela_section};
 use crate::link::MergedLayout;
 
-/// Rejects relocations of the general-dynamic TLS model, which needs
-/// `__tls_get_addr` and dynamic TLS that weld does not provide.
-pub(super) fn reject_general_dynamic_tls(
+const TLS_GET_ADDR: &str = "__tls_get_addr";
+const GD_LEA: [u8; 4] = [0x66, 0x48, 0x8d, 0x3d];
+const GD_CALL: [u8; 4] = [0x66, 0x66, 0x48, 0xe8];
+const LE_MOV_FS: [u8; 9] = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
+const LE_LEA_RAX: [u8; 3] = [0x48, 0x8d, 0x80];
+
+/// Rejects local-dynamic TLS, which needs a module-wide `__tls_get_addr` block
+/// that relaxation cannot replace.
+pub(super) fn reject_local_dynamic_tls(
     data: &[u8],
     sections: &[SectionHeader],
     names: &[String],
@@ -24,7 +31,6 @@ pub(super) fn reject_general_dynamic_tls(
         }
         for rel in parse_rela_section(data, rela_sh)? {
             let kind = match rel.r_type {
-                reloc_type::R_X86_64_TLSGD => "R_X86_64_TLSGD",
                 reloc_type::R_X86_64_TLSLD => "R_X86_64_TLSLD",
                 reloc_type::R_X86_64_DTPOFF32 => "R_X86_64_DTPOFF32",
                 _ => continue,
@@ -33,7 +39,7 @@ pub(super) fn reject_general_dynamic_tls(
                 .get(rela_sh.sh_info as usize)
                 .map_or("?", String::as_str);
             return Err(format!(
-                "general dynamic TLS is not supported ({kind} in section {section}); only the initial-exec and local-exec models are planned"
+                "local dynamic TLS is not supported ({kind} in section {section}); use -ftls-model=global-dynamic or local-exec"
             ));
         }
     }
@@ -96,13 +102,22 @@ pub fn apply_relocations(
         let Some(&merged_idx) = layout.section_by_name.get(&target_name) else {
             continue;
         };
+        let Some(target_sh) = sections.get(target_section_idx) else {
+            continue;
+        };
         let merged = &mut layout.sections[merged_idx];
         let data_off = section_offset
             .and_then(|m| m.get(&target_name).copied())
             .unwrap_or(0) as usize;
         let relas = parse_rela_section(data, rela_sh)?;
+        let gd_sites = general_dynamic_sites(data, sections, target_sh, &relas)?;
+        let gd_leas: HashSet<usize> = gd_sites.iter().map(|&(lea, _)| lea).collect();
+        let gd_calls: HashSet<usize> = gd_sites.iter().map(|&(_, call)| call).collect();
 
-        for rel in &relas {
+        for (index, rel) in relas.iter().enumerate() {
+            if gd_calls.contains(&index) {
+                continue;
+            }
             let off = usize::try_from(rel.r_offset)
                 .ok()
                 .and_then(|r| data_off.checked_add(r))
@@ -183,6 +198,22 @@ pub fn apply_relocations(
                     }
                     write_u32_le(&mut merged.data, off, val);
                 }
+                reloc_type::R_X86_64_TLSGD if gd_leas.contains(&index) => {
+                    let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
+                        return Err(format!("undefined symbol index {}", rel.r_sym));
+                    };
+                    let tp_offset = i32::try_from(local_exec_offset(tls.as_ref(), *s_addr, 0)?)
+                        .map_err(|_| {
+                            "R_X86_64_TLSGD local-exec offset does not fit in i32".to_string()
+                        })?;
+                    let start = off - 4;
+                    if merged.data.len() < start + 16 {
+                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                    }
+                    merged.data[start..start + 9].copy_from_slice(&LE_MOV_FS);
+                    merged.data[start + 9..start + 12].copy_from_slice(&LE_LEA_RAX);
+                    merged.data[start + 12..start + 16].copy_from_slice(&tp_offset.to_le_bytes());
+                }
                 reloc_type::R_X86_64_TPOFF32 | reloc_type::R_X86_64_TPOFF64 => {
                     let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
                         return Err(format!("undefined symbol index {}", rel.r_sym));
@@ -225,4 +256,89 @@ pub fn apply_relocations(
     }
 
     Ok(())
+}
+
+/// General-dynamic call sites in one relocation section, as `(tlsgd, call)` indices
+/// into `relas`. A site is the 16-byte `lea x@tlsgd(%rip),%rdi` plus
+/// `call __tls_get_addr@PLT` pair, which the linker relaxes to local-exec.
+fn general_dynamic_sites(
+    data: &[u8],
+    sections: &[SectionHeader],
+    target: &SectionHeader,
+    relas: &[RelaEntry],
+) -> Result<Vec<(usize, usize)>, String> {
+    if !relas
+        .iter()
+        .any(|rel| rel.r_type == reloc_type::R_X86_64_TLSGD)
+    {
+        return Ok(Vec::new());
+    }
+    let names = symbol_names_by_index(data, sections)?;
+    let code = data
+        .get(target.sh_offset as usize..(target.sh_offset + target.sh_size) as usize)
+        .unwrap_or(&[]);
+    let mut sites = Vec::new();
+    for (lea, rel) in relas
+        .iter()
+        .enumerate()
+        .filter(|(_, rel)| rel.r_type == reloc_type::R_X86_64_TLSGD)
+    {
+        let start = rel
+            .r_offset
+            .checked_sub(4)
+            .and_then(|start| usize::try_from(start).ok());
+        let is_sequence = start
+            .and_then(|start| code.get(start..start + 16))
+            .is_some_and(|bytes| bytes[..4] == GD_LEA && bytes[8..12] == GD_CALL);
+        if !is_sequence {
+            return Err(format!(
+                "general dynamic TLS at offset {} is not a __tls_get_addr call sequence",
+                rel.r_offset
+            ));
+        }
+        let call = relas
+            .iter()
+            .position(|other| {
+                other.r_offset == rel.r_offset + 8
+                    && other.r_type == reloc_type::R_X86_64_PLT32
+                    && other.r_addend == -4
+                    && names.get(other.r_sym as usize).map(|n| n.as_ref()) == Some(TLS_GET_ADDR)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "general dynamic TLS at offset {} has no __tls_get_addr call relocation",
+                    rel.r_offset
+                )
+            })?;
+        sites.push((lea, call));
+    }
+    Ok(sites)
+}
+
+/// True when every relocation against `__tls_get_addr` in `data` is a general-dynamic
+/// call that is relaxed away, so the undefined symbol is never reached.
+pub(super) fn tls_get_addr_only_relaxed(
+    data: &[u8],
+    sections: &[SectionHeader],
+) -> Result<bool, String> {
+    const SHT_RELA: u32 = 4;
+    let names = symbol_names_by_index(data, sections)?;
+    let (mut total, mut relaxed) = (0usize, 0usize);
+    for rela_sh in sections.iter().filter(|s| s.sh_type == SHT_RELA) {
+        let Some(target) = sections.get(rela_sh.sh_info as usize) else {
+            continue;
+        };
+        let relas = parse_rela_section(data, rela_sh)?;
+        let calls: HashSet<usize> = general_dynamic_sites(data, sections, target, &relas)?
+            .into_iter()
+            .map(|(_, call)| call)
+            .collect();
+        for (index, rel) in relas.iter().enumerate() {
+            if names.get(rel.r_sym as usize).map(|n| n.as_ref()) == Some(TLS_GET_ADDR) {
+                total += 1;
+                relaxed += usize::from(calls.contains(&index));
+            }
+        }
+    }
+    Ok(total == relaxed)
 }

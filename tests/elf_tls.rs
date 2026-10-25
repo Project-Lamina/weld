@@ -252,3 +252,31 @@ fn initial_exec_rejects_thread_local_from_shared_library() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn global_dynamic_calls_relax_to_local_exec_like_ld() {
+    let output = compare_program_output(
+        "global-dynamic-two-units",
+        &[DEFINITIONS, &format!("{DECLARATIONS}\n{PROBE_MAIN}")],
+        &["-fPIC"],
+    );
+    assert_eq!(output, "-96 -64 -32 -92 2 9 6 120\n");
+}
+
+#[test]
+fn global_dynamic_relaxation_is_correct_in_pie() {
+    let dir = std::env::temp_dir().join(format!("weld-tls-gd-pie-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(dir.join("defs.c"), DEFINITIONS).unwrap();
+    fs::write(dir.join("probe.c"), format!("{DECLARATIONS}\n{PROBE_MAIN}")).unwrap();
+    run("gcc", &["-fPIC", "-c", "defs.c", "-o", "defs.o"], &dir);
+    run("gcc", &["-fPIC", "-c", "probe.c", "-o", "probe.o"], &dir);
+    run(
+        "gcc",
+        &["-pie", "-B", "drv/", "defs.o", "probe.o", "-o", "weld"],
+        &dir,
+    );
+    assert_eq!(run("./weld", &[], &dir), "-96 -64 -32 -92 2 9 6 120\n");
+    fs::remove_dir_all(dir).unwrap();
+}
