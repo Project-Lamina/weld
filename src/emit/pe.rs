@@ -550,6 +550,27 @@ fn coff_duplicate_symbol(name: &str, first: usize, second: usize) -> std::io::Er
     ))
 }
 
+fn reloc_target_name(symbols: &[coff::Symbol], index: u32) -> Option<&str> {
+    symbols.get(index as usize).map(|s| s.name.as_str())
+}
+
+fn comdat_bodies_match(
+    a: &CoffSection,
+    a_symbols: &[coff::Symbol],
+    b: &CoffSection,
+    b_symbols: &[coff::Symbol],
+) -> bool {
+    a.size == b.size
+        && a.raw == b.raw
+        && a.relocs.len() == b.relocs.len()
+        && a.relocs.iter().zip(&b.relocs).all(|(ra, rb)| {
+            ra.0 == rb.0
+                && ra.2 == rb.2
+                && reloc_target_name(a_symbols, ra.1)
+                    .is_some_and(|name| Some(name) == reloc_target_name(b_symbols, rb.1))
+        })
+}
+
 /// Base relocation blocks: one per 4 KiB page, each with `(type << 12) | offset` entries.
 fn build_base_relocs(sites: &[(u32, u16)]) -> Vec<u8> {
     let mut sites = sites.to_vec();
@@ -737,8 +758,19 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                     IMAGE_COMDAT_SELECT_SAME_SIZE if sections[first].size != sections[k].size => {
                         return Err(mismatch("size"));
                     }
-                    IMAGE_COMDAT_SELECT_EXACT_MATCH if sections[first].raw != sections[k].raw => {
-                        return Err(mismatch("contents"));
+                    IMAGE_COMDAT_SELECT_EXACT_MATCH
+                        if !comdat_bodies_match(
+                            &sections[first],
+                            &syms_of[sections[first].object],
+                            &sections[k],
+                            &syms_of[sections[k].object],
+                        ) =>
+                    {
+                        return Err(coff_duplicate_symbol(
+                            key,
+                            sections[first].object,
+                            sections[k].object,
+                        ));
                     }
                     IMAGE_COMDAT_SELECT_LARGEST if sections[k].size > sections[first].size => {
                         sections[first].keep = false;
