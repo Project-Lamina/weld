@@ -4,8 +4,7 @@ use std::borrow::Cow;
 
 use super::{
     MergedLayout, ObjectSectionContrib, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_SYMTAB, STB_LOCAL,
-    STB_WEAK,
-    merge_sections_single_object,
+    STB_WEAK, merge_sections_single_object,
 };
 use crate::{
     collections::{HashMap, HashSet},
@@ -134,7 +133,10 @@ where
             SHN_UNDEF => (None, false),
             SHN_ABS => (Some(sym.st_value), true),
             SHN_COMMON => {
-                let bss = layout.section_by_name.get(".bss").map(|&i| &layout.sections[i]);
+                let bss = layout
+                    .section_by_name
+                    .get(".bss")
+                    .map(|&i| &layout.sections[i]);
                 match (bss, commons.get(&name)) {
                     (Some(bss), Some(&offset)) => (Some(bss.vaddr + offset), true),
                     _ => (None, false),
@@ -259,7 +261,8 @@ pub fn resolve_symbols(
     sections: &[SectionHeader],
     names: &[String],
 ) -> Result<ResolvedSymbols, String> {
-    resolve_symbols_with_offsets(data, layout, sections, names, &HashMap::default(), |_| Some(0))
+    let no_commons = HashMap::default();
+    resolve_symbols_with_offsets(data, layout, sections, names, &no_commons, |_| Some(0))
 }
 
 pub(super) fn resolve_symbols_for_object(
