@@ -33,7 +33,7 @@ fn pt_tls(dir: &Path, output: &str) -> Vec<u64> {
         .collect()
 }
 
-fn link_and_compare(name: &str, sources: &[&str]) {
+fn link_both(name: &str, sources: &[&str], cflags: &[&str]) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("weld-tls-{name}-{}", std::process::id()));
     fs::create_dir_all(dir.join("drv")).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
@@ -42,7 +42,9 @@ fn link_and_compare(name: &str, sources: &[&str]) {
         let file = format!("unit{i}.c");
         fs::write(dir.join(&file), source).unwrap();
         let object = format!("unit{i}.o");
-        run("gcc", &["-fno-pic", "-c", &file, "-o", &object], &dir);
+        let mut args = cflags.to_vec();
+        args.extend(["-c", &file, "-o", &object]);
+        run("gcc", &args, &dir);
         objects.push(object);
     }
     let mut ld_args = vec!["-no-pie"];
@@ -53,6 +55,11 @@ fn link_and_compare(name: &str, sources: &[&str]) {
     weld_args.extend(objects.iter().map(String::as_str));
     weld_args.extend(["-o", "weld"]);
     run("gcc", &weld_args, &dir);
+    dir
+}
+
+fn link_and_compare(name: &str, sources: &[&str]) {
+    let dir = link_both(name, sources, &["-fno-pic"]);
     let weld = pt_tls(&dir, "weld");
     let reference = pt_tls(&dir, "reference");
     assert_eq!(
@@ -67,6 +74,32 @@ fn link_and_compare(name: &str, sources: &[&str]) {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+fn compare_program_output(name: &str, sources: &[&str], cflags: &[&str]) -> String {
+    let dir = link_both(name, sources, cflags);
+    let expected = run("./reference", &[], &dir);
+    assert_eq!(run("./weld", &[], &dir), expected, "{name} output");
+    fs::remove_dir_all(dir).unwrap();
+    expected
+}
+
+const DEFINITIONS: &str = "__thread int a = 1; __thread char b[3]; __thread long c __attribute__((aligned(32))); __thread short d = 4;";
+
+const DECLARATIONS: &str = "extern __thread int a; extern __thread char b[3]; extern __thread long c; extern __thread short d;";
+
+const PROBE_MAIN: &str = r#"
+#include <stdio.h>
+int main(void) {
+    unsigned long tp;
+    __asm__("movq %%fs:0, %0" : "=r"(tp));
+    a += 1; c = 9; d += 2; b[2] = 'x';
+    printf("%ld %ld %ld %ld %d %ld %d %d\n",
+        (long)((char *)&a - (char *)tp), (long)((char *)b - (char *)tp),
+        (long)((char *)&c - (char *)tp), (long)((char *)&d - (char *)tp),
+        a, c, d, b[2]);
+    return 0;
+}
+"#;
 
 #[test]
 fn pt_tls_sizes_and_alignment_match_ld_with_tdata_and_tbss() {
@@ -103,4 +136,22 @@ fn pt_tls_matches_ld_across_two_objects() {
             "__thread long y __attribute__((aligned(16))); __thread short s = 9;",
         ],
     );
+}
+
+#[test]
+fn local_exec_offsets_from_thread_pointer_match_ld() {
+    let source = format!("{DEFINITIONS}\n{PROBE_MAIN}");
+    let output = compare_program_output("local-exec-one-unit", &[&source], &["-fno-pic"]);
+    assert_eq!(output, "-96 -64 -32 -92 2 9 6 120\n");
+}
+
+#[test]
+fn local_exec_offsets_hold_across_object_files_with_ld() {
+    let probe = format!("{DECLARATIONS}\n{PROBE_MAIN}");
+    let output = compare_program_output(
+        "local-exec-two-units",
+        &[DEFINITIONS, &probe],
+        &["-fno-pic", "-ftls-model=local-exec"],
+    );
+    assert_eq!(output, "-96 -64 -32 -92 2 9 6 120\n");
 }

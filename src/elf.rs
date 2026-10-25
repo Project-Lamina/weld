@@ -52,6 +52,8 @@ pub mod reloc_type {
     pub const R_X86_64_TLSLD: u32 = 20;
     pub const R_X86_64_DTPOFF32: u32 = 21;
     pub const R_X86_64_GOTTPOFF: u32 = 22;
+    pub const R_X86_64_TPOFF32: u32 = 23;
+    pub const R_X86_64_TPOFF64: u32 = 18;
 
     pub const R_AARCH64_NONE: u32 = 0;
     pub const R_AARCH64_ABS64: u32 = 257;
