@@ -322,6 +322,8 @@ fn link_multi_object_parsed(
         }
 
         let needed = select_needed_libraries(parsed, libs.unwrap_or(&[]), opts, &resolver)?;
+        let aliases = runtime::copy_aliases(libs.unwrap_or(&[]), &resolver, &needed, &undefined)?;
+        undefined.extend(aliases);
         if !needed.is_empty() {
             let (plt_data, got_plt_data) = build_plt_got_x86_64(&undefined, &layout)?;
             let last = layout.sections.last().ok_or("no sections")?;

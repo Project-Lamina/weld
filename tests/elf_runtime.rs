@@ -306,3 +306,37 @@ int main(int argc, char **argv) {
     assert_eq!(run("./output", &[], &dir), "from table\nalpha\n");
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn imported_data_alias_shares_copy_relocation() {
+    let dir = std::env::temp_dir().join(format!("weld-alias-runtime-{}", std::process::id()));
+    fs::create_dir_all(dir.join("prefix")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
+    fs::write(
+        dir.join("input.c"),
+        r#"
+#include <stdio.h>
+extern char **environ;
+extern char **__environ;
+int main(void) {
+    printf("%d %d\n", environ != 0, environ == __environ);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    run(
+        "gcc",
+        &["-no-pie", "-fno-pic", "-c", "input.c", "-o", "input.o"],
+        &dir,
+    );
+    run("gcc", &["-no-pie", "input.o", "-o", "reference"], &dir);
+    run(
+        "gcc",
+        &["-no-pie", "-Bprefix", "input.o", "-o", "output"],
+        &dir,
+    );
+    assert_eq!(run("./reference", &[], &dir), "1 1\n");
+    assert_eq!(run("./output", &[], &dir), "1 1\n");
+    fs::remove_dir_all(dir).unwrap();
+}
