@@ -204,3 +204,35 @@ fn strong_definition_overrides_weak_in_either_order() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn rejects_relocation_section_targeting_missing_section() {
+    let dir = std::env::temp_dir().join(format!("weld-rela-info-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(
+        dir.join("input.c"),
+        "int puts(const char *); int main(void) { return puts(\"x\") > 0; }",
+    )
+    .unwrap();
+    let status = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-c", "input.c", "-o", "input.o"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut mutant = fs::read(dir.join("input.o")).unwrap();
+    let rela = elf_section_field(&mutant, 4).unwrap();
+    mutant[rela + 44..rela + 48].copy_from_slice(&0xffff_fff0u32.to_le_bytes());
+    fs::write(dir.join("mutant.o"), &mutant).unwrap();
+    let output = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-Bdrv", "mutant.o", "-o", "output"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    fs::remove_dir_all(dir).unwrap();
+}

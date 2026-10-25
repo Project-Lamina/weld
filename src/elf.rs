@@ -27,6 +27,7 @@ const SHT_NOBITS: u32 = 8;
 const MAX_SECTION_ALIGN: u64 = 1 << 21;
 const MAX_NOBITS_SIZE: u64 = 1 << 32;
 const SHT_SYMTAB: u32 = 2;
+const SHT_DYNSYM: u32 = 11;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
 const SHT_GNU_VERDEF: u32 = 0x6ffffffd;
@@ -419,6 +420,16 @@ pub fn parse_elf64_slice(
             return Err(format!(
                 "section {i} has unsupported alignment {}",
                 sh.sh_addralign
+            ));
+        }
+        let refers_to_missing_section = match sh.sh_type {
+            SHT_SYMTAB | SHT_DYNSYM | SHT_RELA => sh.sh_link as usize >= shnum,
+            _ => false,
+        } || (sh.sh_type == SHT_RELA
+            && sh.sh_info as usize >= shnum);
+        if refers_to_missing_section {
+            return Err(format!(
+                "section {i} refers to a section that does not exist"
             ));
         }
         if sh.sh_type == SHT_NOBITS {
