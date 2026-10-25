@@ -314,3 +314,60 @@ fn links_common_symbols_with_strong_override() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+fn elf_section(bytes: &[u8], index: usize) -> (u32, u64, u64, u32) {
+    let shoff = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+    let at = shoff + index * 64;
+    let sh_type = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
+    let offset = u64::from_le_bytes(bytes[at + 24..at + 32].try_into().unwrap());
+    let size = u64::from_le_bytes(bytes[at + 32..at + 40].try_into().unwrap());
+    let link = u32::from_le_bytes(bytes[at + 40..at + 44].try_into().unwrap());
+    (sh_type, offset, size, link)
+}
+
+#[test]
+fn rejects_imported_data_larger_than_cap() {
+    let dir = std::env::temp_dir().join(format!("weld-bigimport-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(dir.join("lib.c"), "int bigdata = 1;").unwrap();
+    fs::write(
+        dir.join("main.c"),
+        "extern int bigdata; int main(void) { return bigdata; }",
+    )
+    .unwrap();
+    let status = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-shared", "-fPIC", "lib.c", "-o", "libbig.so"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut lib = fs::read(dir.join("libbig.so")).unwrap();
+    let shnum = u16::from_le_bytes(lib[60..62].try_into().unwrap()) as usize;
+    let dynsym = (0..shnum).find(|&i| elf_section(&lib, i).0 == 11).unwrap();
+    let (_, sym_off, sym_size, strtab_index) = elf_section(&lib, dynsym);
+    let (_, str_off, _, _) = elf_section(&lib, strtab_index as usize);
+    let entry = (0..sym_size / 24)
+        .map(|k| (sym_off + k * 24) as usize)
+        .find(|&at| {
+            let name_at =
+                str_off as usize + u32::from_le_bytes(lib[at..at + 4].try_into().unwrap()) as usize;
+            lib[name_at..].starts_with(b"bigdata\0")
+        })
+        .unwrap();
+    lib[entry + 16..entry + 24].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    fs::write(dir.join("libbig.so"), &lib).unwrap();
+    let output = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-Bdrv", "-no-pie", "main.c", "-L.", "-lbig", "-o", "output"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("imported data bigdata is too large"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("memory allocation"), "{stderr}");
+    fs::remove_dir_all(dir).unwrap();
+}
