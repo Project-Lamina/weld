@@ -29,6 +29,11 @@ fn rejects_lto_and_unresolved_symbols_before_emission() {
             "undefined symbol missing",
         ),
         (
+            "extern __thread int value; int main(void) { return value; }",
+            vec!["-fPIC"],
+            "general dynamic TLS is not supported",
+        ),
+        (
             "extern int missing(void); int main(void) { return missing(); }",
             vec!["-nostdlib", "-no-pie"],
             "undefined symbol missing",

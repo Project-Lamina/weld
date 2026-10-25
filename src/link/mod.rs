@@ -180,6 +180,9 @@ fn link_multi_object_parsed(
         return Err("no objects to link".to_string());
     }
 
+    for obj in parsed.iter().filter(|obj| obj.header.e_machine == 62) {
+        x86_64::reject_general_dynamic_tls(&obj.data, &obj.sections, &obj.names)?;
+    }
     if opts.static_link {
         if opts.pie {
             return Err("static PIE is not supported".into());
