@@ -476,6 +476,13 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         return None;
     }
 
+    if let Err(error) =
+        object::check_archive_indexes(&args.input_files, &static_library_paths(args))
+    {
+        eprintln!("weld: {error}");
+        return Some(1);
+    }
+
     // Windows PE: triggered by explicit --target=windows or .exe output suffix.
     let wants_pe = args
         .output_file

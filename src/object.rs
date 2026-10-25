@@ -567,6 +567,37 @@ fn expand_data_to_objects(data: Vec<u8>) -> Option<Vec<Vec<u8>>> {
     }
 }
 
+/// GNU ld refuses an ELF archive without a symbol index even when nothing is taken from it.
+pub fn check_archive_indexes(paths: &[PathBuf], libs: &[PathBuf]) -> Result<(), String> {
+    for path in paths.iter().chain(libs) {
+        let Ok(mut file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+            continue;
+        };
+        let Ok(scan) = archive::scan_headers(&mut file, len) else {
+            continue;
+        };
+        if scan.index.is_some() {
+            continue;
+        }
+        for member in &scan.members {
+            let mut prefix = vec![0u8; member.len.min(ELF_MAGIC.len())];
+            let read = file
+                .seek(std::io::SeekFrom::Start(member.start as u64))
+                .and_then(|_| file.read_exact(&mut prefix));
+            if read.is_ok() && is_elf(&prefix) {
+                return Err(format!(
+                    "{}: archive has no index; run ranlib to add one",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Refuse GCC LTO objects: their real content lives in `.gnu.lto_*` sections that only
 /// the LTO plugin can expand, so linking them would silently drop every definition.
 pub fn reject_lto_objects(objects: &[Vec<u8>]) -> Result<(), String> {
