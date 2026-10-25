@@ -58,7 +58,7 @@ fn pc_relative_field(displacement: i64, r_type: u32) -> Result<u32, String> {
 
 /// Thread-pointer offset of a thread-local symbol at `address + addend`. On x86_64
 /// the thread pointer sits just past the static TLS block, so offsets are negative.
-fn local_exec_offset(
+pub(super) fn local_exec_offset(
     tls: Option<&super::merge::TlsSegment>,
     address: u64,
     addend: i64,
@@ -165,7 +165,8 @@ pub fn apply_relocations(
                 }
                 reloc_type::R_X86_64_GOTPCREL
                 | reloc_type::R_X86_64_GOTPCRELX
-                | reloc_type::R_X86_64_REX_GOTPCRELX => {
+                | reloc_type::R_X86_64_REX_GOTPCRELX
+                | reloc_type::R_X86_64_GOTTPOFF => {
                     let got_entry_vaddr = got_entries
                         .get(rel.r_sym as usize)
                         .copied()
@@ -210,8 +211,7 @@ pub fn apply_relocations(
                 }
                 reloc_type::R_X86_64_TLSGD
                 | reloc_type::R_X86_64_TLSLD
-                | reloc_type::R_X86_64_DTPOFF32
-                | reloc_type::R_X86_64_GOTTPOFF => {
+                | reloc_type::R_X86_64_DTPOFF32 => {
                     return Err(format!(
                         "unsupported x86_64 TLS relocation type {}",
                         rel.r_type

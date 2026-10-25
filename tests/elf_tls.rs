@@ -182,3 +182,73 @@ fn static_link_without_libc_keeps_pt_tls_for_local_exec_thread_locals() {
     assert_eq!(weld[1..], reference[1..]);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn initial_exec_offsets_match_ld_across_object_files() {
+    let probe = format!("{DECLARATIONS}\n{PROBE_MAIN}");
+    let output = compare_program_output(
+        "initial-exec-two-units",
+        &[DEFINITIONS, &probe],
+        &["-fPIC", "-ftls-model=initial-exec"],
+    );
+    assert_eq!(output, "-96 -64 -32 -92 2 9 6 120\n");
+}
+
+#[test]
+fn initial_exec_offsets_survive_pie_output() {
+    let dir = std::env::temp_dir().join(format!("weld-tls-pie-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(dir.join("unit.c"), format!("{DEFINITIONS}\n{PROBE_MAIN}")).unwrap();
+    run(
+        "gcc",
+        &[
+            "-fPIC",
+            "-ftls-model=initial-exec",
+            "-c",
+            "unit.c",
+            "-o",
+            "unit.o",
+        ],
+        &dir,
+    );
+    run("gcc", &["-pie", "-B", "drv/", "unit.o", "-o", "weld"], &dir);
+    assert_eq!(run("./weld", &[], &dir), "-96 -64 -32 -92 2 9 6 120\n");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn initial_exec_rejects_thread_local_from_shared_library() {
+    let dir = std::env::temp_dir().join(format!("weld-tls-shared-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(
+        dir.join("unit.c"),
+        "extern __thread int imported; int main(void) { return imported; }",
+    )
+    .unwrap();
+    run(
+        "gcc",
+        &[
+            "-fPIC",
+            "-ftls-model=initial-exec",
+            "-c",
+            "unit.c",
+            "-o",
+            "unit.o",
+        ],
+        &dir,
+    );
+    let output = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-B", "drv/", "unit.o", "-o", "weld"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("thread-locals from shared libraries are not supported"),
+        "{stderr}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
