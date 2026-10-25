@@ -280,3 +280,28 @@ fn global_dynamic_relaxation_is_correct_in_pie() {
     assert_eq!(run("./weld", &[], &dir), "-96 -64 -32 -92 2 9 6 120\n");
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn local_exec_rejects_undefined_weak_thread_local() {
+    let dir = std::env::temp_dir().join(format!("weld-tls-weak-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(
+        dir.join("unit.c"),
+        "extern __thread int weak_value __attribute__((weak)); int main(void) { return &weak_value != 0; }",
+    )
+    .unwrap();
+    run("gcc", &["-fno-pic", "-c", "unit.c", "-o", "unit.o"], &dir);
+    let output = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-no-pie", "-B", "drv/", "unit.o", "-o", "weld"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("thread-local symbol weak_value is not defined by the inputs"),
+        "{stderr}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}

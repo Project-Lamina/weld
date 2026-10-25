@@ -526,18 +526,22 @@ fn link_multi_object_parsed(
             tls_got_names.insert(name.clone());
             unique_syms.push(name);
         }
-        let mut gd_names: Vec<String> = Vec::new();
-        let mut gd_seen: HashSet<String> = HashSet::default();
+        let mut offset_names: Vec<String> = Vec::new();
+        let mut offset_seen: HashSet<String> = HashSet::default();
         for obj in parsed.iter() {
             collect_got_symbol_names(
                 &obj.data,
                 &obj.sections,
-                &[reloc_type::R_X86_64_TLSGD],
-                &mut gd_names,
-                &mut gd_seen,
+                &[
+                    reloc_type::R_X86_64_TLSGD,
+                    reloc_type::R_X86_64_TPOFF32,
+                    reloc_type::R_X86_64_TPOFF64,
+                ],
+                &mut offset_names,
+                &mut offset_seen,
             );
         }
-        for name in &gd_names {
+        for name in &offset_names {
             check_thread_local_defined(parsed, name)?;
         }
         if !unique_syms.is_empty() {
