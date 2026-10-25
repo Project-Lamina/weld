@@ -54,7 +54,11 @@ pub fn apply_relocations(
         let relas = parse_rela_section(data, rela_sh)?;
 
         for rel in &relas {
-            let off = data_off + rel.r_offset as usize;
+            let off = usize::try_from(rel.r_offset)
+                .ok()
+                .and_then(|r| data_off.checked_add(r))
+                .filter(|&off| off <= merged.data.len())
+                .ok_or_else(|| format!("relocation offset {} out of bounds", rel.r_offset))?;
             let place = merged.vaddr + off as u64;
             let a = rel.r_addend;
             let p = place as i64;
