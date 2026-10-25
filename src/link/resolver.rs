@@ -91,6 +91,42 @@ impl LibraryResolver {
         None
     }
 
+    /// Static archives named by the `libNAME.so` text script, if the first such
+    /// file on the search path is one. glibc's `libc.so` script adds
+    /// `libc_nonshared.a` (for `atexit`), which `libc.so.6` alone does not provide.
+    pub fn linker_script_archives(&self, lib_name: &str) -> Vec<PathBuf> {
+        self.search_paths
+            .iter()
+            .map(|dir| dir.join(format!("lib{lib_name}.so")))
+            .find(|path| path.is_file())
+            .map(|path| self.script_archives(&path))
+            .unwrap_or_default()
+    }
+
+    fn script_archives(&self, script: &Path) -> Vec<PathBuf> {
+        if is_elf_file(script) {
+            return Vec::new();
+        }
+        let Ok(text) = std::fs::read_to_string(script) else {
+            return Vec::new();
+        };
+        let body = text.rsplit("*/").next().unwrap_or_default();
+        body.split(|c: char| c == '(' || c == ')' || c.is_whitespace())
+            .filter(|token| !token.starts_with('-') && token.ends_with(".a"))
+            .filter_map(|token| {
+                let direct = Path::new(token);
+                if direct.is_absolute() && direct.is_file() {
+                    return Some(direct.to_path_buf());
+                }
+                let file_name = direct.file_name()?;
+                self.search_paths
+                    .iter()
+                    .map(|dir| dir.join(file_name))
+                    .find(|candidate| candidate.is_file())
+            })
+            .collect()
+    }
+
     pub fn resolve_static(&self, name: &str) -> Option<ResolvedLibrary> {
         let filename = name
             .strip_prefix(':')
