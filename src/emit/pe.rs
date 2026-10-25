@@ -1798,6 +1798,70 @@ mod tests {
         )
     }
 
+    fn comdat_call_object(symbols: &[(&str, i16, u8, u32)], target: u32) -> Vec<u8> {
+        let call = [0xE8, 0, 0, 0, 0, 0xC3];
+        coff_object(
+            &[TestSection {
+                name: ".text",
+                flags: COMDAT_TEXT_FLAGS,
+                data: &call,
+                relocs: &[(1, target, IMAGE_REL_AMD64_REL32)],
+                selection: IMAGE_COMDAT_SELECT_EXACT_MATCH,
+                assoc: 0,
+            }],
+            symbols,
+        )
+    }
+
+    #[test]
+    fn test_coff_comdat_exact_match_compares_relocation_targets_by_name() {
+        let x_first = [
+            ("inl", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+            (
+                "x",
+                IMAGE_SYM_UNDEFINED_SECTION,
+                IMAGE_SYM_CLASS_EXTERNAL,
+                0,
+            ),
+            (
+                "y",
+                IMAGE_SYM_UNDEFINED_SECTION,
+                IMAGE_SYM_CLASS_EXTERNAL,
+                0,
+            ),
+        ];
+        let y_first = [
+            ("inl", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+            (
+                "y",
+                IMAGE_SYM_UNDEFINED_SECTION,
+                IMAGE_SYM_CLASS_EXTERNAL,
+                0,
+            ),
+            (
+                "x",
+                IMAGE_SYM_UNDEFINED_SECTION,
+                IMAGE_SYM_CLASS_EXTERNAL,
+                0,
+            ),
+        ];
+        let calls_x = comdat_call_object(&x_first, 3);
+        let calls_y = comdat_call_object(&x_first, 4);
+        let calls_x_at_other_index = comdat_call_object(&y_first, 4);
+
+        let mut out = Vec::new();
+        assert!(
+            link_and_emit_pe_from_coffs(&[calls_x.as_slice(), calls_y.as_slice()], &mut out)
+                .is_err()
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(
+            &[calls_x.as_slice(), calls_x_at_other_index.as_slice()],
+            &mut out,
+        )
+        .expect("links");
+    }
+
     #[test]
     fn test_coff_comdat_largest_keeps_largest_copy() {
         let small = comdat_object(&[0xC3; 4], IMAGE_COMDAT_SELECT_LARGEST);
