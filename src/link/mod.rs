@@ -194,17 +194,6 @@ fn link_multi_object_parsed(
                         .into(),
                 );
             }
-            if let Some((index, _)) = obj
-                .sections
-                .iter()
-                .enumerate()
-                .find(|(_, section)| section.sh_flags & 0x400 != 0 && section.sh_size != 0)
-            {
-                return Err(format!(
-                    "static TLS is not supported (section {}); static glibc requires TLS layout, PT_TLS and thread-pointer relocations",
-                    obj.names[index]
-                ));
-            }
             if let Some((symbols, strings)) = parse_symtab_view(&obj.data, &obj.sections)?
                 && let Some(symbol) = symbols
                     .iter()
@@ -803,6 +792,7 @@ fn validate_undefined(
             }
             if let Some(name) = get_strtab_string(strings, symbol.name_offset)
                 && !name.is_empty()
+                && name != "_GLOBAL_OFFSET_TABLE_"
                 && !globals.contains_key(&name)
             {
                 return Err(format!("undefined symbol {name}"));
