@@ -24,8 +24,8 @@ pub enum SectionType {
 
 const SHT_NULL: u32 = 0;
 const SHT_NOBITS: u32 = 8;
-const MAX_SECTION_ALIGN: u64 = 1 << 21;
-const MAX_NOBITS_SIZE: u64 = 1 << 32;
+pub const MAX_SECTION_ALIGN: u64 = 1 << 21;
+pub const MAX_NOBITS_SIZE: u64 = 1 << 32;
 const SHT_SYMTAB: u32 = 2;
 const SHT_DYNSYM: u32 = 11;
 const SHT_STRTAB: u32 = 3;
