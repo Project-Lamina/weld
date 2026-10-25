@@ -230,3 +230,27 @@ fn archive_member_pulled_after_earlier_definition_is_duplicate() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn archive_without_symbol_index_is_rejected_like_ld() {
+    let dir = std::env::temp_dir().join(format!("weld-archive-noidx-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(dir.join("empty.c"), "int main(void) { return 0; }").unwrap();
+    fs::write(dir.join("helper.c"), "int helper(void) { return 1; }").unwrap();
+    run(&dir, "gcc", &["-c", "empty.c", "-o", "empty.o"]);
+    run(&dir, "gcc", &["-c", "helper.c", "-o", "helper.o"]);
+    run(&dir, "ar", &["rcS", "libnoidx.a", "helper.o"]);
+    let output = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-Bdrv", "-o", "noidx", "empty.o", "libnoidx.a"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("archive has no index"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
