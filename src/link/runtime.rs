@@ -238,6 +238,7 @@ pub(super) fn prepare(
                     continue;
                 }
                 let relocation = crate::elf::parse_rela_entry(record, 0)?;
+                layout.sections[target].flags |= SHF_WRITE;
                 relocations.push(PendingRelocation {
                     object,
                     section: target,

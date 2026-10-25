@@ -269,3 +269,40 @@ int main(void) { printf("%d %d\n", old(), number()); return old() != 12 || numbe
     assert_eq!(run("./output", &[], &dir), "12 34\n");
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn read_only_table_of_imported_function_pointers_is_relocated_in_place() {
+    let dir = std::env::temp_dir().join(format!("weld-rodata-runtime-{}", std::process::id()));
+    fs::create_dir_all(dir.join("prefix")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
+    fs::write(
+        dir.join("input.c"),
+        r#"
+#include <stdio.h>
+typedef int (*printer)(const char *);
+int wrapped(const char *s) { return printf("[%s]\n", s); }
+static const printer table[] = { puts, wrapped, 0 };
+const char *const names[] = { "alpha", "beta" };
+int main(int argc, char **argv) {
+    table[argc - 1]("from table");
+    printf("%s\n", names[argc - 1]);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    run(
+        "gcc",
+        &["-no-pie", "-fno-pic", "-c", "input.c", "-o", "input.o"],
+        &dir,
+    );
+    run("gcc", &["-no-pie", "input.o", "-o", "reference"], &dir);
+    run(
+        "gcc",
+        &["-no-pie", "-Bprefix", "input.o", "-o", "output"],
+        &dir,
+    );
+    assert_eq!(run("./reference", &[], &dir), "from table\nalpha\n");
+    assert_eq!(run("./output", &[], &dir), "from table\nalpha\n");
+    fs::remove_dir_all(dir).unwrap();
+}
