@@ -31,7 +31,12 @@ fn rejects_lto_and_unresolved_symbols_before_emission() {
         (
             "extern __thread int value; int main(void) { return value; }",
             vec!["-fPIC"],
-            "general dynamic TLS is not supported",
+            "thread-local symbol value is not defined by the inputs",
+        ),
+        (
+            "static __thread int value = 1; int get(void) { return value; } int main(void) { return get(); }",
+            vec!["-fPIC", "-ftls-model=local-dynamic"],
+            "local dynamic TLS is not supported",
         ),
         (
             "extern int missing(void); int main(void) { return missing(); }",

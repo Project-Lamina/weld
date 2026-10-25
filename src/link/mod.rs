@@ -182,7 +182,7 @@ fn link_multi_object_parsed(
     }
 
     for obj in parsed.iter().filter(|obj| obj.header.e_machine == 62) {
-        x86_64::reject_general_dynamic_tls(&obj.data, &obj.sections, &obj.names)?;
+        x86_64::reject_local_dynamic_tls(&obj.data, &obj.sections, &obj.names)?;
     }
     if opts.static_link {
         if opts.pie {
@@ -300,9 +300,13 @@ fn link_multi_object_parsed(
                 let Some(name) = get_strtab_string(strtab, sym.name_offset) else {
                     continue;
                 };
+                let relaxed_tls_call = name == "__tls_get_addr"
+                    && obj.header.e_machine == 62
+                    && x86_64::tls_get_addr_only_relaxed(&obj.data, &obj.sections)?;
                 if !name.is_empty()
                     && name != "_GLOBAL_OFFSET_TABLE_"
                     && !global_symbols.contains_key(&name)
+                    && !relaxed_tls_call
                     && undefined_seen.insert(name.clone())
                 {
                     undefined.push(name);
@@ -518,13 +522,23 @@ fn link_multi_object_parsed(
                     "symbol {name} is used by both GOT and initial-exec TLS relocations"
                 ));
             }
-            if !defines_thread_local(parsed, &name)? {
-                return Err(format!(
-                    "initial-exec TLS symbol {name} is not a thread-local defined by the inputs; thread-locals from shared libraries are not supported"
-                ));
-            }
+            check_thread_local_defined(parsed, &name)?;
             tls_got_names.insert(name.clone());
             unique_syms.push(name);
+        }
+        let mut gd_names: Vec<String> = Vec::new();
+        let mut gd_seen: HashSet<String> = HashSet::default();
+        for obj in parsed.iter() {
+            collect_got_symbol_names(
+                &obj.data,
+                &obj.sections,
+                &[reloc_type::R_X86_64_TLSGD],
+                &mut gd_names,
+                &mut gd_seen,
+            );
+        }
+        for name in &gd_names {
+            check_thread_local_defined(parsed, name)?;
         }
         if !unique_syms.is_empty() {
             let got_base = {
@@ -812,7 +826,9 @@ fn link_multi_object_parsed(
     })
 }
 
-fn defines_thread_local(parsed: &[ParsedObject], name: &str) -> Result<bool, String> {
+/// Thread-local relocations only resolve against thread-locals the inputs define,
+/// because their offsets are fixed at link time.
+fn check_thread_local_defined(parsed: &[ParsedObject], name: &str) -> Result<(), String> {
     for obj in parsed {
         let Some((symbols, strings)) = parse_symtab_view(&obj.data, &obj.sections)? else {
             continue;
@@ -822,10 +838,12 @@ fn defines_thread_local(parsed: &[ParsedObject], name: &str) -> Result<bool, Str
                 && symbol.sym_type == STT_TLS
                 && get_strtab_string(strings, symbol.name_offset).as_deref() == Some(name)
         }) {
-            return Ok(true);
+            return Ok(());
         }
     }
-    Ok(false)
+    Err(format!(
+        "thread-local symbol {name} is not defined by the inputs; thread-locals from shared libraries are not supported"
+    ))
 }
 
 fn validate_undefined(
@@ -853,6 +871,9 @@ fn validate_undefined(
                 && !name.is_empty()
                 && name != "_GLOBAL_OFFSET_TABLE_"
                 && !globals.contains_key(&name)
+                && !(name == "__tls_get_addr"
+                    && obj.header.e_machine == 62
+                    && x86_64::tls_get_addr_only_relaxed(&obj.data, &obj.sections)?)
             {
                 return Err(format!("undefined symbol {name}"));
             }
