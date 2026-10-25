@@ -267,3 +267,50 @@ fn rejects_relocation_offset_that_wraps() {
     assert!(!stderr.contains("panicked"), "{stderr}");
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn links_common_symbols_with_strong_override() {
+    let dir = std::env::temp_dir().join(format!("weld-common-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(
+        dir.join("a.c"),
+        "int cx; int ca[4] __attribute__((aligned(64))); int cz;",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("b.c"),
+        "int cx; int cz = 5; extern int ca[]; \
+         int main(void) { cx = 5; ca[0] = 2; return cx + ca[0] + cz + (((unsigned long)ca) & 63 ? 100 : 0); }",
+    )
+    .unwrap();
+    for source in ["a.c", "b.c"] {
+        let status = Command::new("gcc")
+            .current_dir(&dir)
+            .args(["-fcommon", "-c", source])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let output = Command::new("gcc")
+        .current_dir(&dir)
+        .args([
+            "-Bdrv",
+            "-nostdlib",
+            "-no-pie",
+            "-nostartfiles",
+            "a.o",
+            "b.o",
+            "-o",
+            "output",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.is_empty() || !stderr.contains("undefined"),
+        "{stderr}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
