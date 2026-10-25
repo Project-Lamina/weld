@@ -153,3 +153,80 @@ fn static_glibc_and_unsupported_runtime_features_fail_before_emission() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn archive_listed_before_its_user_is_not_searched() {
+    let dir = std::env::temp_dir().join(format!("weld-archive-order-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    for (name, source) in [
+        ("r", "int r(void) { return 20; }"),
+        ("q", "int r(void); int q(void) { return r() * 2; }"),
+        ("p", "int q(void); int p(void) { return q() + 1; }"),
+        (
+            "main",
+            "#include <stdio.h>\nint p(void); int main(void) { printf(\"p=%d\\n\", p()); return 0; }",
+        ),
+    ] {
+        fs::write(dir.join(format!("{name}.c")), source).unwrap();
+        run(
+            &dir,
+            "gcc",
+            &["-c", &format!("{name}.c"), "-o", &format!("{name}.o")],
+        );
+    }
+    run(&dir, "ar", &["rcs", "libchain.a", "r.o", "q.o", "p.o"]);
+    let output = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-Bdrv", "-o", "before", "libchain.a", "main.o"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("undefined"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    run(
+        &dir,
+        "gcc",
+        &["-Bdrv", "-o", "after", "main.o", "libchain.a"],
+    );
+    assert_eq!(run(&dir, "./after", &[]), "p=41\n");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn archive_member_pulled_after_earlier_definition_is_duplicate() {
+    let dir = std::env::temp_dir().join(format!("weld-archive-dup-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    for (name, source) in [
+        ("member", "int strongf(void) { return 7; }"),
+        ("object", "int strongf(void) { return 5; }"),
+        (
+            "main",
+            "int strongf(void); int main(void) { return strongf(); }",
+        ),
+    ] {
+        fs::write(dir.join(format!("{name}.c")), source).unwrap();
+        run(
+            &dir,
+            "gcc",
+            &["-c", &format!("{name}.c"), "-o", &format!("{name}.o")],
+        );
+    }
+    run(&dir, "ar", &["rcs", "libmember.a", "member.o"]);
+    let output = Command::new("gcc")
+        .current_dir(&dir)
+        .args(["-Bdrv", "-o", "dup", "main.o", "libmember.a", "object.o"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("multiple definition of strongf"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
