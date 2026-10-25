@@ -28,7 +28,7 @@ use dynamic::{
 pub(crate) use merge::segment_class;
 pub use merge::{
     MergedLayout, MergedSection, ObjectSectionContrib, merge_sections_multi_object,
-    merge_sections_single_object,
+    merge_sections_single_object, tls_segment,
 };
 use merge::{align_up, is_allocatable, reserve_start_section};
 pub use resolver::LibraryResolver;
@@ -601,6 +601,7 @@ fn link_multi_object_parsed(
         });
     }
     let moves = merge::layout_segments(&mut layout, arch.page_align());
+    tls_segment(&layout)?;
     let remap = |address: u64| {
         moves
             .iter()
