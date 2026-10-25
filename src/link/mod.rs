@@ -34,7 +34,7 @@ use merge::{align_up, is_allocatable, reserve_start_section};
 pub use resolver::LibraryResolver;
 pub use symbols::OutputSymbol;
 use symbols::{
-    collect_gotpcrel_symbol_names, collect_output_symbols, parse_symtab_view,
+    collect_got_symbol_names, collect_output_symbols, parse_symtab_view,
     resolve_symbols_for_object, symbol_names_by_index,
 };
 
@@ -42,7 +42,7 @@ use crate::{
     arch::TargetArch,
     elf::{
         Elf64Header, SectionHeader, Symbol, get_strtab_from_section, get_strtab_string,
-        parse_elf64_slice, parse_rela_section, parse_symtab,
+        parse_elf64_slice, parse_rela_section, parse_symtab, reloc_type,
     },
     platform::TargetPlatform,
 };
@@ -76,6 +76,7 @@ const SHN_COMMON: u16 = 0xfff2;
 const STB_LOCAL: u8 = 0;
 const STB_GLOBAL: u8 = 1;
 const STB_WEAK: u8 = 2;
+const STT_TLS: u8 = 6;
 
 const SHF_ALLOC: u64 = 2;
 const SHF_EXECINSTR: u64 = 4;
@@ -483,16 +484,47 @@ fn link_multi_object_parsed(
     // included). For external symbols without a definition, the slot stays 0.
     timer.mark("dynamic sections");
     let mut got_symbol_map: HashMap<String, u64> = HashMap::default();
+    let mut tls_got_names: HashSet<String> = HashSet::default();
     if arch == TargetArch::X86_64 {
         let mut unique_syms: Vec<String> = Vec::new();
         let mut got_seen: HashSet<String> = HashSet::default();
         for obj in parsed.iter() {
-            collect_gotpcrel_symbol_names(
+            collect_got_symbol_names(
                 &obj.data,
                 &obj.sections,
+                &[
+                    reloc_type::R_X86_64_GOTPCREL,
+                    reloc_type::R_X86_64_GOTPCRELX,
+                    reloc_type::R_X86_64_REX_GOTPCRELX,
+                ],
                 &mut unique_syms,
                 &mut got_seen,
             );
+        }
+        let mut tls_seen: HashSet<String> = HashSet::default();
+        let mut tls_names: Vec<String> = Vec::new();
+        for obj in parsed.iter() {
+            collect_got_symbol_names(
+                &obj.data,
+                &obj.sections,
+                &[reloc_type::R_X86_64_GOTTPOFF],
+                &mut tls_names,
+                &mut tls_seen,
+            );
+        }
+        for name in tls_names {
+            if got_seen.contains(&name) {
+                return Err(format!(
+                    "symbol {name} is used by both GOT and initial-exec TLS relocations"
+                ));
+            }
+            if !defines_thread_local(parsed, &name)? {
+                return Err(format!(
+                    "initial-exec TLS symbol {name} is not a thread-local defined by the inputs; thread-locals from shared libraries are not supported"
+                ));
+            }
+            tls_got_names.insert(name.clone());
+            unique_syms.push(name);
         }
         if !unique_syms.is_empty() {
             let got_base = {
@@ -519,11 +551,16 @@ fn link_multi_object_parsed(
     }
 
     let mut pie_relocations = if opts.pie {
+        let pie_got: HashMap<String, u64> = got_symbol_map
+            .iter()
+            .filter(|(name, _)| !tls_got_names.contains(*name))
+            .map(|(name, &address)| (name.clone(), address))
+            .collect();
         Some(pie::prepare(
             &mut layout,
             parsed,
             &section_contribs,
-            &got_symbol_map,
+            &pie_got,
             &global_symbols,
         )?)
     } else {
@@ -653,14 +690,20 @@ fn link_multi_object_parsed(
     }
 
     // Local symbols and PLT stubs for external functions get their resolved addresses here.
+    let tls = tls_segment(&layout)?;
     if let Some(&got_idx) = layout.section_by_name.get(".got") {
         let got_base = layout.sections[got_idx].vaddr;
         for (name, &got_entry_vaddr) in &got_symbol_map {
             if let Some(&sym_addr) = global_symbols.get(name) {
+                let value = if tls_got_names.contains(name) {
+                    x86_64::local_exec_offset(tls.as_ref(), sym_addr, 0)? as u64
+                } else {
+                    sym_addr
+                };
                 let off = (got_entry_vaddr - got_base) as usize;
                 if off + 8 <= layout.sections[got_idx].data.len() {
                     layout.sections[got_idx].data[off..off + 8]
-                        .copy_from_slice(&sym_addr.to_le_bytes());
+                        .copy_from_slice(&value.to_le_bytes());
                 }
             }
         }
@@ -767,6 +810,22 @@ fn link_multi_object_parsed(
         symbol_addrs: global_symbols,
         dynamic: dynamic_info,
     })
+}
+
+fn defines_thread_local(parsed: &[ParsedObject], name: &str) -> Result<bool, String> {
+    for obj in parsed {
+        let Some((symbols, strings)) = parse_symtab_view(&obj.data, &obj.sections)? else {
+            continue;
+        };
+        if symbols.iter().any(|symbol| {
+            symbol.st_shndx != SHN_UNDEF
+                && symbol.sym_type == STT_TLS
+                && get_strtab_string(strings, symbol.name_offset).as_deref() == Some(name)
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_undefined(
