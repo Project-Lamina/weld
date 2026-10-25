@@ -6,7 +6,9 @@ use super::{
 };
 use crate::{
     collections::HashMap,
-    elf::{MAX_NOBITS_SIZE, MAX_SECTION_ALIGN, SectionHeader, get_strtab_string, parse_elf64_slice},
+    elf::{
+        MAX_NOBITS_SIZE, MAX_SECTION_ALIGN, SectionHeader, get_strtab_string, parse_elf64_slice,
+    },
 };
 use std::path::Path;
 
@@ -503,7 +505,9 @@ fn place_common_symbols(
     if requirements.is_empty() {
         return Ok(offsets);
     }
-    section_types.entry(".bss".into()).or_insert((SHT_NOBITS, 0));
+    section_types
+        .entry(".bss".into())
+        .or_insert((SHT_NOBITS, 0));
     section_flags
         .entry(".bss".into())
         .or_insert(SHF_ALLOC | SHF_WRITE);
@@ -512,10 +516,15 @@ fn place_common_symbols(
     let mut end: u64 = bss.iter().map(|(_, size)| *size).sum();
     for (name, size, align) in requirements {
         if !align.is_power_of_two() || align > MAX_SECTION_ALIGN {
-            return Err(format!("common symbol {name} has unsupported alignment {align}"));
+            return Err(format!(
+                "common symbol {name} has unsupported alignment {align}"
+            ));
         }
         let offset = align_up(end, align);
-        if offset.checked_add(size).is_none_or(|stop| stop > MAX_NOBITS_SIZE) {
+        if offset
+            .checked_add(size)
+            .is_none_or(|stop| stop > MAX_NOBITS_SIZE)
+        {
             return Err("common symbols are too large".into());
         }
         if offset > end {
@@ -529,17 +538,14 @@ fn place_common_symbols(
     Ok(offsets)
 }
 
+pub type MultiObjectMerge = (
+    MergedLayout,
+    Vec<HashMap<String, ObjectSectionContrib>>,
+    HashMap<String, u64>,
+);
+
 /// Merge sections from multiple objects. Same e_machine required.
-pub fn merge_sections_multi_object(
-    objects: &[&[u8]],
-) -> Result<
-    (
-        MergedLayout,
-        Vec<HashMap<String, ObjectSectionContrib>>,
-        HashMap<String, u64>,
-    ),
-    String,
-> {
+pub fn merge_sections_multi_object(objects: &[&[u8]]) -> Result<MultiObjectMerge, String> {
     if objects.is_empty() {
         return Err("no objects to merge".to_string());
     }
