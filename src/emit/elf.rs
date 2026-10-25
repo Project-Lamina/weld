@@ -6,7 +6,7 @@
 
 use crate::{
     arch::TargetArch,
-    link::{DynamicLinkInfo, MergedLayout, OutputSymbol},
+    link::{DynamicLinkInfo, MergedLayout, OutputSymbol, tls_segment},
     segment::{align_up_u64, build_segment_buffer},
 };
 use std::io::{Error, ErrorKind, Result, Write};
@@ -25,6 +25,7 @@ const PT_PHDR: u32 = 6;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
+const PT_TLS: u32 = 7;
 const PT_GNU_STACK: u32 = 0x6474e551;
 const PF_R: u32 = 4;
 const PF_W: u32 = 2;
@@ -190,7 +191,9 @@ fn emit_image(
         .get(".note.gnu.property")
         .map(|&i| &layout.sections[i])
         .filter(|s| !s.data.is_empty());
+    let tls = tls_segment(layout).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
     let phnum = 2 - u16::from(combine_headers)
+        + u16::from(tls.is_some())
         + notes.len() as u16
         + u16::from(property.is_some())
         + groups.len() as u16
@@ -315,6 +318,17 @@ fn emit_image(
             section.data.len() as u64,
             section.data.len() as u64,
             8,
+        )?;
+    }
+    if let Some(tls) = tls {
+        header(
+            PT_TLS,
+            PF_R,
+            segment_offset + tls.vaddr - base,
+            tls.vaddr,
+            tls.filesz,
+            tls.memsz,
+            tls.align,
         )?;
     }
     header(PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 16)?;
