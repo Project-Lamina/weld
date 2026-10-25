@@ -85,6 +85,7 @@ pub(super) fn prepare(
                         || relative
                         || (arch == TargetArch::X86_64 && kind == 6) =>
                     {
+                        layout.sections[index].flags |= SHF_WRITE;
                         slots.push((
                             index,
                             (contribution.offset_in_merged + rel.r_offset) as usize,
