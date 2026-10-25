@@ -74,6 +74,18 @@ pub(super) fn reserve_start_section(layout: &mut MergedLayout) {
 }
 
 pub(super) fn layout_segments(layout: &mut MergedLayout, page: u64) -> Vec<(u64, u64, u64)> {
+    let tls_align = layout
+        .sections
+        .iter()
+        .filter(|s| is_tls(s))
+        .map(|s| s.align)
+        .max()
+        .unwrap_or(1);
+    for section in &mut layout.sections {
+        if is_tls(section) {
+            section.align = tls_align;
+        }
+    }
     let base = layout
         .sections
         .iter()
@@ -93,6 +105,7 @@ pub(super) fn layout_segments(layout: &mut MergedLayout, page: u64) -> Vec<(u64,
         let s = &layout.sections[i];
         (
             segment_class(s),
+            !is_tls(s),
             s.sh_type == SHT_NOBITS,
             section_rank(&s.name),
             runtime::array_order(&s.name),
@@ -194,6 +207,68 @@ pub(super) fn align_up(value: u64, align: u64) -> u64 {
 
 pub(super) fn is_allocatable(flags: u64) -> bool {
     (flags & SHF_ALLOC) != 0
+}
+
+pub(crate) const SHF_TLS: u64 = 0x400;
+
+pub(crate) fn is_tls(section: &MergedSection) -> bool {
+    is_allocatable(section.flags) && section.flags & SHF_TLS != 0
+}
+
+/// The PT_TLS template. `vaddr` is the first thread-local byte, `filesz` the
+/// initialised prefix and `memsz` the whole block, which the thread pointer
+/// follows at `round_up(memsz, align)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsSegment {
+    pub vaddr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+    pub align: u64,
+}
+
+/// Returns the thread-local template, or `None` when the program has no
+/// thread-local sections. Fails when a non-thread-local section lies inside the
+/// block, because the template copy would then leak its bytes into every thread.
+pub fn tls_segment(layout: &MergedLayout) -> Result<Option<TlsSegment>, String> {
+    let tls: Vec<&MergedSection> = layout.sections.iter().filter(|s| is_tls(s)).collect();
+    if tls.is_empty() {
+        return Ok(None);
+    }
+    let start = tls.iter().map(|s| s.vaddr).min().unwrap_or(0);
+    let memsz_end = tls
+        .iter()
+        .map(|s| s.vaddr + s.data.len() as u64)
+        .max()
+        .unwrap_or(start);
+    let filesz_end = tls
+        .iter()
+        .filter(|s| s.sh_type != SHT_NOBITS)
+        .map(|s| s.vaddr + s.data.len() as u64)
+        .max()
+        .unwrap_or(start);
+    let align = tls.iter().map(|s| s.align).max().unwrap_or(1).max(1);
+    if start % align != 0 {
+        return Err("thread-local block is not aligned to its alignment".into());
+    }
+    for section in layout
+        .sections
+        .iter()
+        .filter(|s| is_allocatable(s.flags) && !is_tls(s) && !s.data.is_empty())
+    {
+        let end = section.vaddr + section.data.len() as u64;
+        if section.vaddr < memsz_end && end > start {
+            return Err(format!(
+                "section {} lies inside the thread-local block",
+                section.name
+            ));
+        }
+    }
+    Ok(Some(TlsSegment {
+        vaddr: start,
+        filesz: filesz_end - start,
+        memsz: memsz_end - start,
+        align,
+    }))
 }
 
 pub(super) fn output_section_name(name: &str) -> &str {
