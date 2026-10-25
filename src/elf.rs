@@ -304,15 +304,29 @@ pub fn read_dynamic_tables(path: &Path) -> Result<(Vec<u8>, Vec<SectionHeader>),
     wanted.sort_unstable();
     wanted.dedup();
 
+    let file_len = file_size(&file)?;
     let mut data = Vec::new();
     for i in wanted {
         let section = &mut sections[i];
+        if section
+            .sh_offset
+            .checked_add(section.sh_size)
+            .is_none_or(|end| end > file_len)
+        {
+            return Err(format!("section {i} extends past end of file"));
+        }
         let start = data.len();
         data.resize(start + section.sh_size as usize, 0);
         read_at(&mut file, section.sh_offset, &mut data[start..])?;
         section.sh_offset = start as u64;
     }
     Ok((data, sections))
+}
+
+fn file_size(file: &std::fs::File) -> Result<u64, String> {
+    file.metadata()
+        .map(|m| m.len())
+        .map_err(|e| format!("read failed: {}", e))
 }
 
 pub fn parse_elf64_file(
@@ -500,5 +514,24 @@ mod tests {
         assert_eq!(rel.r_sym, 5);
         assert_eq!(rel.r_type, 1);
         assert_eq!(rel.r_addend, -4);
+    }
+
+    #[test]
+    fn dynamic_table_larger_than_file_is_error() {
+        let mut data = vec![0u8; 128];
+        data[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        data[4] = 2;
+        data[5] = 1;
+        data[16..18].copy_from_slice(&3u16.to_le_bytes());
+        data[18..20].copy_from_slice(&62u16.to_le_bytes());
+        data[40..48].copy_from_slice(&64u64.to_le_bytes());
+        data[60..62].copy_from_slice(&1u16.to_le_bytes());
+        data[64 + 4..64 + 8].copy_from_slice(&11u32.to_le_bytes());
+        data[64 + 32..64 + 40].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        let path = std::env::temp_dir().join(format!("weld-dyn-table-{}.so", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        let result = read_dynamic_tables(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(result.unwrap_err().contains("extends past end of file"));
     }
 }
