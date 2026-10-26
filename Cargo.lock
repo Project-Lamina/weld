@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "lamina-weld"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "lamina-platform",
  "lamina-ras",
