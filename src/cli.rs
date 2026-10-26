@@ -47,7 +47,7 @@ pub fn print_usage() {
     eprintln!("  --version                   Print version");
     eprintln!();
     eprintln!(
-        "GCC: link with weld using -fuse-ld=weld; assemble .s with ras by symlinking as -> ras and passing gcc -B<prefix> (see ras --help)."
+        "GCC: symlink ld -> weld in a prefix dir and pass gcc -B<prefix>/ (-fuse-ld=weld is not a name gcc or clang accepts). Symlink as -> ras in the same dir to assemble with ras (see ras --help)."
     );
 }
 
