@@ -234,7 +234,9 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "--eh-frame-hdr" | "--no-eh-frame-hdr" => {}
             "--build-id" | "--build-id=sha1" => args.build_id = true,
             "--build-id=none" => args.build_id = false,
-            s if s.starts_with("--build-id=") => return Err(format!("unsupported build ID style: {s}")),
+            s if s.starts_with("--build-id=") => {
+                return Err(format!("unsupported build ID style: {s}"));
+            }
             s if s.starts_with("--hash-style=") => {}
             s if s.starts_with("-plugin-opt=") || s.starts_with("--plugin-opt=") => {}
             "-plugin" | "--plugin" => {
