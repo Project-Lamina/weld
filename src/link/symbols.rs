@@ -213,7 +213,10 @@ pub(super) fn collect_got_symbol_names(
 
 /// Like `symbol_names_by_index` but returns `None` on parse failure instead
 /// of `Err`, for use in best-effort pre-scans.
-pub(super) fn symbol_names_by_index_raw(data: &[u8], sections: &[SectionHeader]) -> Option<Vec<String>> {
+pub(super) fn symbol_names_by_index_raw(
+    data: &[u8],
+    sections: &[SectionHeader],
+) -> Option<Vec<String>> {
     let (symbols, strtab) = parse_symtab_view(data, sections).ok()??;
     Some(
         symbols

@@ -6,8 +6,8 @@
 mod arch;
 mod archive;
 mod cli;
-mod collections;
 mod coff;
+mod collections;
 mod elf;
 mod emit;
 mod link;

@@ -16,7 +16,9 @@ pub struct Member {
 
 impl Member {
     pub fn data<'a>(&self, archive: &'a [u8]) -> &'a [u8] {
-        archive.get(self.start..self.start + self.len).unwrap_or(&[])
+        archive
+            .get(self.start..self.start + self.len)
+            .unwrap_or(&[])
     }
 }
 
