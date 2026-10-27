@@ -1,6 +1,6 @@
 [package]
 name = "lamina-weld"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 authors = ["Eira <eira@nornity.com>"]
 description = "weld - Cross-platform linker. Fast, minimal, drop-in for ld/lld/mold. Links ELF (Linux), PE (Windows), Mach-O (macOS)."
@@ -18,5 +18,11 @@ rustc-hash = "2.1.2"
 log = "0.4"
 
 [dev-dependencies]
-lamina-platform = { version = "0.1.1" }
-ras = { package = "lamina-ras", version = "0.1.1", features = ["encoder"] }
+lamina-platform = { version = "0.2.0" }
+ras = { package = "lamina-ras", version = "0.2.0", features = ["encoder"] }
+
+[patch.crates-io]
+lamina-platform = { path = "../lamina/lamina-platform" }
+lamina-mir = { path = "../lamina/lamina-mir" }
+lamina-codegen = { path = "../lamina/lamina-codegen" }
+lamina-ras = { path = "../ras" }
