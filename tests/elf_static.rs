@@ -249,3 +249,68 @@ fn archive_without_symbol_index_is_rejected_like_ld() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn static_link_emits_eh_frame_hdr_for_unwinders() {
+    let dir = std::env::temp_dir().join(format!("weld-static-eh-hdr-{}", std::process::id()));
+    fs::create_dir_all(dir.join("drv")).unwrap();
+    symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
+    fs::write(
+        dir.join("start.s"),
+        ".globl _start\n.text\n_start:\n call main\n mov %eax, %edi\n mov $60, %eax\n syscall\n.section .note.GNU-stack,\"\",@progbits\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("prog.c"),
+        "__attribute__((noinline)) int a(int x) { return x + 1; }\n__attribute__((noinline)) int b(int x) { return a(x) * 2; }\nint main(void) { return b(3) == 8 ? 0 : 1; }\n",
+    )
+    .unwrap();
+    run(
+        &dir,
+        "gcc",
+        &["-c", "-O0", "-fno-pie", "prog.c", "-o", "prog.o"],
+    );
+    run(&dir, "gcc", &["-c", "start.s", "-o", "start.o"]);
+    run(
+        &dir,
+        "gcc",
+        &[
+            "-Bdrv",
+            "-static",
+            "-nostdlib",
+            "start.o",
+            "prog.o",
+            "-o",
+            "output",
+        ],
+    );
+    assert!(Command::new(dir.join("output")).status().unwrap().success());
+    let headers = run(&dir, "readelf", &["-SlW", "output"]);
+    assert!(headers.contains(".eh_frame_hdr") && headers.contains("GNU_EH_FRAME"));
+    let frames = run(&dir, "readelf", &["--debug-dump=frames", "output"]);
+    let fdes = frames.matches(" FDE cie").count();
+    assert_eq!(fdes, 3);
+    let dump = run(&dir, "readelf", &["-x", ".eh_frame_hdr", "output"]);
+    let hex: String = dump
+        .lines()
+        .filter(|line| line.trim_start().starts_with("0x"))
+        .flat_map(|line| {
+            line.split_whitespace()
+                .skip(1)
+                .take_while(|group| group.len() == 8)
+        })
+        .collect();
+    assert!(hex.starts_with("011b033b"), "{hex}");
+    let word = |at: usize| {
+        let le = [
+            &hex[at + 6..at + 8],
+            &hex[at + 4..at + 6],
+            &hex[at + 2..at + 4],
+            &hex[at..at + 2],
+        ];
+        u32::from_str_radix(&le.concat(), 16).unwrap()
+    };
+    assert_eq!(word(16) as usize, fdes);
+    assert_eq!(hex.len(), (12 + fdes * 8) * 2);
+    fs::remove_dir_all(dir).unwrap();
+}
