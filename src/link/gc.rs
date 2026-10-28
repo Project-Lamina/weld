@@ -34,6 +34,9 @@ fn frames(data: &[u8]) -> Result<Vec<Frame>, String> {
         });
         start += 4 + size;
     }
+    if start != data.len() {
+        return Err("truncated .eh_frame record during section GC".into());
+    }
     Ok(result)
 }
 
