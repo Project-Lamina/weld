@@ -514,16 +514,7 @@ pub(super) fn prepare(
     } else {
         append(layout, ".rela.dyn", vec![0; count * 24], 8, SHF_ALLOC);
     }
-    if let Some(&idx) = layout.section_by_name.get(".eh_frame") {
-        let count = frame_entries(&layout.sections[idx])?.len();
-        append(
-            layout,
-            ".eh_frame_hdr",
-            vec![0; 12 + count * 8],
-            4,
-            SHF_ALLOC,
-        );
-    }
+    reserve_eh_frame_hdr(layout)?;
     let dynidx = layout.section_by_name[".dynamic"];
     let mut entries: Vec<(u64, u64)> = layout.sections[dynidx]
         .data
@@ -758,6 +749,24 @@ pub(super) fn finish(
             record[8..].copy_from_slice(&size.to_le_bytes());
         }
     }
+    Ok(())
+}
+
+pub(super) fn reserve_eh_frame_hdr(layout: &mut MergedLayout) -> Result<(), String> {
+    if let Some(&idx) = layout.section_by_name.get(".eh_frame") {
+        let count = frame_entries(&layout.sections[idx])?.len();
+        append(
+            layout,
+            ".eh_frame_hdr",
+            vec![0; 12 + count * 8],
+            4,
+            SHF_ALLOC,
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn finish_eh_frame_hdr(layout: &mut MergedLayout) -> Result<(), String> {
     if let Some(&hdridx) = layout.section_by_name.get(".eh_frame_hdr") {
         let frame = &layout.sections[layout.section_by_name[".eh_frame"]];
         let mut entries = frame_entries(frame)?;

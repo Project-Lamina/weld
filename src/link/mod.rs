@@ -595,6 +595,7 @@ fn link_multi_object_parsed(
             &mut global_symbols,
         )?)
     } else {
+        runtime::reserve_eh_frame_hdr(&mut layout)?;
         None
     };
     if opts.pie && dynamic_info.is_none() {
@@ -797,6 +798,7 @@ fn link_multi_object_parsed(
     if let Some(runtime) = runtime {
         runtime::finish(&mut layout, &section_contribs, &runtime)?;
     }
+    runtime::finish_eh_frame_hdr(&mut layout)?;
     if let Some(pending) = pie_relocations {
         pie::finish(&mut layout, pending)?;
     }
