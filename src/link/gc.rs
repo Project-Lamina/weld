@@ -15,7 +15,8 @@ fn frames(data: &[u8]) -> Result<Vec<Frame>, String> {
     while start + 4 <= data.len() {
         let size = u32::from_le_bytes(data[start..start + 4].try_into().unwrap()) as usize;
         if size == 0 {
-            break;
+            start += 4;
+            continue;
         }
         if size == u32::MAX as usize || size < 4 || start + 4 + size > data.len() {
             return Err("unsupported .eh_frame record during section GC".into());
