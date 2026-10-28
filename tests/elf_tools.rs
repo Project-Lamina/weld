@@ -184,6 +184,112 @@ fn gc_follows_relocations_and_prunes_unwind_records() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+const MID_EH_FRAME_SOURCE: &str = r#".text
+.globl _start
+.type _start,@function
+_start:
+    call helper
+    mov $60, %eax
+    xor %edi, %edi
+    syscall
+_start_end:
+.size _start, .-_start
+
+.section .text.helper,"ax",@progbits
+.type helper,@function
+helper:
+    ret
+helper_end:
+.size helper, .-helper
+
+.section .text.pers,"ax",@progbits
+.type pers,@function
+pers:
+    ret
+.size pers, .-pers
+
+.section .eh_frame,"a",@progbits
+cie1:
+    .long cie1_end - cie1_body
+cie1_body:
+    .long 0
+    .byte 1
+    .asciz "zR"
+    .uleb128 1
+    .sleb128 -8
+    .uleb128 16
+    .uleb128 1
+    .byte 0x1b
+    .byte 0x0c, 7, 8, 0x90, 1
+    .balign 8
+cie1_end:
+fde1:
+    .long fde1_end - fde1_body
+fde1_body:
+    .long fde1_body - cie1
+    .long _start - .
+    .long _start_end - _start
+    .uleb128 0
+    .balign 8
+fde1_end:
+    .long 0
+cie2:
+    .long cie2_end - cie2_body
+cie2_body:
+    .long 0
+    .byte 1
+    .asciz "zPR"
+    .uleb128 1
+    .sleb128 -8
+    .uleb128 16
+    .uleb128 10
+    .byte 0
+    .quad pers
+    .byte 0x1b
+    .byte 0x0c, 7, 8
+    .balign 8
+cie2_end:
+fde2:
+    .long fde2_end - fde2_body
+fde2_body:
+    .long fde2_body - cie2
+    .long helper - .
+    .long helper_end - helper
+    .uleb128 0
+    .balign 8
+fde2_end:
+.section .note.GNU-stack,"",@progbits
+"#;
+
+#[test]
+fn gc_scans_records_after_an_eh_frame_terminator() {
+    let dir = std::env::temp_dir().join(format!("weld-gc-eh-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("mid.s"), MID_EH_FRAME_SOURCE).unwrap();
+    fs::write(
+        dir.join("tail.c"),
+        "__attribute__((noinline)) int leaf(int x) { return x + 1; }\nint tail_entry(int x) { return leaf(x) * 2; }\n",
+    )
+    .unwrap();
+    run("as", &["mid.s", "-o", "mid.o"], &dir);
+    run(
+        "gcc",
+        &["-c", "-O0", "-fno-pie", "tail.c", "-o", "tail.o"],
+        &dir,
+    );
+    run(
+        env!("CARGO_BIN_EXE_weld"),
+        &["mid.o", "tail.o", "--gc-sections", "-o", "output"],
+        &dir,
+    );
+    assert!(Command::new(dir.join("output")).status().unwrap().success());
+    let symbols = run("nm", &["output"], &dir);
+    assert!(symbols.contains(" helper") && symbols.contains(" pers"));
+    let frames = run("readelf", &["--debug-dump=frames", "output"], &dir);
+    assert_eq!(frames.matches(" FDE ").count(), 2);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn strip_preserves_dynamic_symbols_and_map_retains_definitions() {
     let dir = std::env::temp_dir().join(format!("weld-strip-{}", std::process::id()));
