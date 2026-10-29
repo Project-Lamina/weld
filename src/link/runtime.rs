@@ -29,12 +29,7 @@ fn symbol_name(strings: &[u8], offset: u32) -> Option<&str> {
 }
 
 fn append(layout: &mut MergedLayout, name: &str, data: Vec<u8>, align: u64, flags: u64) {
-    let end = layout
-        .sections
-        .iter()
-        .map(|s| s.vaddr + s.data.len() as u64)
-        .max()
-        .unwrap_or(0x400000);
+    let end = super::merge::image_end(layout).unwrap_or(0x400000);
     layout
         .section_by_name
         .insert(name.into(), layout.sections.len());
@@ -455,12 +450,7 @@ pub(super) fn prepare(
         }
     }
     layout.sections[stridx].data.clear();
-    let end = layout
-        .sections
-        .iter()
-        .map(|s| s.vaddr + s.data.len() as u64)
-        .max()
-        .unwrap();
+    let end = super::merge::image_end(layout).ok_or("no sections")?;
     layout.sections[stridx].vaddr = align_up(end, 8);
     layout.sections[stridx].data = strings;
     append(layout, ".gnu.version", versym, 2, SHF_ALLOC);
@@ -502,12 +492,7 @@ pub(super) fn prepare(
             .count()
         + relocations.len();
     if let Some(&idx) = layout.section_by_name.get(".rela.dyn") {
-        let end = layout
-            .sections
-            .iter()
-            .map(|s| s.vaddr + s.data.len() as u64)
-            .max()
-            .unwrap();
+        let end = super::merge::image_end(layout).ok_or("no sections")?;
         layout.sections[idx].vaddr = align_up(end, 8);
         let size = layout.sections[idx].data.len() + count * 24;
         layout.sections[idx].data.resize(size, 0);
@@ -571,15 +556,7 @@ pub(super) fn prepare(
     layout.sections[dynidx]
         .data
         .resize((entries.len() + 1) * 16, 0);
-    let mut end = align_up(
-        layout
-            .sections
-            .iter()
-            .map(|s| s.vaddr + s.data.len() as u64)
-            .max()
-            .unwrap(),
-        4096,
-    );
+    let mut end = align_up(super::merge::image_end(layout).ok_or("no sections")?, 4096);
     let mut protected: Vec<_> = layout
         .sections
         .iter()

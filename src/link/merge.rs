@@ -53,12 +53,7 @@ pub(super) fn reserve_start(
 }
 
 pub(super) fn reserve_start_section(layout: &mut MergedLayout) {
-    let end = layout
-        .sections
-        .iter()
-        .map(|s| s.vaddr + s.data.len() as u64)
-        .max()
-        .unwrap_or(0x400000);
+    let end = image_end(layout).unwrap_or(0x400000);
     layout
         .section_by_name
         .insert(".text.__weld_start".into(), layout.sections.len());
@@ -96,7 +91,13 @@ pub(super) fn layout_segments(layout: &mut MergedLayout, page: u64) -> Vec<(u64,
     let old: Vec<_> = layout
         .sections
         .iter()
-        .map(|s| (s.vaddr, s.data.len() as u64))
+        .map(|s| {
+            if is_allocatable(s.flags) {
+                (s.vaddr, s.data.len() as u64)
+            } else {
+                (0, 0)
+            }
+        })
         .collect();
     let mut order: Vec<_> = (0..layout.sections.len())
         .filter(|&i| is_allocatable(layout.sections[i].flags))
@@ -186,7 +187,7 @@ pub(super) fn move_nobits(layout: &mut MergedLayout) {
     let mut end = layout
         .sections
         .iter()
-        .filter(|s| s.sh_type != SHT_NOBITS)
+        .filter(|s| s.sh_type != SHT_NOBITS && is_allocatable(s.flags))
         .map(|s| s.vaddr + s.data.len() as u64)
         .max()
         .unwrap_or(0x400000);
@@ -207,6 +208,23 @@ pub(super) fn align_up(value: u64, align: u64) -> u64 {
 
 pub(super) fn is_allocatable(flags: u64) -> bool {
     (flags & SHF_ALLOC) != 0
+}
+
+const SHF_COMPRESSED: u64 = 0x800;
+
+pub(super) fn is_debug_section(name: &str) -> bool {
+    name.starts_with(".debug_") || name == ".debug"
+}
+
+/// The end of the loaded image: the highest address any allocatable section
+/// reaches. Non-allocatable sections hold no address and are skipped.
+pub(crate) fn image_end(layout: &MergedLayout) -> Option<u64> {
+    layout
+        .sections
+        .iter()
+        .filter(|s| is_allocatable(s.flags))
+        .map(|s| s.vaddr + s.data.len() as u64)
+        .max()
 }
 
 pub(crate) const SHF_TLS: u64 = 0x400;
@@ -318,6 +336,9 @@ pub(super) fn collect_mergeable_sections<'a>(
             (matches!(sh.sh_type, SHT_PROGBITS | SHT_NOBITS | 7 | 14..=16)
                 && is_allocatable(sh.sh_flags))
                 || (sh.sh_type == SHT_PROGBITS && names.get(*i).is_some_and(|n| n == ".comment"))
+                || (sh.sh_type == SHT_PROGBITS
+                    && sh.sh_flags & SHF_COMPRESSED == 0
+                    && names.get(*i).is_some_and(|n| is_debug_section(n)))
         })
         .map(|(i, sh)| (names.get(i).cloned().unwrap_or_default(), sh))
         .collect();
@@ -354,6 +375,7 @@ pub(super) fn default_flags_for_section(name: &str) -> u64 {
         ".text" => SHF_ALLOC | SHF_EXECINSTR,
         ".rodata" => SHF_ALLOC,
         ".data" | ".bss" => SHF_ALLOC | SHF_WRITE,
+        name if is_debug_section(name) || name == ".comment" => 0,
         _ => SHF_ALLOC,
     }
 }
@@ -374,7 +396,10 @@ pub(super) fn append_merged_section(
     }
 
     let align = align.max(1);
-    *vaddr = align_up(*vaddr, align);
+    let allocatable = is_allocatable(flags);
+    if allocatable {
+        *vaddr = align_up(*vaddr, align);
+    }
 
     let idx = layout.sections.len();
     layout.section_by_name.insert(name.to_string(), idx);
@@ -383,12 +408,14 @@ pub(super) fn append_merged_section(
         sh_type: 1,
         name: name.to_string(),
         data: merged_bytes,
-        vaddr: *vaddr,
+        vaddr: if allocatable { *vaddr } else { 0 },
         flags,
         align,
     });
 
-    *vaddr += total_size;
+    if allocatable {
+        *vaddr += total_size;
+    }
 }
 
 /// Merge allocatable sections from a single ELF64 object into a linear layout
@@ -406,7 +433,10 @@ pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String>
 
     for (name, sh) in &to_merge {
         let align = sh.sh_addralign.max(1);
-        vaddr = align_up(vaddr, align);
+        let allocatable = is_allocatable(sh.sh_flags);
+        if allocatable {
+            vaddr = align_up(vaddr, align);
+        }
 
         let data_slice = read_section_data(data, sh);
 
@@ -415,7 +445,7 @@ pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String>
             sh_type: sh.sh_type,
             name: name.clone(),
             data: data_slice,
-            vaddr,
+            vaddr: if allocatable { vaddr } else { 0 },
             flags: sh.sh_flags,
             align,
         };
@@ -424,7 +454,9 @@ pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String>
         layout.section_by_name.insert(name.clone(), idx);
         layout.sections.push(merged);
 
-        vaddr += sh.sh_size;
+        if allocatable {
+            vaddr += sh.sh_size;
+        }
     }
 
     Ok(layout)

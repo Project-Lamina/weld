@@ -819,3 +819,119 @@ named: .asciz "named"
     assert_eq!(locals("output"), locals("reference"));
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn debug_sections_survive_linking_and_match_ld_line_tables() {
+    let dir = std::env::temp_dir().join(format!("weld-debug-info-{}", std::process::id()));
+    fs::create_dir_all(dir.join("prefix")).unwrap();
+    let _ = fs::remove_file(dir.join("prefix/ld"));
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
+    fs::write(
+        dir.join("one.c"),
+        "int other(int x);\nint total;\nint main(void) {\n  int t = 0;\n  for (int i = 0; i < 3; i++) {\n    t += other(i);\n  }\n  return t - 9;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("two.c"),
+        "extern int total;\nint other(int x) {\n  int y = x * 2;\n  total += y;\n  return y + 1;\n}\n",
+    )
+    .unwrap();
+
+    for mode in ["-no-pie", "-pie"] {
+        let pic = if mode == "-pie" { "-fPIE" } else { "-fno-pie" };
+        run(
+            "gcc",
+            &["-g", "-O0", pic, "-c", "one.c", "-o", "one.o"],
+            &dir,
+        );
+        run(
+            "gcc",
+            &["-g", "-O0", pic, "-c", "two.c", "-o", "two.o"],
+            &dir,
+        );
+        run(
+            "gcc",
+            &[
+                "-B", "prefix", mode, "-g", "one.o", "two.o", "-o", "weld-dbg",
+            ],
+            &dir,
+        );
+        run("gcc", &[mode, "-g", "one.o", "two.o", "-o", "ld-dbg"], &dir);
+
+        let sections = run("readelf", &["-SW", "weld-dbg"], &dir);
+        for name in [".debug_info", ".debug_line", ".debug_abbrev", ".debug_str"] {
+            assert!(sections.contains(name), "{mode}: {name} was dropped");
+        }
+
+        let image = fs::read(dir.join("weld-dbg")).unwrap();
+        let number =
+            |offset: usize| u64::from_le_bytes(image[offset..offset + 8].try_into().unwrap());
+        let phnum = u16::from_le_bytes(image[56..58].try_into().unwrap()) as usize;
+        let loads: Vec<(u64, u64)> = (0..phnum)
+            .map(|i| 64 + i * 56)
+            .filter(|&p| u32::from_le_bytes(image[p..p + 4].try_into().unwrap()) == 1)
+            .map(|p| (number(p + 8), number(p + 32)))
+            .collect();
+        let shoff = number(40) as usize;
+        let shnum = u16::from_le_bytes(image[60..62].try_into().unwrap()) as usize;
+        let shstrndx = u16::from_le_bytes(image[62..64].try_into().unwrap()) as usize;
+        let strings = number(shoff + shstrndx * 64 + 24) as usize;
+        for i in 0..shnum {
+            let header = shoff + i * 64;
+            let start = strings
+                + u32::from_le_bytes(image[header..header + 4].try_into().unwrap()) as usize;
+            let end = start + image[start..].iter().position(|&b| b == 0).unwrap();
+            let name = std::str::from_utf8(&image[start..end]).unwrap();
+            if !name.starts_with(".debug_") {
+                continue;
+            }
+            let (address, offset, size) = (
+                number(header + 16),
+                number(header + 24),
+                number(header + 32),
+            );
+            assert_eq!(address, 0, "{mode}: {name} has an address");
+            for (load_offset, load_size) in &loads {
+                assert!(
+                    offset >= load_offset + load_size || offset + size <= *load_offset,
+                    "{mode}: {name} lies inside a PT_LOAD"
+                );
+            }
+        }
+
+        let lines = |file| {
+            let text = run("readelf", &["--debug-dump=decodedline", file], &dir);
+            let mut rows: Vec<(String, String)> = text
+                .lines()
+                .filter_map(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    (fields.len() >= 3 && fields[0].ends_with(".c") && fields[2].starts_with("0x"))
+                        .then(|| (fields[0].to_string(), fields[1].to_string()))
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        let rows = lines("weld-dbg");
+        assert!(rows.len() > 10, "{mode}: line table is empty");
+        assert!(
+            rows.iter().any(|(file, _)| file == "one.c")
+                && rows.iter().any(|(file, _)| file == "two.c"),
+            "{mode}: only one input object reached the line table"
+        );
+        assert_eq!(
+            rows,
+            lines("ld-dbg"),
+            "{mode}: line tables disagree with ld"
+        );
+
+        assert_eq!(
+            Command::new(dir.join("weld-dbg"))
+                .status()
+                .unwrap()
+                .code()
+                .unwrap(),
+            0
+        );
+    }
+}

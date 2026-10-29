@@ -247,8 +247,7 @@ pub(super) fn build_plt_got_x86_64(
     plt_symbols: &[String],
     layout: &MergedLayout,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let last = layout.sections.last().ok_or("no sections")?;
-    let vaddr = align_up(last.vaddr + last.data.len() as u64, 16);
+    let vaddr = align_up(super::merge::image_end(layout).ok_or("no sections")?, 16);
     let plt0_vaddr = vaddr;
     let plt_size = 16 + (plt_symbols.len() as u64) * 16;
     let got_plt_vaddr = align_up(vaddr + plt_size, 8);
