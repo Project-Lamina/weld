@@ -34,7 +34,7 @@ pub use merge::{
     MergedLayout, MergedSection, ObjectSectionContrib, merge_sections_multi_object,
     merge_sections_single_object, tls_segment,
 };
-use merge::{align_up, is_allocatable, reserve_start_section};
+use merge::{align_up, image_end, is_allocatable, reserve_start_section};
 pub use relocatable::link_relocatable;
 pub use resolver::LibraryResolver;
 pub use symbols::OutputSymbol;
@@ -246,7 +246,11 @@ fn link_multi_object_parsed(
 
     if opts.pie {
         let base = arch.page_align();
-        for section in &mut layout.sections {
+        for section in layout
+            .sections
+            .iter_mut()
+            .filter(|s| is_allocatable(s.flags))
+        {
             section.vaddr = section.vaddr - 0x400000 + base;
         }
     }
@@ -361,8 +365,7 @@ fn link_multi_object_parsed(
         }
         if !needed.is_empty() || opts.shared {
             let (plt_data, got_plt_data) = build_plt_got_x86_64(&undefined, &layout)?;
-            let last = layout.sections.last().ok_or("no sections")?;
-            let mut vaddr = align_up(last.vaddr + last.data.len() as u64, 16);
+            let mut vaddr = align_up(image_end(&layout).ok_or("no sections")?, 16);
 
             let plt_vaddr = vaddr;
             layout.sections.push(MergedSection {
@@ -594,10 +597,7 @@ fn link_multi_object_parsed(
             check_thread_local_defined(parsed, name)?;
         }
         if !unique_syms.is_empty() {
-            let got_base = {
-                let last = layout.sections.last().ok_or("no sections")?;
-                align_up(last.vaddr + last.data.len() as u64, 8)
-            };
+            let got_base = align_up(image_end(&layout).ok_or("no sections")?, 8);
             let got_data = vec![0u8; unique_syms.len() * 8];
             layout.sections.push(MergedSection {
                 entsize: 0,
@@ -677,12 +677,7 @@ fn link_multi_object_parsed(
         }
         data.extend_from_slice(b"GNU\0");
         data.resize(36, 0);
-        let end = layout
-            .sections
-            .iter()
-            .map(|s| s.vaddr + s.data.len() as u64)
-            .max()
-            .unwrap_or(arch.page_align());
+        let end = image_end(&layout).unwrap_or(arch.page_align());
         layout
             .section_by_name
             .insert(".note.gnu.build-id".into(), layout.sections.len());
@@ -723,12 +718,7 @@ fn link_multi_object_parsed(
     }
     runtime::remap_generated(&mut layout, remap);
     if arch == TargetArch::PowerPc64 {
-        let end = layout
-            .sections
-            .iter()
-            .map(|s| s.vaddr + s.data.len() as u64)
-            .max()
-            .unwrap_or(0);
+        let end = image_end(&layout).unwrap_or(0);
         global_symbols
             .entry(".TOC.".to_string())
             .or_insert(align_up(end, 8) + 0x8000);

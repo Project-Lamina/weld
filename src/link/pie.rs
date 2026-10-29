@@ -61,6 +61,9 @@ pub(super) fn prepare(
             let Some(contribution) = contributions[object].get(&obj.names[target]) else {
                 continue;
             };
+            if !is_allocatable(obj.sections[target].sh_flags) {
+                continue;
+            }
             let index = layout.section_by_name[&obj.names[target]];
             for rel in parse_rela_section(&obj.data, section)? {
                 let relative = rel.r_type == relative_kind;
@@ -111,12 +114,7 @@ pub(super) fn prepare(
         }
     }
     slots.sort_unstable();
-    let end = layout
-        .sections
-        .iter()
-        .map(|s| s.vaddr + s.data.len() as u64)
-        .max()
-        .unwrap_or(4096);
+    let end = merge::image_end(layout).unwrap_or(4096);
     layout
         .section_by_name
         .insert(".rela.dyn".into(), layout.sections.len());
@@ -182,12 +180,7 @@ pub(super) fn add_dynamic(
     interpreter: Option<String>,
 ) -> DynamicLinkInfo {
     let mut append = |name: &str, data: Vec<u8>, flags: u64| {
-        let end = layout
-            .sections
-            .iter()
-            .map(|s| s.vaddr + s.data.len() as u64)
-            .max()
-            .unwrap_or(arch.page_align());
+        let end = merge::image_end(layout).unwrap_or(arch.page_align());
         let address = align_up(end, 8);
         layout
             .section_by_name

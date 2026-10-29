@@ -161,6 +161,7 @@ fn synthesize_elf_start_x86_64(result: &mut LinkResult, freebsd_abi: bool) -> Op
                 .layout
                 .sections
                 .iter()
+                .filter(|s| s.flags & 2 != 0)
                 .map(|s| (s.vaddr + s.data.len() as u64 + 15) & !15)
                 .max()
         })?;
