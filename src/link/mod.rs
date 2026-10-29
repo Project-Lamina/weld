@@ -4,6 +4,7 @@
 //! - x86_64: x86_64.rs
 //! - aarch64: aarch64.rs
 //! - riscv: riscv.rs
+//! - powerpc64: ppc64.rs
 
 #![allow(dead_code)]
 
@@ -14,6 +15,7 @@ pub mod macho;
 mod merge;
 mod notes;
 mod pie;
+mod ppc64;
 mod relocatable;
 pub mod resolver;
 mod riscv;
@@ -720,6 +722,18 @@ fn link_multi_object_parsed(
         pending.remap(remap);
     }
     runtime::remap_generated(&mut layout, remap);
+    if arch == TargetArch::PowerPc64 {
+        let end = layout
+            .sections
+            .iter()
+            .map(|s| s.vaddr + s.data.len() as u64)
+            .max()
+            .unwrap_or(0);
+        global_symbols
+            .entry(".TOC.".to_string())
+            .or_insert(align_up(end, 8) + 0x8000);
+    }
+    let mut local_entries: HashMap<u64, u64> = HashMap::default();
     for (i, obj) in parsed.iter().enumerate() {
         let Some(table) = obj.sections.iter().find(|s| s.sh_type == SHT_SYMTAB) else {
             continue;
@@ -747,6 +761,9 @@ fn link_multi_object_parsed(
             let address = layout.sections[layout.section_by_name[name]].vaddr
                 + contribution.offset_in_merged
                 + symbol.st_value;
+            if arch == TargetArch::PowerPc64 && record[5] >> 5 != 0 {
+                local_entries.insert(address, 1u64 << (record[5] >> 5));
+            }
             let old = resolved_by_index_per_object[i][index].replace(address);
             if symbol.bind != STB_LOCAL
                 && let Some(name) = get_strtab_string(strings, symbol.name_offset)
@@ -840,6 +857,8 @@ fn link_multi_object_parsed(
                 symbol_addrs: &by_index,
                 got_entries: &got_by_index,
                 section_offset: Some(&section_off),
+                toc: global_symbols.get(".TOC.").copied().unwrap_or(0),
+                local_entries: &local_entries,
             },
         )?;
     }
@@ -1092,6 +1111,8 @@ pub struct RelocInputs<'a> {
     pub symbol_addrs: &'a [Option<u64>],
     pub got_entries: &'a [Option<u64>],
     pub section_offset: Option<&'a HashMap<String, u64>>,
+    pub toc: u64,
+    pub local_entries: &'a HashMap<u64, u64>,
 }
 
 pub fn apply_relocations(
@@ -1106,6 +1127,7 @@ pub fn apply_relocations(
         symbol_addrs,
         got_entries,
         section_offset,
+        ..
     } = *inputs;
     match arch {
         TargetArch::X86_64 => x86_64::apply_relocations(
@@ -1123,6 +1145,7 @@ pub fn apply_relocations(
         TargetArch::RiscV => {
             riscv::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset)
         }
+        TargetArch::PowerPc64 => ppc64::apply_relocations(layout, inputs),
     }
 }
 

@@ -271,6 +271,10 @@ fn linux_search_paths(arch: TargetArch) -> Vec<PathBuf> {
         ],
         TargetArch::AArch64 => vec!["/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu"],
         TargetArch::RiscV => vec!["/lib/riscv64-linux-gnu", "/usr/lib/riscv64-linux-gnu"],
+        TargetArch::PowerPc64 => vec![
+            "/lib/powerpc64le-linux-gnu",
+            "/usr/lib/powerpc64le-linux-gnu",
+        ],
     };
 
     for p in multilib {

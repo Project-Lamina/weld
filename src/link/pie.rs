@@ -34,6 +34,7 @@ pub(super) fn prepare(
             R_RISCV_RELATIVE,
             &[R_RISCV_32, R_RISCV_HI20, R_RISCV_LO12_I, R_RISCV_LO12_S],
         ),
+        TargetArch::PowerPc64 => return Err("PIE is not supported for PowerPC64".into()),
     };
     let mut slots = Vec::new();
     let mut absolute_names = HashSet::default();
@@ -230,6 +231,7 @@ pub(super) fn add_dynamic(
                 TargetArch::X86_64 => "/lib64/ld-linux-x86-64.so.2",
                 TargetArch::AArch64 => "/lib/ld-linux-aarch64.so.1",
                 TargetArch::RiscV => "/lib/ld-linux-riscv64-lp64d.so.1",
+                TargetArch::PowerPc64 => "/lib64/ld64.so.2",
             }
             .into()
         })),
