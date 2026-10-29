@@ -14,6 +14,7 @@ pub mod macho;
 mod merge;
 mod notes;
 mod pie;
+mod relocatable;
 pub mod resolver;
 mod riscv;
 mod runtime;
@@ -31,6 +32,7 @@ pub use merge::{
     merge_sections_single_object, tls_segment,
 };
 use merge::{align_up, is_allocatable, reserve_start_section};
+pub use relocatable::link_relocatable;
 pub use resolver::LibraryResolver;
 pub use symbols::OutputSymbol;
 use symbols::{

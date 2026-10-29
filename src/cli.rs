@@ -18,6 +18,7 @@ pub struct ParsedArgs {
     pub build_id: bool,
     pub pie: bool,
     pub static_link: bool,
+    pub relocatable: bool,
     pub map_file: Option<PathBuf>,
     pub input_files: Vec<PathBuf>,
     pub input_positions: Vec<usize>,
@@ -269,7 +270,8 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             }
             s if s.starts_with("-B") && s.len() > 2 => {}
             s if s.starts_with("-F") && s.len() > 2 => {}
-            "-shared" | "--shared" | "-dylib" | "-r" | "--relocatable" => {
+            "-r" | "--relocatable" => args.relocatable = true,
+            "-shared" | "--shared" | "-dylib" => {
                 return Err(format!("{a} is not supported yet"));
             }
             _ => {

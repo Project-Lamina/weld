@@ -58,11 +58,31 @@ pub mod reloc_type {
     pub const R_AARCH64_NONE: u32 = 0;
     pub const R_AARCH64_ABS64: u32 = 257;
     pub const R_AARCH64_ABS32: u32 = 258;
-    pub const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+    pub const R_AARCH64_ABS16: u32 = 259;
+    pub const R_AARCH64_PREL64: u32 = 260;
+    pub const R_AARCH64_PREL32: u32 = 261;
+    pub const R_AARCH64_PREL16: u32 = 262;
+    pub const R_AARCH64_MOVW_UABS_G0: u32 = 263;
+    pub const R_AARCH64_MOVW_UABS_G0_NC: u32 = 264;
+    pub const R_AARCH64_MOVW_UABS_G1: u32 = 265;
+    pub const R_AARCH64_MOVW_UABS_G1_NC: u32 = 266;
+    pub const R_AARCH64_MOVW_UABS_G2: u32 = 267;
+    pub const R_AARCH64_MOVW_UABS_G2_NC: u32 = 268;
+    pub const R_AARCH64_MOVW_UABS_G3: u32 = 269;
+    pub const R_AARCH64_LD_PREL_LO19: u32 = 273;
     pub const R_AARCH64_ADR_PREL_LO21: u32 = 274;
     pub const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
+    pub const R_AARCH64_ADR_PREL_PG_HI21_NC: u32 = 276;
+    pub const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+    pub const R_AARCH64_LDST8_ABS_LO12_NC: u32 = 278;
+    pub const R_AARCH64_TSTBR14: u32 = 279;
+    pub const R_AARCH64_CONDBR19: u32 = 280;
     pub const R_AARCH64_JUMP26: u32 = 282;
     pub const R_AARCH64_CALL26: u32 = 283;
+    pub const R_AARCH64_LDST16_ABS_LO12_NC: u32 = 284;
+    pub const R_AARCH64_LDST32_ABS_LO12_NC: u32 = 285;
+    pub const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
+    pub const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
     pub const R_AARCH64_RELATIVE: u32 = 1027;
 
     // RISC-V ELF psABI relocations
