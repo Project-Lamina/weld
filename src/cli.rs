@@ -17,6 +17,8 @@ pub struct ParsedArgs {
     pub strip_all: bool,
     pub build_id: bool,
     pub pie: bool,
+    pub shared: bool,
+    pub soname: Option<String>,
     pub static_link: bool,
     pub relocatable: bool,
     pub map_file: Option<PathBuf>,
@@ -271,7 +273,14 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             s if s.starts_with("-B") && s.len() > 2 => {}
             s if s.starts_with("-F") && s.len() > 2 => {}
             "-r" | "--relocatable" => args.relocatable = true,
-            "-shared" | "--shared" | "-dylib" => {
+            "-shared" | "--shared" => args.shared = true,
+            "-soname" | "--soname" => {
+                args.soname = Some(take_required_arg(argv, &mut i, "-soname")?);
+            }
+            s if s.starts_with("--soname=") => {
+                args.soname = Some(s["--soname=".len()..].to_string());
+            }
+            "-dylib" => {
                 return Err(format!("{a} is not supported yet"));
             }
             _ => {
@@ -289,6 +298,9 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
     }
     if args.static_link && args.pie {
         return Err("static PIE is not supported".into());
+    }
+    if args.shared && args.static_link {
+        return Err("-shared cannot be combined with -static".into());
     }
     Ok(ParseAction::Run(Box::new(args)))
 }

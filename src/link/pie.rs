@@ -22,6 +22,7 @@ pub(super) fn prepare(
     contributions: &[HashMap<String, ObjectSectionContrib>],
     got: &HashMap<String, u64>,
     globals: &HashMap<String, u64>,
+    glob_count: usize,
 ) -> Result<RelativeRelocations, String> {
     let arch = TargetArch::from_elf_machine(objects[0].header.e_machine)
         .ok_or("unsupported PIE architecture")?;
@@ -120,7 +121,7 @@ pub(super) fn prepare(
         .insert(".rela.dyn".into(), layout.sections.len());
     layout.sections.push(MergedSection {
         name: ".rela.dyn".into(),
-        data: vec![0; slots.len() * 24],
+        data: vec![0; (slots.len() + glob_count) * 24],
         vaddr: align_up(end, 8),
         align: 8,
         flags: SHF_ALLOC,
@@ -136,6 +137,7 @@ pub(super) fn prepare(
 pub(super) fn finish(
     layout: &mut MergedLayout,
     pending: RelativeRelocations,
+    glob: &[(u64, u32)],
 ) -> Result<(), String> {
     let mut bytes = Vec::new();
     for (index, offset, addend) in &pending.slots {
@@ -149,6 +151,11 @@ pub(super) fn finish(
         bytes.extend_from_slice(&(section.vaddr + *offset as u64).to_le_bytes());
         bytes.extend_from_slice(&u64::from(pending.kind).to_le_bytes());
         bytes.extend_from_slice(&addend.to_le_bytes());
+    }
+    for &(address, symbol) in glob {
+        bytes.extend_from_slice(&address.to_le_bytes());
+        bytes.extend_from_slice(&((u64::from(symbol) << 32) | 6).to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
     }
     let dynidx = layout.section_by_name[".dynamic"];
     let existing_size = layout.sections[dynidx]

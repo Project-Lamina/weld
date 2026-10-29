@@ -192,23 +192,21 @@ fn emit_image(
         .map(|&i| &layout.sections[i])
         .filter(|s| !s.data.is_empty());
     let tls = tls_segment(layout).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+    let interp = dynamic.and_then(|d| d.interpreter.as_ref());
+    let interp = interp.map(|s| format!("{s}\0")).unwrap_or_default();
     let phnum = 2 - u16::from(combine_headers)
         + u16::from(tls.is_some())
         + notes.len() as u16
         + u16::from(property.is_some())
         + groups.len() as u16
-        + if dynamic.is_some() { 3 } else { 0 }
+        + if dynamic.is_some() {
+            2 + u16::from(!interp.is_empty())
+        } else {
+            0
+        }
         + u16::from(!protected.is_empty())
         + u16::from(unwind.is_some());
     let phsize = u64::from(phnum) * ELF64_PHDR_SIZE as u64;
-    let interp = dynamic
-        .map(|d| {
-            d.interpreter
-                .as_ref()
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no interpreter"))
-        })
-        .transpose()?;
-    let interp = interp.map(|s| format!("{s}\0")).unwrap_or_default();
     let segment_offset = align_up_u64(64 + phsize + interp.len() as u64, page);
     let header_base = base - segment_offset;
     let mut ehdr = [0u8; 64];
@@ -260,15 +258,17 @@ fn emit_image(
     };
     if dynamic.is_some() {
         header(PT_PHDR, PF_R, 64, header_base + 64, phsize, phsize, 8)?;
-        header(
-            PT_INTERP,
-            PF_R,
-            64 + phsize,
-            header_base + 64 + phsize,
-            interp.len() as u64,
-            interp.len() as u64,
-            1,
-        )?;
+        if !interp.is_empty() {
+            header(
+                PT_INTERP,
+                PF_R,
+                64 + phsize,
+                header_base + 64 + phsize,
+                interp.len() as u64,
+                interp.len() as u64,
+                1,
+            )?;
+        }
     }
     if !combine_headers {
         header(

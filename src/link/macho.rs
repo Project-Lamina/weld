@@ -1235,6 +1235,7 @@ pub fn link_macho_multi_object(
         }
         Some(DynamicLinkInfo {
             pie: false,
+            shared: false,
             needed,
             plt_symbols,
             weak_plt_symbols,

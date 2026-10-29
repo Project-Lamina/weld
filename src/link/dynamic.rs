@@ -4,7 +4,15 @@ use super::merge::{MergedLayout, align_up};
 
 /// Four binary blobs produced when building ELF dynamic sections:
 /// `.dynsym`, `.dynstr`, `.rela.plt`, and `.hash` (SysV DT_HASH).
-pub(super) type DynSections = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u32>, Option<u32>);
+pub(super) type DynSections = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u32>,
+    Option<u32>,
+    Option<u32>,
+);
 /// Standard SysV ELF hash function (used by DT_HASH).
 pub(super) fn elf_hash(name: &[u8]) -> u32 {
     let mut h: u32 = 0;
@@ -49,6 +57,7 @@ pub(super) fn build_sysv_hash(sym_names: &[&str]) -> Vec<u8> {
 #[derive(Debug, Default)]
 pub struct DynamicLinkInfo {
     pub pie: bool,
+    pub shared: bool,
     pub needed: Vec<String>,
     pub plt_symbols: Vec<String>,
     pub weak_plt_symbols: Vec<String>,
@@ -66,10 +75,13 @@ pub(super) fn build_dynamic_sections(
     got_plt_vaddr: u64,
     needed: &[String],
     rpaths: &[String],
+    exports: &[String],
+    soname: Option<&str>,
 ) -> Result<DynSections, String> {
     let mut dynstr = vec![0u8];
     let mut needed_offsets: Vec<u32> = Vec::with_capacity(needed.len());
     let mut runpath_offset = None;
+    let mut soname_offset = None;
     for soname in needed {
         needed_offsets.push(dynstr.len() as u32);
         dynstr.extend_from_slice(soname.as_bytes());
@@ -78,6 +90,11 @@ pub(super) fn build_dynamic_sections(
     if !rpaths.is_empty() {
         runpath_offset = Some(dynstr.len() as u32);
         dynstr.extend_from_slice(rpaths.join(":").as_bytes());
+        dynstr.push(0);
+    }
+    if let Some(name) = soname {
+        soname_offset = Some(dynstr.len() as u32);
+        dynstr.extend_from_slice(name.as_bytes());
         dynstr.push(0);
     }
 
@@ -100,6 +117,19 @@ pub(super) fn build_dynamic_sections(
         dynsym.extend_from_slice(&0u64.to_le_bytes());
         dynsym.extend_from_slice(&0u64.to_le_bytes());
     }
+    let mut export_names: Vec<&str> = Vec::with_capacity(exports.len());
+    for name in exports {
+        let off = dynstr.len() as u32;
+        dynstr.extend_from_slice(name.as_bytes());
+        dynstr.push(0);
+        dynsym.extend_from_slice(&off.to_le_bytes());
+        dynsym.push(1 << 4);
+        dynsym.push(0);
+        dynsym.extend_from_slice(&1u16.to_le_bytes());
+        dynsym.extend_from_slice(&0u64.to_le_bytes());
+        dynsym.extend_from_slice(&0u64.to_le_bytes());
+        export_names.push(name);
+    }
 
     let mut rela_plt = Vec::with_capacity(plt_symbols.len() * 24);
     for (i, _) in plt_symbols.iter().enumerate() {
@@ -111,10 +141,11 @@ pub(super) fn build_dynamic_sections(
         rela_plt.extend_from_slice(&0i64.to_le_bytes());
     }
 
-    let name_refs: Vec<&str> = plt_symbols
+    let mut name_refs: Vec<&str> = plt_symbols
         .iter()
         .map(|s| s.split('@').next().unwrap())
         .collect();
+    name_refs.extend(export_names);
     let hash = build_sysv_hash(&name_refs);
 
     Ok((
@@ -124,6 +155,7 @@ pub(super) fn build_dynamic_sections(
         hash,
         needed_offsets,
         runpath_offset,
+        soname_offset,
     ))
 }
 
@@ -142,12 +174,14 @@ pub(super) struct DynamicAddrs {
     pub(super) rela_plt_size: u64,
     pub(super) hash_vaddr: u64,
     pub(super) pie: bool,
+    pub(super) shared: bool,
 }
 
 pub(super) fn build_dynamic_section_content(
     addrs: &DynamicAddrs,
     needed_offsets: &[u32],
     runpath_offset: Option<u32>,
+    soname_offset: Option<u32>,
 ) -> Result<Vec<u8>, String> {
     let DynamicAddrs {
         got_plt_vaddr,
@@ -158,6 +192,7 @@ pub(super) fn build_dynamic_section_content(
         rela_plt_size,
         hash_vaddr,
         pie,
+        shared,
     } = *addrs;
     let mut content = Vec::new();
     fn push_dyn(content: &mut Vec<u8>, tag: u64, val: u64) {
@@ -170,6 +205,9 @@ pub(super) fn build_dynamic_section_content(
     }
     if let Some(off) = runpath_offset {
         push_dyn(&mut content, 29, off as u64);
+    }
+    if let Some(off) = soname_offset {
+        push_dyn(&mut content, 14, off as u64);
     }
     push_dyn(&mut content, 5, dynstr_vaddr);
     push_dyn(&mut content, 6, dynsym_vaddr);
@@ -187,8 +225,13 @@ pub(super) fn build_dynamic_section_content(
     push_dyn(
         &mut content,
         0x6ffffffb,
-        0x1 | if pie { 0x08000000 } else { 0 },
+        0x1 | if pie && !shared { 0x08000000 } else { 0 },
     );
+    if shared {
+        push_dyn(&mut content, 7, 0);
+        push_dyn(&mut content, 8, 0);
+        push_dyn(&mut content, 9, 24);
+    }
     if pie {
         push_dyn(&mut content, 0x6ffffff9, 0);
     }
