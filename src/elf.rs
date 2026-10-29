@@ -85,7 +85,6 @@ pub mod reloc_type {
     pub const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
     pub const R_AARCH64_RELATIVE: u32 = 1027;
 
-    // RISC-V ELF psABI relocations
     pub const R_RISCV_NONE: u32 = 0;
     pub const R_RISCV_32: u32 = 1;
     pub const R_RISCV_64: u32 = 2;

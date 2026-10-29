@@ -207,7 +207,6 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             "--version" => return Ok(ParseAction::Version),
             s if s.starts_with("-mmacosx-version-min") || s.starts_with("-mios") => {}
             "-nodefaultlibs" | "-nostdlib" => {}
-            // LTO plugin and linker state flags have no effect in weld.
             "--strip-all" | "-s" => args.strip_all = true,
             "--Map" | "-Map" => {
                 args.map_file = Some(PathBuf::from(take_required_arg(argv, &mut i, a)?))
