@@ -211,6 +211,49 @@ fn synthesize_elf_start_x86_64(result: &mut LinkResult, freebsd_abi: bool) -> Op
     Some(start_vaddr)
 }
 
+/// Write a freestanding `_start` for AArch64 into the reserved section: load
+/// argc and argv, call `main`, then `bl exit` if libc provides it, else the
+/// `exit` syscall with `main`'s return value still in x0.
+fn synthesize_elf_start_aarch64(result: &mut LinkResult) -> Option<u64> {
+    let main_addr = result
+        .symbol_addrs
+        .get("main")
+        .or_else(|| result.symbol_addrs.get("_main"))
+        .copied()?;
+    let index = result
+        .layout
+        .section_by_name
+        .get(".text.__weld_start")
+        .copied()?;
+    let start = result.layout.sections[index].vaddr;
+    let exit_addr = result.symbol_addrs.get("exit").copied();
+
+    let bl = |at: u64, target: u64| -> Option<u32> {
+        let words = (target as i64 - at as i64) / 4;
+        if !(-(1 << 25)..(1 << 25)).contains(&words) {
+            return None;
+        }
+        Some(0x9400_0000 | (words as u32 & 0x03FF_FFFF))
+    };
+    let mut words = vec![0xF940_03E0, 0x9100_23E1, bl(start + 8, main_addr)?];
+    match exit_addr {
+        Some(addr) => words.push(bl(start + 12, addr)?),
+        None => words.extend([0xD280_0BA8, 0xD400_0001]),
+    }
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let data = &mut result.layout.sections[index].data;
+    data.get_mut(..code.len())?.copy_from_slice(&code);
+    Some(start)
+}
+
+fn synthesize_elf_start(result: &mut LinkResult, freebsd_abi: bool) -> Option<u64> {
+    match TargetArch::from_elf_machine(result.e_machine)? {
+        TargetArch::X86_64 => synthesize_elf_start_x86_64(result, freebsd_abi),
+        TargetArch::AArch64 => synthesize_elf_start_aarch64(result),
+        TargetArch::RiscV => None,
+    }
+}
+
 fn host_arch() -> TargetArch {
     if cfg!(target_arch = "aarch64") {
         TargetArch::AArch64
@@ -345,8 +388,7 @@ fn try_weld_link_elf(
         }
     }
     let entry = if needs_synthetic_start(&result) {
-        synthesize_elf_start_x86_64(&mut result, freebsd_abi)
-            .or_else(|| select_entry(args, &result))?
+        synthesize_elf_start(&mut result, freebsd_abi).or_else(|| select_entry(args, &result))?
     } else {
         select_entry(args, &result)?
     };
@@ -527,11 +569,34 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
     }
 
     timer.mark("detect format and load objects");
+    if args.relocatable {
+        if loaded.format != ObjectFormat::Elf {
+            eprintln!("weld: -r supports ELF inputs only");
+            return Some(1);
+        }
+        return try_weld_relocatable(args, &loaded.objects);
+    }
     match loaded.format {
         ObjectFormat::Elf => try_weld_link_elf(args, loaded.objects, loaded.positions),
         ObjectFormat::MachO => try_weld_link_macho(args),
         ObjectFormat::Coff => try_weld_link_coff(args, loaded.objects),
     }
+}
+
+fn try_weld_relocatable(args: &ParsedArgs, objects: &[Vec<u8>]) -> Option<i32> {
+    let refs: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
+    let image = match link::link_relocatable(&refs) {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("weld: {error}");
+            return Some(1);
+        }
+    };
+    let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
+    let mut out = std::io::BufWriter::new(create_output(out_path).ok()?);
+    out.write_all(&image).ok()?;
+    out.flush().ok()?;
+    Some(0)
 }
 
 struct StderrLogger;
