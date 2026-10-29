@@ -16,6 +16,8 @@ mod object;
 mod parallel;
 mod platform;
 mod segment;
+#[cfg(test)]
+mod test_support;
 mod timing;
 
 use crate::{

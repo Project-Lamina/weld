@@ -1,5 +1,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
+mod common;
+use common::TempDir;
 use std::{fs, os::unix::fs::symlink, path::Path, process::Command};
 
 fn run(dir: &Path, program: &str, args: &[&str]) -> String {
@@ -18,7 +20,8 @@ fn run(dir: &Path, program: &str, args: &[&str]) -> String {
 
 #[test]
 fn static_archives_rescan_cycles_and_preserve_runtime_arrays() {
-    let dir = std::env::temp_dir().join(format!("weld-static-{}", std::process::id()));
+    let guard = TempDir::new("weld-static");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -60,7 +63,7 @@ fini: .quad finalize
     ] {
         fs::write(dir.join(format!("{name}.c")), source).unwrap();
         run(
-            &dir,
+            dir,
             "gcc",
             &[
                 "-c",
@@ -72,16 +75,16 @@ fini: .quad finalize
             ],
         );
     }
-    run(&dir, "gcc", &["-c", "start.s", "-o", "start.o"]);
-    run(&dir, "ar", &["rcs", "libfirst.a", "first.o", "last.o"]);
-    run(&dir, "ar", &["rcs", "libsecond.a", "second.o"]);
+    run(dir, "gcc", &["-c", "start.s", "-o", "start.o"]);
+    run(dir, "ar", &["rcs", "libfirst.a", "first.o", "last.o"]);
+    run(dir, "ar", &["rcs", "libsecond.a", "second.o"]);
     run(
-        &dir,
+        dir,
         "gcc",
         &["-shared", "-nostdlib", "second.o", "-o", "libfirst.so"],
     );
     run(
-        &dir,
+        dir,
         "gcc",
         &[
             "-Bdrv",
@@ -97,8 +100,8 @@ fini: .quad finalize
             "output",
         ],
     );
-    run(&dir, "./output", &[]);
-    let headers = run(&dir, "readelf", &["-hlSW", "output"]);
+    run(dir, "./output", &[]);
+    let headers = run(dir, "readelf", &["-hlSW", "output"]);
     assert!(
         headers.contains("EXEC")
             && headers.contains(".init_array")
@@ -109,12 +112,12 @@ fini: .quad finalize
     ] {
         assert!(!headers.contains(forbidden), "{forbidden}: {headers}");
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn static_glibc_and_unsupported_runtime_features_fail_before_emission() {
-    let dir = std::env::temp_dir().join(format!("weld-static-errors-{}", std::process::id()));
+    let guard = TempDir::new("weld-static-errors");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     for (source, flags, diagnostic) in [
@@ -136,7 +139,7 @@ fn static_glibc_and_unsupported_runtime_features_fail_before_emission() {
     ] {
         fs::write(dir.join("input.c"), source).unwrap();
         let output = Command::new("gcc")
-            .current_dir(&dir)
+            .current_dir(dir)
             .args(["-Bdrv", "-static", "input.c", "-o", "output"])
             .args(flags)
             .output()
@@ -146,12 +149,12 @@ fn static_glibc_and_unsupported_runtime_features_fail_before_emission() {
         assert!(stderr.contains(diagnostic), "{stderr}");
         assert!(!dir.join("output").exists());
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn archive_listed_before_its_user_is_not_searched() {
-    let dir = std::env::temp_dir().join(format!("weld-archive-order-{}", std::process::id()));
+    let guard = TempDir::new("weld-archive-order");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     for (name, source) in [
@@ -165,14 +168,14 @@ fn archive_listed_before_its_user_is_not_searched() {
     ] {
         fs::write(dir.join(format!("{name}.c")), source).unwrap();
         run(
-            &dir,
+            dir,
             "gcc",
             &["-c", &format!("{name}.c"), "-o", &format!("{name}.o")],
         );
     }
-    run(&dir, "ar", &["rcs", "libchain.a", "r.o", "q.o", "p.o"]);
+    run(dir, "ar", &["rcs", "libchain.a", "r.o", "q.o", "p.o"]);
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-Bdrv", "-o", "before", "libchain.a", "main.o"])
         .output()
         .unwrap();
@@ -183,17 +186,17 @@ fn archive_listed_before_its_user_is_not_searched() {
         String::from_utf8_lossy(&output.stderr)
     );
     run(
-        &dir,
+        dir,
         "gcc",
         &["-Bdrv", "-o", "after", "main.o", "libchain.a"],
     );
-    assert_eq!(run(&dir, "./after", &[]), "p=41\n");
-    fs::remove_dir_all(dir).unwrap();
+    assert_eq!(run(dir, "./after", &[]), "p=41\n");
 }
 
 #[test]
 fn archive_member_pulled_after_earlier_definition_is_duplicate() {
-    let dir = std::env::temp_dir().join(format!("weld-archive-dup-{}", std::process::id()));
+    let guard = TempDir::new("weld-archive-dup");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     for (name, source) in [
@@ -206,14 +209,14 @@ fn archive_member_pulled_after_earlier_definition_is_duplicate() {
     ] {
         fs::write(dir.join(format!("{name}.c")), source).unwrap();
         run(
-            &dir,
+            dir,
             "gcc",
             &["-c", &format!("{name}.c"), "-o", &format!("{name}.o")],
         );
     }
-    run(&dir, "ar", &["rcs", "libmember.a", "member.o"]);
+    run(dir, "ar", &["rcs", "libmember.a", "member.o"]);
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-Bdrv", "-o", "dup", "main.o", "libmember.a", "object.o"])
         .output()
         .unwrap();
@@ -223,21 +226,21 @@ fn archive_member_pulled_after_earlier_definition_is_duplicate() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn archive_without_symbol_index_is_rejected_like_ld() {
-    let dir = std::env::temp_dir().join(format!("weld-archive-noidx-{}", std::process::id()));
+    let guard = TempDir::new("weld-archive-noidx");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(dir.join("empty.c"), "int main(void) { return 0; }").unwrap();
     fs::write(dir.join("helper.c"), "int helper(void) { return 1; }").unwrap();
-    run(&dir, "gcc", &["-c", "empty.c", "-o", "empty.o"]);
-    run(&dir, "gcc", &["-c", "helper.c", "-o", "helper.o"]);
-    run(&dir, "ar", &["rcS", "libnoidx.a", "helper.o"]);
+    run(dir, "gcc", &["-c", "empty.c", "-o", "empty.o"]);
+    run(dir, "gcc", &["-c", "helper.c", "-o", "helper.o"]);
+    run(dir, "ar", &["rcS", "libnoidx.a", "helper.o"]);
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-Bdrv", "-o", "noidx", "empty.o", "libnoidx.a"])
         .output()
         .unwrap();
@@ -247,12 +250,12 @@ fn archive_without_symbol_index_is_rejected_like_ld() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn static_link_emits_eh_frame_hdr_for_unwinders() {
-    let dir = std::env::temp_dir().join(format!("weld-static-eh-hdr-{}", std::process::id()));
+    let guard = TempDir::new("weld-static-eh-hdr");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -266,13 +269,13 @@ fn static_link_emits_eh_frame_hdr_for_unwinders() {
     )
     .unwrap();
     run(
-        &dir,
+        dir,
         "gcc",
         &["-c", "-O0", "-fno-pie", "prog.c", "-o", "prog.o"],
     );
-    run(&dir, "gcc", &["-c", "start.s", "-o", "start.o"]);
+    run(dir, "gcc", &["-c", "start.s", "-o", "start.o"]);
     run(
-        &dir,
+        dir,
         "gcc",
         &[
             "-Bdrv",
@@ -285,12 +288,12 @@ fn static_link_emits_eh_frame_hdr_for_unwinders() {
         ],
     );
     assert!(Command::new(dir.join("output")).status().unwrap().success());
-    let headers = run(&dir, "readelf", &["-SlW", "output"]);
+    let headers = run(dir, "readelf", &["-SlW", "output"]);
     assert!(headers.contains(".eh_frame_hdr") && headers.contains("GNU_EH_FRAME"));
-    let frames = run(&dir, "readelf", &["--debug-dump=frames", "output"]);
+    let frames = run(dir, "readelf", &["--debug-dump=frames", "output"]);
     let fdes = frames.matches(" FDE cie").count();
     assert_eq!(fdes, 3);
-    let dump = run(&dir, "readelf", &["-x", ".eh_frame_hdr", "output"]);
+    let dump = run(dir, "readelf", &["-x", ".eh_frame_hdr", "output"]);
     let hex: String = dump
         .lines()
         .filter(|line| line.trim_start().starts_with("0x"))
@@ -312,5 +315,4 @@ fn static_link_emits_eh_frame_hdr_for_unwinders() {
     };
     assert_eq!(word(16) as usize, fdes);
     assert_eq!(hex.len(), (12 + fdes * 8) * 2);
-    fs::remove_dir_all(dir).unwrap();
 }

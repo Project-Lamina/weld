@@ -1,5 +1,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
+mod common;
+use common::TempDir;
 use std::{fs, os::unix::fs::symlink, path::Path, process::Command};
 
 fn run(program: &str, args: &[&str], dir: &Path) -> String {
@@ -24,7 +26,8 @@ fn run(program: &str, args: &[&str], dir: &Path) -> String {
 
 #[test]
 fn cpp_constructors_exceptions_and_destructors() {
-    let dir = std::env::temp_dir().join(format!("weld-cpp-runtime-{}", std::process::id()));
+    let guard = TempDir::new("weld-cpp-runtime");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("prefix")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
     fs::write(
@@ -60,13 +63,13 @@ int main() {
         run(
             "g++",
             &[mode, flags, "-c", "input.cpp", "-o", "input.o"],
-            &dir,
+            dir,
         );
-        run("g++", &[mode, "input.o", "-o", "reference"], &dir);
-        run("g++", &[mode, "-Bprefix", "input.o", "-o", "output"], &dir);
-        assert_eq!(run("./reference", &[], &dir), expected);
-        assert_eq!(run("./output", &[], &dir), expected);
-        let tags = run("readelf", &["-dW", "output"], &dir);
+        run("g++", &[mode, "input.o", "-o", "reference"], dir);
+        run("g++", &[mode, "-Bprefix", "input.o", "-o", "output"], dir);
+        assert_eq!(run("./reference", &[], dir), expected);
+        assert_eq!(run("./output", &[], dir), expected);
+        let tags = run("readelf", &["-dW", "output"], dir);
         for tag in [
             "(RELA)",
             "(RELASZ)",
@@ -82,15 +85,15 @@ int main() {
         ] {
             assert!(tags.contains(tag), "missing {tag}");
         }
-        let headers = run("readelf", &["-lW", "output"], &dir);
+        let headers = run("readelf", &["-lW", "output"], dir);
         assert!(headers.contains("GNU_EH_FRAME") && headers.contains("GNU_RELRO"));
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn imported_data_pointers_and_version_requirements() {
-    let dir = std::env::temp_dir().join(format!("weld-data-runtime-{}", std::process::id()));
+    let guard = TempDir::new("weld-data-runtime");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("prefix")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
     fs::write(
@@ -128,7 +131,7 @@ int main(void) {
             "-o",
             "libinput.so",
         ],
-        &dir,
+        dir,
     );
     for (mode, flags) in [
         ("-no-pie", "-fno-pic"),
@@ -149,12 +152,12 @@ int main(void) {
                 "-o",
                 "output",
             ],
-            &dir,
+            dir,
         );
-        assert_eq!(run("./output", &[], &dir), "73 73\n");
-        let versions = run("readelf", &["-VW", "output"], &dir);
+        assert_eq!(run("./output", &[], dir), "73 73\n");
+        let versions = run("readelf", &["-VW", "output"], dir);
         assert!(versions.contains("CHECK_1"));
-        let relocs = run("readelf", &["-rW", "output"], &dir);
+        let relocs = run("readelf", &["-rW", "output"], dir);
         assert!(relocs.contains("R_X86_64_COPY") && relocs.contains("R_X86_64_64"));
         if flags == "-fPIC" {
             assert!(relocs.contains("R_X86_64_GLOB_DAT"));
@@ -175,7 +178,7 @@ int main(void) {
             "-o",
             "libinput.so",
         ],
-        &dir,
+        dir,
     );
     let output = Command::new(dir.join("output")).output().unwrap();
     assert!(!output.status.success());
@@ -184,12 +187,12 @@ int main(void) {
         error.contains("CHECK_1") && error.contains("not found"),
         "{error}"
     );
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn init_array_priorities_and_weak_got_entries() {
-    let dir = std::env::temp_dir().join(format!("weld-init-runtime-{}", std::process::id()));
+    let guard = TempDir::new("weld-init-runtime");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("prefix")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
     fs::write(
@@ -208,15 +211,15 @@ int main(void) { if (absent || state != 123) return 1; printf("%d\n", state); re
     )
     .unwrap();
     for mode in ["-no-pie", "-pie"] {
-        run("gcc", &[mode, "-Bprefix", "input.c", "-o", "output"], &dir);
-        assert_eq!(run("./output", &[], &dir), "123\nfirst dtor\nlast dtor\n");
+        run("gcc", &[mode, "-Bprefix", "input.c", "-o", "output"], dir);
+        assert_eq!(run("./output", &[], dir), "123\nfirst dtor\nlast dtor\n");
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn explicit_symbol_versions_select_nondefault_exports() {
-    let dir = std::env::temp_dir().join(format!("weld-version-runtime-{}", std::process::id()));
+    let guard = TempDir::new("weld-version-runtime");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("prefix")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
     fs::write(
@@ -250,7 +253,7 @@ int main(void) { printf("%d %d\n", old(), number()); return old() != 12 || numbe
             "-o",
             "libinput.so",
         ],
-        &dir,
+        dir,
     );
     run(
         "gcc",
@@ -264,15 +267,15 @@ int main(void) { printf("%d %d\n", old(), number()); return old() != 12 || numbe
             "-o",
             "output",
         ],
-        &dir,
+        dir,
     );
-    assert_eq!(run("./output", &[], &dir), "12 34\n");
-    fs::remove_dir_all(dir).unwrap();
+    assert_eq!(run("./output", &[], dir), "12 34\n");
 }
 
 #[test]
 fn read_only_table_of_imported_function_pointers_is_relocated_in_place() {
-    let dir = std::env::temp_dir().join(format!("weld-rodata-runtime-{}", std::process::id()));
+    let guard = TempDir::new("weld-rodata-runtime");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("prefix")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
     fs::write(
@@ -294,22 +297,22 @@ int main(int argc, char **argv) {
     run(
         "gcc",
         &["-no-pie", "-fno-pic", "-c", "input.c", "-o", "input.o"],
-        &dir,
+        dir,
     );
-    run("gcc", &["-no-pie", "input.o", "-o", "reference"], &dir);
+    run("gcc", &["-no-pie", "input.o", "-o", "reference"], dir);
     run(
         "gcc",
         &["-no-pie", "-Bprefix", "input.o", "-o", "output"],
-        &dir,
+        dir,
     );
-    assert_eq!(run("./reference", &[], &dir), "from table\nalpha\n");
-    assert_eq!(run("./output", &[], &dir), "from table\nalpha\n");
-    fs::remove_dir_all(dir).unwrap();
+    assert_eq!(run("./reference", &[], dir), "from table\nalpha\n");
+    assert_eq!(run("./output", &[], dir), "from table\nalpha\n");
 }
 
 #[test]
 fn imported_data_alias_shares_copy_relocation() {
-    let dir = std::env::temp_dir().join(format!("weld-alias-runtime-{}", std::process::id()));
+    let guard = TempDir::new("weld-alias-runtime");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("prefix")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
     fs::write(
@@ -328,22 +331,22 @@ int main(void) {
     run(
         "gcc",
         &["-no-pie", "-fno-pic", "-c", "input.c", "-o", "input.o"],
-        &dir,
+        dir,
     );
-    run("gcc", &["-no-pie", "input.o", "-o", "reference"], &dir);
+    run("gcc", &["-no-pie", "input.o", "-o", "reference"], dir);
     run(
         "gcc",
         &["-no-pie", "-Bprefix", "input.o", "-o", "output"],
-        &dir,
+        dir,
     );
-    assert_eq!(run("./reference", &[], &dir), "1 1\n");
-    assert_eq!(run("./output", &[], &dir), "1 1\n");
-    fs::remove_dir_all(dir).unwrap();
+    assert_eq!(run("./reference", &[], dir), "1 1\n");
+    assert_eq!(run("./output", &[], dir), "1 1\n");
 }
 
 #[test]
 fn atexit_resolves_from_libc_linker_script_archive() {
-    let dir = std::env::temp_dir().join(format!("weld-atexit-runtime-{}", std::process::id()));
+    let guard = TempDir::new("weld-atexit-runtime");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("prefix")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
     fs::write(
@@ -360,10 +363,9 @@ int main(void) {
 "#,
     )
     .unwrap();
-    run("gcc", &["-c", "input.c", "-o", "input.o"], &dir);
-    run("gcc", &["input.o", "-o", "reference"], &dir);
-    run("gcc", &["-Bprefix", "input.o", "-o", "output"], &dir);
-    assert_eq!(run("./reference", &[], &dir), "hi\nbye\n");
-    assert_eq!(run("./output", &[], &dir), "hi\nbye\n");
-    fs::remove_dir_all(dir).unwrap();
+    run("gcc", &["-c", "input.c", "-o", "input.o"], dir);
+    run("gcc", &["input.o", "-o", "reference"], dir);
+    run("gcc", &["-Bprefix", "input.o", "-o", "output"], dir);
+    assert_eq!(run("./reference", &[], dir), "hi\nbye\n");
+    assert_eq!(run("./output", &[], dir), "hi\nbye\n");
 }

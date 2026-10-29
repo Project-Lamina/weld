@@ -1,5 +1,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
+mod common;
+use common::TempDir;
 use std::{fs, path::Path, process::Command};
 
 fn run(program: &str, args: &[&str], dir: &Path) -> String {
@@ -23,12 +25,13 @@ fn run(program: &str, args: &[&str], dir: &Path) -> String {
 
 #[test]
 fn elf_tools_agree_with_ld_on_defined_symbols() {
-    let dir = std::env::temp_dir().join(format!("weld-elf-tools-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-elf-tools");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("input.s"), ".file \"input.s\"\n.text\n.globl _start\n.type _start,@function\n_start:\n mov $60,%eax\n xor %edi,%edi\n syscall\n.size _start,.-_start\n.local helper\n.type helper,@function\nhelper: ret\n.size helper,.-helper\n.section .rodata\nmessage: .asciz \"hello\"\n.data\n.globl value\n.type value,@object\nvalue: .quad 42\n.size value,8\n.bss\n.balign 16\n.weak buffer\n.type buffer,@object\nbuffer: .skip 4096\n.size buffer,4096\n.globl absolute\n.set absolute,123\n").unwrap();
     fs::write(dir.join("layout.ld"), "SECTIONS { . = 0x400000; .text : { *(.text) } . = ALIGN(4096); .rodata : { *(.rodata) } . = ALIGN(4096); .data : { *(.data) } .bss : { *(.bss) } }").unwrap();
-    run("as", &["input.s", "-o", "input.o"], &dir);
-    run(env!("CARGO_BIN_EXE_weld"), &["input.o", "-o", "weld"], &dir);
+    run("as", &["input.s", "-o", "input.o"], dir);
+    run(env!("CARGO_BIN_EXE_weld"), &["input.o", "-o", "weld"], dir);
     run(
         "ld",
         &[
@@ -39,9 +42,9 @@ fn elf_tools_agree_with_ld_on_defined_symbols() {
             "-o",
             "reference",
         ],
-        &dir,
+        dir,
     );
-    let sections = run("readelf", &["-SW", "weld"], &dir);
+    let sections = run("readelf", &["-SW", "weld"], dir);
     assert!(sections.contains(".bss") && sections.contains("NOBITS"));
     assert!(
         sections.contains(".symtab")
@@ -49,7 +52,7 @@ fn elf_tools_agree_with_ld_on_defined_symbols() {
             && sections.contains(".shstrtab")
     );
     let symbols = |file| {
-        let text = run("readelf", &["-sW", file], &dir);
+        let text = run("readelf", &["-sW", file], dir);
         let mut rows: Vec<_> = text
             .lines()
             .filter_map(|line| {
@@ -62,19 +65,19 @@ fn elf_tools_agree_with_ld_on_defined_symbols() {
         rows
     };
     assert_eq!(symbols("weld"), symbols("reference"));
-    assert!(run("objdump", &["-d", "weld"], &dir).contains("<_start>:"));
+    assert!(run("objdump", &["-d", "weld"], dir).contains("<_start>:"));
     let data = fs::read(dir.join("weld")).unwrap();
     let number = |offset| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
     let phnum = u16::from_le_bytes(data[56..58].try_into().unwrap()) as usize;
     assert!((0..phnum).any(|i| number(64 + i * 56 + 32) < number(64 + i * 56 + 40)));
     assert!(Command::new(dir.join("weld")).status().unwrap().success());
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn as_needed_tracks_state_and_deduplicates_sonames() {
-    let dir = std::env::temp_dir().join(format!("weld-needed-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-needed");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(
         dir.join("used.s"),
         ".globl used\n.type used,@function\nused: ret\n",
@@ -94,7 +97,7 @@ fn as_needed_tracks_state_and_deduplicates_sonames() {
         run(
             "as",
             &[&format!("{name}.s"), "-o", &format!("{name}.o")],
-            &dir,
+            dir,
         );
     }
     for name in ["used", "unused"] {
@@ -108,7 +111,7 @@ fn as_needed_tracks_state_and_deduplicates_sonames() {
                 "-o",
                 &format!("lib{name}.so"),
             ],
-            &dir,
+            dir,
         );
     }
     for (flags, expected) in [
@@ -132,8 +135,8 @@ fn as_needed_tracks_state_and_deduplicates_sonames() {
         args.extend(flags);
         args.extend(["-o", "output"]);
         for linker in [env!("CARGO_BIN_EXE_weld"), "ld"] {
-            run(linker, &args, &dir);
-            let dynamic = run("readelf", &["-dW", "output"], &dir);
+            run(linker, &args, dir);
+            let dynamic = run("readelf", &["-dW", "output"], dir);
             let needed: Vec<_> = dynamic
                 .lines()
                 .filter(|s| s.contains("(NEEDED)"))
@@ -142,13 +145,13 @@ fn as_needed_tracks_state_and_deduplicates_sonames() {
             assert_eq!(needed, expected);
         }
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn gc_follows_relocations_and_prunes_unwind_records() {
-    let dir = std::env::temp_dir().join(format!("weld-gc-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-gc");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("input.c"), "int live_data=42; int dead_data[4096]={1}; __attribute__((noinline)) int live(void){return live_data;} __attribute__((noinline)) int dead(void){return dead_data[0];} int main(void){return live()!=42;}").unwrap();
     run(
         "gcc",
@@ -162,26 +165,25 @@ fn gc_follows_relocations_and_prunes_unwind_records() {
             "-o",
             "input.o",
         ],
-        &dir,
+        dir,
     );
     let linker = env!("CARGO_BIN_EXE_weld");
-    run(linker, &["input.o", "-lc", "-o", "full"], &dir);
+    run(linker, &["input.o", "-lc", "-o", "full"], dir);
     run(
         linker,
         &["input.o", "-lc", "--gc-sections", "-o", "gc"],
-        &dir,
+        dir,
     );
     assert!(Command::new(dir.join("gc")).status().unwrap().success());
-    let symbols = run("readelf", &["-sW", "gc"], &dir);
+    let symbols = run("readelf", &["-sW", "gc"], dir);
     assert!(symbols.contains("live_data"));
     assert!(!symbols.contains("dead"));
-    let frames = run("readelf", &["--debug-dump=frames", "gc"], &dir);
+    let frames = run("readelf", &["--debug-dump=frames", "gc"], dir);
     assert_eq!(frames.matches(" FDE ").count(), 2);
     assert!(
         fs::metadata(dir.join("gc")).unwrap().len() + 16000
             < fs::metadata(dir.join("full")).unwrap().len()
     );
-    fs::remove_dir_all(dir).unwrap();
 }
 
 const MID_EH_FRAME_SOURCE: &str = r#".text
@@ -263,66 +265,67 @@ fde2_end:
 
 #[test]
 fn gc_scans_records_after_an_eh_frame_terminator() {
-    let dir = std::env::temp_dir().join(format!("weld-gc-eh-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-gc-eh");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("mid.s"), MID_EH_FRAME_SOURCE).unwrap();
     fs::write(
         dir.join("tail.c"),
         "__attribute__((noinline)) int leaf(int x) { return x + 1; }\nint tail_entry(int x) { return leaf(x) * 2; }\n",
     )
     .unwrap();
-    run("as", &["mid.s", "-o", "mid.o"], &dir);
+    run("as", &["mid.s", "-o", "mid.o"], dir);
     run(
         "gcc",
         &["-c", "-O0", "-fno-pie", "tail.c", "-o", "tail.o"],
-        &dir,
+        dir,
     );
     run(
         env!("CARGO_BIN_EXE_weld"),
         &["mid.o", "tail.o", "--gc-sections", "-o", "output"],
-        &dir,
+        dir,
     );
     assert!(Command::new(dir.join("output")).status().unwrap().success());
-    let symbols = run("nm", &["output"], &dir);
+    let symbols = run("nm", &["output"], dir);
     assert!(symbols.contains(" helper") && symbols.contains(" pers"));
-    let frames = run("readelf", &["--debug-dump=frames", "output"], &dir);
+    let frames = run("readelf", &["--debug-dump=frames", "output"], dir);
     assert_eq!(frames.matches(" FDE ").count(), 2);
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn strip_preserves_dynamic_symbols_and_map_retains_definitions() {
-    let dir = std::env::temp_dir().join(format!("weld-strip-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-strip");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(
         dir.join("main.c"),
         "#include <stdio.h>\nint main(void){puts(\"hello\");return 0;}\n",
     )
     .unwrap();
-    run("gcc", &["-fno-pie", "-c", "main.c", "-o", "main.o"], &dir);
+    run("gcc", &["-fno-pie", "-c", "main.c", "-o", "main.o"], dir);
     for flag in ["-s", "--strip-all"] {
         run(
             env!("CARGO_BIN_EXE_weld"),
             &["main.o", "-lc", flag, "--Map=output.map", "-o", "output"],
-            &dir,
+            dir,
         );
-        let sections = run("readelf", &["-SW", "output"], &dir);
+        let sections = run("readelf", &["-SW", "output"], dir);
         assert!(sections.contains(".dynsym") && sections.contains(".dynstr"));
         assert!(!sections.contains(".symtab") && !sections.contains(" .strtab"));
         let map = fs::read_to_string(dir.join("output.map")).unwrap();
         assert!(map.contains("main") && map.contains(".text") && map.contains("Entry point"));
         assert_eq!(
-            run(dir.join("output").to_str().unwrap(), &[], &dir),
+            run(dir.join("output").to_str().unwrap(), &[], dir),
             "hello\n"
         );
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn parallel_loading_preserves_local_symbols_and_archive_selection() {
-    let dir = std::env::temp_dir().join(format!("weld-parallel-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-parallel");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     let mut names = Vec::new();
     for i in 0..40 {
         let next = if i == 39 {
@@ -337,7 +340,7 @@ fn parallel_loading_preserves_local_symbols_and_archive_selection() {
         };
         fs::write(dir.join("input.s"), format!(".text\n{start}.globl chain{i}\nchain{i}: lea private(%rip),%r11\n call {next}\n ret\n.data\nprivate: .quad {i}\n")).unwrap();
         let name = format!("input{i}.o");
-        run("as", &["input.s", "-o", &name], &dir);
+        run("as", &["input.s", "-o", &name], dir);
         names.push(name);
     }
     for (name, source) in [
@@ -348,26 +351,26 @@ fn parallel_loading_preserves_local_symbols_and_archive_selection() {
         ("unused", ".globl unreachable\nunreachable: ret\n"),
     ] {
         fs::write(dir.join("archive.s"), source).unwrap();
-        run("as", &["archive.s", "-o", &format!("{name}.o")], &dir);
+        run("as", &["archive.s", "-o", &format!("{name}.o")], dir);
     }
-    run("ar", &["rcs", "libinput.a", "used.o", "unused.o"], &dir);
+    run("ar", &["rcs", "libinput.a", "used.o", "unused.o"], dir);
     let mut args: Vec<_> = names.iter().map(String::as_str).collect();
     args.extend(["libinput.a", "-o", "output"]);
-    run(env!("CARGO_BIN_EXE_weld"), &args, &dir);
+    run(env!("CARGO_BIN_EXE_weld"), &args, dir);
     assert!(Command::new(dir.join("output")).status().unwrap().success());
-    let symbols = run("readelf", &["-sW", "output"], &dir);
+    let symbols = run("readelf", &["-sW", "output"], dir);
     assert!(symbols.contains("archive_fn") && !symbols.contains("unreachable"));
     assert_eq!(
         symbols.lines().filter(|s| s.ends_with(" private")).count(),
         40
     );
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn nobits_boundary_symbols_follow_dynamic_layout() {
-    let dir = std::env::temp_dir().join(format!("weld-nobits-end-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-nobits-end");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("start.s"), ".globl _start\n_start: lea buffer_end(%rip),%rax\n lea buffer(%rip),%rdx\n sub %rdx,%rax\n cmp $4096,%rax\n setne %dil\n movzbl %dil,%edi\n mov $60,%eax\n syscall\n").unwrap();
     fs::write(
         dir.join("data.s"),
@@ -378,16 +381,16 @@ fn nobits_boundary_symbols_follow_dynamic_layout() {
         run(
             "as",
             &[&format!("{name}.s"), "-o", &format!("{name}.o")],
-            &dir,
+            dir,
         );
     }
     run(
         env!("CARGO_BIN_EXE_weld"),
         &["start.o", "data.o", "-lc", "-o", "output"],
-        &dir,
+        dir,
     );
     assert!(Command::new(dir.join("output")).status().unwrap().success());
-    let symbols = run("readelf", &["-sW", "output"], &dir);
+    let symbols = run("readelf", &["-sW", "output"], dir);
     let address = |name: &str| {
         let line = symbols
             .lines()
@@ -396,13 +399,13 @@ fn nobits_boundary_symbols_follow_dynamic_layout() {
         u64::from_str_radix(line.split_whitespace().nth(1).unwrap(), 16).unwrap()
     };
     assert_eq!(address("buffer_end") - address("buffer"), 4096);
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn as_needed_counts_archive_members_and_retained_dso_references() {
-    let dir = std::env::temp_dir().join(format!("weld-needed-origins-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-needed-origins");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     for (name, source) in [
         (
             "main",
@@ -418,9 +421,9 @@ fn as_needed_counts_archive_members_and_retained_dso_references() {
         ("shared", ".globl entry\nentry: call dependency\n ret\n"),
     ] {
         fs::write(dir.join("input.s"), source).unwrap();
-        run("as", &["input.s", "-o", &format!("{name}.o")], &dir);
+        run("as", &["input.s", "-o", &format!("{name}.o")], dir);
     }
-    run("ar", &["rcs", "libarchive.a", "first.o", "second.o"], &dir);
+    run("ar", &["rcs", "libarchive.a", "first.o", "second.o"], dir);
     run(
         "ld",
         &[
@@ -431,7 +434,7 @@ fn as_needed_counts_archive_members_and_retained_dso_references() {
             "-o",
             "libprovider.so",
         ],
-        &dir,
+        dir,
     );
     run(
         "ld",
@@ -443,7 +446,7 @@ fn as_needed_counts_archive_members_and_retained_dso_references() {
             "-o",
             "libshared.so",
         ],
-        &dir,
+        dir,
     );
     for (input, expected) in [
         (
@@ -469,8 +472,8 @@ fn as_needed_counts_archive_members_and_retained_dso_references() {
         args.extend(input);
         args.extend(["-o", "output"]);
         for linker in [env!("CARGO_BIN_EXE_weld"), "ld"] {
-            run(linker, &args, &dir);
-            let dynamic = run("readelf", &["-dW", "output"], &dir);
+            run(linker, &args, dir);
+            let dynamic = run("readelf", &["-dW", "output"], dir);
             let needed: Vec<_> = dynamic
                 .lines()
                 .filter(|s| s.contains("(NEEDED)"))
@@ -479,19 +482,19 @@ fn as_needed_counts_archive_members_and_retained_dso_references() {
             assert_eq!(needed, expected);
         }
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn load_segments_enforce_wx_for_pie_exec_and_static() {
-    let dir = std::env::temp_dir().join(format!("weld-segments-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-segments");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("input.s"), ".text\n.globl _start\n_start: mov $60,%eax\n xor %edi,%edi\n syscall\n.section .init,\"ax\"\nret\n.section .fini,\"ax\"\nret\n.section .rodata\n.asciz \"constant\"\n.section .data.rel.ro,\"aw\"\n.quad _start\n.data\n.quad 42\n.bss\n.skip 8192\n").unwrap();
-    run("as", &["input.s", "-o", "input.o"], &dir);
+    run("as", &["input.s", "-o", "input.o"], dir);
     for flags in [vec!["-pie", "-lc"], vec!["-no-pie", "-lc"], vec!["-static"]] {
         let mut args = flags;
         args.extend(["input.o", "-o", "output"]);
-        run(env!("CARGO_BIN_EXE_weld"), &args, &dir);
+        run(env!("CARGO_BIN_EXE_weld"), &args, dir);
         let bytes = fs::read(dir.join("output")).unwrap();
         let count = u16::from_le_bytes(bytes[56..58].try_into().unwrap()) as usize;
         let mut loads = 0;
@@ -504,9 +507,9 @@ fn load_segments_enforce_wx_for_pie_exec_and_static() {
             }
         }
         assert!(loads >= 3);
-        let headers = run("readelf", &["-lW", "output"], &dir);
+        let headers = run("readelf", &["-lW", "output"], dir);
         assert!(headers.contains("GNU_RELRO"));
-        let sections = run("readelf", &["-SW", "output"], &dir);
+        let sections = run("readelf", &["-SW", "output"], dir);
         let address = |name: &str| {
             let row = sections
                 .lines()
@@ -527,13 +530,13 @@ fn load_segments_enforce_wx_for_pie_exec_and_static() {
 
         assert!(Command::new(dir.join("output")).status().unwrap().success());
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn subsection_mapping_preserves_relocations_and_relro() {
-    let dir = std::env::temp_dir().join(format!("weld-subsections-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-subsections");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(
         dir.join("input.s"),
         r#"
@@ -560,13 +563,13 @@ value: .long 42
 "#,
     )
     .unwrap();
-    run("as", &["input.s", "-o", "input.o"], &dir);
+    run("as", &["input.s", "-o", "input.o"], dir);
     run(
         env!("CARGO_BIN_EXE_weld"),
         &["input.o", "-o", "output"],
-        &dir,
+        dir,
     );
-    let sections = run("readelf", &["-SW", "output"], &dir);
+    let sections = run("readelf", &["-SW", "output"], dir);
     for name in [
         ".text.startup",
         ".text.helper",
@@ -581,13 +584,13 @@ value: .long 42
         assert!(sections.contains(name), "{sections}");
     }
     assert!(Command::new(dir.join("output")).status().unwrap().success());
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn merge_elements_deduplicate_strings_constants_and_interior_references() {
-    let dir = std::env::temp_dir().join(format!("weld-merge-elements-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-merge-elements");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     for (name, prefix) in [("first", ".asciz \"unique\"\n"), ("second", "")] {
         fs::write(
             dir.join(format!("{name}.s")),
@@ -616,7 +619,7 @@ fn merge_elements_deduplicate_strings_constants_and_interior_references() {
         run(
             "as",
             &[&format!("{name}.s"), "-o", &format!("{name}.o")],
-            &dir,
+            dir,
         );
     }
     fs::write(
@@ -656,26 +659,26 @@ exit: mov $60,%eax
 "#,
     )
     .unwrap();
-    run("as", &["start.s", "-o", "start.o"], &dir);
+    run("as", &["start.s", "-o", "start.o"], dir);
     for flags in [vec!["-pie", "-lc"], vec!["-no-pie", "-lc"], vec!["-static"]] {
         let mut args = flags;
         args.extend(["start.o", "first.o", "second.o", "-o", "output"]);
-        run(env!("CARGO_BIN_EXE_weld"), &args, &dir);
+        run(env!("CARGO_BIN_EXE_weld"), &args, dir);
         assert!(Command::new(dir.join("output")).status().unwrap().success());
-        let sections = run("readelf", &["-SW", "output"], &dir);
+        let sections = run("readelf", &["-SW", "output"], dir);
         let rodata = sections
             .lines()
             .find(|line| line.contains(".rodata "))
             .unwrap();
         assert!(rodata.contains("000022"), "{rodata}");
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn build_ids_hash_output_and_notes_survive_stripping() {
-    let dir = std::env::temp_dir().join(format!("weld-notes-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-notes");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     for (name, features) in [("first", 3), ("second", 1)] {
         let text = if name == "first" {
             ".text\n.globl _start\n_start: endbr64\n mov $60,%eax\n xor %edi,%edi\n syscall\n"
@@ -706,22 +709,22 @@ fn build_ids_hash_output_and_notes_survive_stripping() {
         run(
             "as",
             &[&format!("{name}.s"), "-o", &format!("{name}.o")],
-            &dir,
+            dir,
         );
     }
     let args = ["--build-id", "-s", "first.o", "second.o", "-o", "output"];
-    run(env!("CARGO_BIN_EXE_weld"), &args, &dir);
+    run(env!("CARGO_BIN_EXE_weld"), &args, dir);
     let original = fs::read(dir.join("output")).unwrap();
-    run(env!("CARGO_BIN_EXE_weld"), &args, &dir);
+    run(env!("CARGO_BIN_EXE_weld"), &args, dir);
     assert_eq!(original, fs::read(dir.join("output")).unwrap());
-    let notes = run("readelf", &["-nW", "output"], &dir);
+    let notes = run("readelf", &["-nW", "output"], dir);
     assert!(notes.contains("NT_GNU_ABI_TAG") && notes.contains("NT_GNU_BUILD_ID"));
     assert!(notes.contains("x86 feature: IBT") && !notes.contains("SHSTK"));
-    let comments = run("readelf", &["-p", ".comment", "output"], &dir);
+    let comments = run("readelf", &["-p", ".comment", "output"], dir);
     assert!(comments.contains("compiler first") && comments.contains("compiler second"));
-    let headers = run("readelf", &["-lW", "output"], &dir);
+    let headers = run("readelf", &["-lW", "output"], dir);
     assert!(headers.contains("GNU_PROPERTY"));
-    let sections = run("readelf", &["-SW", "output"], &dir);
+    let sections = run("readelf", &["-SW", "output"], dir);
     assert!(!sections.contains(".symtab"));
     let id = notes
         .lines()
@@ -736,7 +739,7 @@ fn build_ids_hash_output_and_notes_survive_stripping() {
     zeroed[offset..offset + 20].fill(0);
     fs::write(dir.join("zeroed"), zeroed).unwrap();
     assert_eq!(
-        run("sha1sum", &["zeroed"], &dir)
+        run("sha1sum", &["zeroed"], dir)
             .split_whitespace()
             .next()
             .unwrap(),
@@ -744,7 +747,7 @@ fn build_ids_hash_output_and_notes_survive_stripping() {
     );
     assert!(Command::new(dir.join("output")).status().unwrap().success());
     fs::write(dir.join("bare.s"), ".data\n.quad 42\n").unwrap();
-    run("as", &["bare.s", "-o", "bare.o"], &dir);
+    run("as", &["bare.s", "-o", "bare.o"], dir);
     run(
         env!("CARGO_BIN_EXE_weld"),
         &[
@@ -755,29 +758,29 @@ fn build_ids_hash_output_and_notes_survive_stripping() {
             "-o",
             "output",
         ],
-        &dir,
+        dir,
     );
-    let changed = run("readelf", &["-nW", "output"], &dir);
+    let changed = run("readelf", &["-nW", "output"], dir);
     assert!(!changed.contains(id) && !changed.contains("x86 feature:"));
     run(
         env!("CARGO_BIN_EXE_weld"),
         &["--build-id", "--build-id=none", "first.o", "-o", "output"],
-        &dir,
+        dir,
     );
-    assert!(!run("readelf", &["-nW", "output"], &dir).contains("NT_GNU_BUILD_ID"));
+    assert!(!run("readelf", &["-nW", "output"], dir).contains("NT_GNU_BUILD_ID"));
     let result = Command::new(env!("CARGO_BIN_EXE_weld"))
         .args(["--build-id=unsupported", "first.o", "-o", "bad"])
-        .current_dir(&dir)
+        .current_dir(dir)
         .output()
         .unwrap();
     assert!(!result.status.success() && !dir.join("bad").exists());
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn output_locals_match_ld_for_merge_labels_and_section_symbols() {
-    let dir = std::env::temp_dir().join(format!("weld-output-locals-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-output-locals");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(
         dir.join("input.s"),
         r#"
@@ -799,12 +802,12 @@ named: .asciz "named"
 "#,
     )
     .unwrap();
-    run("as", &["-L", "input.s", "-o", "input.o"], &dir);
+    run("as", &["-L", "input.s", "-o", "input.o"], dir);
     for (linker, output) in [(env!("CARGO_BIN_EXE_weld"), "output"), ("ld", "reference")] {
-        run(linker, &["input.o", "-o", output], &dir);
+        run(linker, &["input.o", "-o", output], dir);
     }
     let locals = |file| {
-        let text = run("readelf", &["-sW", file], &dir);
+        let text = run("readelf", &["-sW", file], dir);
         let mut result: Vec<_> = text
             .lines()
             .filter_map(|line| {
@@ -817,12 +820,12 @@ named: .asciz "named"
         result
     };
     assert_eq!(locals("output"), locals("reference"));
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn debug_sections_survive_linking_and_match_ld_line_tables() {
-    let dir = std::env::temp_dir().join(format!("weld-debug-info-{}", std::process::id()));
+    let guard = TempDir::new("weld-debug-info");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("prefix")).unwrap();
     let _ = fs::remove_file(dir.join("prefix/ld"));
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
@@ -842,23 +845,23 @@ fn debug_sections_survive_linking_and_match_ld_line_tables() {
         run(
             "gcc",
             &["-g", "-O0", pic, "-c", "one.c", "-o", "one.o"],
-            &dir,
+            dir,
         );
         run(
             "gcc",
             &["-g", "-O0", pic, "-c", "two.c", "-o", "two.o"],
-            &dir,
+            dir,
         );
         run(
             "gcc",
             &[
                 "-B", "prefix", mode, "-g", "one.o", "two.o", "-o", "weld-dbg",
             ],
-            &dir,
+            dir,
         );
-        run("gcc", &[mode, "-g", "one.o", "two.o", "-o", "ld-dbg"], &dir);
+        run("gcc", &[mode, "-g", "one.o", "two.o", "-o", "ld-dbg"], dir);
 
-        let sections = run("readelf", &["-SW", "weld-dbg"], &dir);
+        let sections = run("readelf", &["-SW", "weld-dbg"], dir);
         for name in [".debug_info", ".debug_line", ".debug_abbrev", ".debug_str"] {
             assert!(sections.contains(name), "{mode}: {name} was dropped");
         }
@@ -900,7 +903,7 @@ fn debug_sections_survive_linking_and_match_ld_line_tables() {
         }
 
         let lines = |file| {
-            let text = run("readelf", &["--debug-dump=decodedline", file], &dir);
+            let text = run("readelf", &["--debug-dump=decodedline", file], dir);
             let mut rows: Vec<(String, String)> = text
                 .lines()
                 .filter_map(|line| {
@@ -934,4 +937,60 @@ fn debug_sections_survive_linking_and_match_ld_line_tables() {
             0
         );
     }
+}
+
+#[test]
+fn gc_sections_refuses_debug_info_instead_of_zeroing_addresses() {
+    let guard = TempDir::new("weld-gc-debug");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("one.c"),
+        "int other(int x);\nint main(void) {\n  return other(21) * 2;\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.join("two.c"), "int other(int x) {\n  return x;\n}\n").unwrap();
+    run("gcc", &["-g", "-O0", "-c", "one.c", "-o", "dbg1.o"], dir);
+    run("gcc", &["-g", "-O0", "-c", "two.c", "-o", "dbg2.o"], dir);
+    run("gcc", &["-O0", "-c", "one.c", "-o", "bare1.o"], dir);
+    run("gcc", &["-O0", "-c", "two.c", "-o", "bare2.o"], dir);
+
+    let link = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_weld"))
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+
+    let refused = link(&["--gc-sections", "-o", "gc-dbg", "dbg1.o", "dbg2.o"]);
+    assert!(
+        !refused.status.success(),
+        "gc with debug info linked anyway"
+    );
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("--gc-sections"), "{message}");
+    assert!(
+        !dir.join("gc-dbg").exists(),
+        "a binary was written despite the refusal"
+    );
+
+    let bare = link(&["--gc-sections", "-o", "gc-bare", "bare1.o", "bare2.o"]);
+    assert!(
+        bare.status.success(),
+        "gc without debug info: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+
+    let kept = link(&["-o", "dbg-only", "dbg1.o", "dbg2.o"]);
+    assert!(
+        kept.status.success(),
+        "debug info without gc: {}",
+        String::from_utf8_lossy(&kept.stderr)
+    );
+    let lines = run("readelf", &["--debug-dump=decodedline", "dbg-only"], dir);
+    assert!(
+        lines.contains("0x4") || lines.contains("0x2"),
+        "line table has no real addresses:\n{lines}"
+    );
 }

@@ -571,6 +571,7 @@ mod tests {
     use super::*;
     use crate::collections::HashMap;
     use crate::link::{MergedSection, link_single_object};
+    use crate::test_support::TempDir;
     use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
     #[test]
@@ -647,7 +648,8 @@ mod tests {
     #[test]
     fn test_link_and_emit() {
         let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
-        let tmp = std::env::temp_dir().join("weld_emit_test.o");
+        let tmp_dir = TempDir::new("weld_emit_test");
+        let tmp = tmp_dir.path().join("weld_emit_test.o");
 
         let mut ras =
             ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras");
