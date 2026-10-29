@@ -18,6 +18,7 @@ mod relocatable;
 pub mod resolver;
 mod riscv;
 mod runtime;
+mod shared;
 mod symbols;
 mod x86_64;
 
@@ -107,6 +108,10 @@ pub fn link_single_object(data: &[u8]) -> Result<LinkResult, String> {
 #[derive(Debug, Default, Clone)]
 pub struct LinkOptions {
     pub pie: bool,
+    /// `ld -shared`. Implies `pie` for the output layout.
+    pub shared: bool,
+    /// `ld -soname`, recorded as DT_SONAME.
+    pub soname: Option<String>,
     pub build_id: bool,
     pub static_link: bool,
     /// `ld --dynamic-linker`.
@@ -217,6 +222,25 @@ fn link_multi_object_parsed(
     let e_machine = parsed[0].header.e_machine;
     let arch = TargetArch::from_elf_machine(e_machine)
         .ok_or_else(|| format!("unsupported machine {}", e_machine))?;
+    if opts.shared {
+        if arch != TargetArch::X86_64 {
+            return Err(format!(
+                "-shared is not supported for {arch:?}: only x86_64 has a shared object path"
+            ));
+        }
+        shared::reject_data_imports(parsed)?;
+    }
+    let exports = if opts.shared {
+        shared::collect_exports(parsed)?
+    } else {
+        Vec::new()
+    };
+    let mut shared_imports: Vec<String> = Vec::new();
+    let weak_imports = if opts.shared {
+        shared::weak_imports(parsed)?
+    } else {
+        Default::default()
+    };
 
     if opts.pie {
         let base = arch.page_align();
@@ -281,7 +305,7 @@ fn link_multi_object_parsed(
             })
             .unwrap_or(false);
 
-    if has_shared_lib && arch == TargetArch::X86_64 && e_machine == 62 {
+    if (has_shared_lib || opts.shared) && arch == TargetArch::X86_64 && e_machine == 62 {
         let mut undefined: Vec<String> = Vec::new();
         let mut undefined_seen = HashSet::default();
         for obj in parsed.iter() {
@@ -316,14 +340,24 @@ fn link_multi_object_parsed(
             }
         }
         // Synthetic _start leaves through libc exit(), so it needs a PLT entry.
-        if !global_symbols.contains_key("_start") && !undefined.iter().any(|s| s == "exit") {
+        if !opts.shared
+            && !global_symbols.contains_key("_start")
+            && !undefined.iter().any(|s| s == "exit")
+        {
             undefined.push("exit".to_string());
         }
 
         let needed = select_needed_libraries(parsed, libs.unwrap_or(&[]), opts, &resolver)?;
-        let aliases = runtime::copy_aliases(libs.unwrap_or(&[]), &resolver, &needed, &undefined)?;
+        let aliases = if opts.shared {
+            Vec::new()
+        } else {
+            runtime::copy_aliases(libs.unwrap_or(&[]), &resolver, &needed, &undefined)?
+        };
         undefined.extend(aliases);
-        if !needed.is_empty() {
+        if opts.shared {
+            shared_imports = undefined.clone();
+        }
+        if !needed.is_empty() || opts.shared {
             let (plt_data, got_plt_data) = build_plt_got_x86_64(&undefined, &layout)?;
             let last = layout.sections.last().ok_or("no sections")?;
             let mut vaddr = align_up(last.vaddr + last.data.len() as u64, 16);
@@ -369,7 +403,15 @@ fn link_multi_object_parsed(
                 hash_data,
                 needed_offsets,
                 runpath_offset,
-            ) = build_dynamic_sections(&undefined, got_plt_vaddr, &needed, &opts.rpaths)?;
+                soname_offset,
+            ) = build_dynamic_sections(
+                &undefined,
+                got_plt_vaddr,
+                &needed,
+                &opts.rpaths,
+                &exports,
+                opts.soname.as_deref(),
+            )?;
             let dynsym_vaddr = vaddr;
             let dynsym_size = dynsym_data.len() as u64;
             layout.sections.push(MergedSection {
@@ -444,9 +486,11 @@ fn link_multi_object_parsed(
                     rela_plt_vaddr,
                     rela_plt_size,
                     hash_vaddr,
+                    shared: opts.shared,
                 },
                 &needed_offsets,
                 runpath_offset,
+                soname_offset,
             )?;
             let dynamic_vaddr = vaddr;
             layout.sections.push(MergedSection {
@@ -475,10 +519,11 @@ fn link_multi_object_parsed(
                 .unwrap_or_else(|| "/lib64/ld-linux-x86-64.so.2".to_string());
             dynamic_info = Some(DynamicLinkInfo {
                 pie: opts.pie,
+                shared: opts.shared,
                 needed: needed.clone(),
                 plt_symbols: undefined,
                 weak_plt_symbols: Vec::new(),
-                interpreter: Some(interpreter),
+                interpreter: (!opts.shared).then_some(interpreter),
                 macho_rebase_addrs: Vec::new(),
                 macho_direct_binds: Vec::new(),
             });
@@ -576,17 +621,19 @@ fn link_multi_object_parsed(
             .filter(|(name, _)| !tls_got_names.contains(*name))
             .map(|(name, &address)| (name.clone(), address))
             .collect();
+        let glob_count = shared::glob_slots(&got_symbol_map, &shared_imports).len();
         Some(pie::prepare(
             &mut layout,
             parsed,
             &section_contribs,
             &pie_got,
             &global_symbols,
+            glob_count,
         )?)
     } else {
         None
     };
-    let mut runtime = if let Some(dynamic) = &dynamic_info {
+    let mut runtime = if let Some(dynamic) = dynamic_info.as_ref().filter(|d| !d.shared) {
         Some(runtime::prepare(
             &mut layout,
             parsed,
@@ -802,7 +849,20 @@ fn link_multi_object_parsed(
     }
     runtime::finish_eh_frame_hdr(&mut layout)?;
     if let Some(pending) = pie_relocations {
-        pie::finish(&mut layout, pending)?;
+        let glob: Vec<(u64, u32)> = shared::glob_slots(&got_symbol_map, &shared_imports)
+            .into_iter()
+            .map(|(name, index)| (got_symbol_map[&name], index))
+            .collect();
+        pie::finish(&mut layout, pending, &glob)?;
+    }
+    if opts.shared {
+        shared::fill_dynsym(
+            &mut layout,
+            &global_symbols,
+            &shared_imports,
+            &weak_imports,
+            &exports,
+        )?;
     }
     timer.mark("apply relocations");
     let mut symbols = Vec::new();

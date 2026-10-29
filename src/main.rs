@@ -40,7 +40,9 @@ const ELFOSABI_FREEBSD: u8 = 9;
 /// Command-line settings the linker needs, gathered in one place.
 fn link_options(args: &ParsedArgs) -> LinkOptions {
     LinkOptions {
-        pie: args.pie,
+        pie: args.pie || args.shared,
+        shared: args.shared,
+        soname: args.soname.clone(),
         build_id: args.build_id,
         static_link: args.static_link,
         interpreter: args.dynamic_linker.clone(),
@@ -387,7 +389,9 @@ fn try_weld_link_elf(
             _ => {}
         }
     }
-    let entry = if needs_synthetic_start(&result) {
+    let entry = if opts.shared {
+        0
+    } else if needs_synthetic_start(&result) {
         synthesize_elf_start(&mut result, freebsd_abi).or_else(|| select_entry(args, &result))?
     } else {
         select_entry(args, &result)?
@@ -446,6 +450,7 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
     let mut out = std::io::BufWriter::new(out_file);
     let fallback_dyn = DynamicLinkInfo {
         pie: false,
+        shared: false,
         needed: vec!["/usr/lib/libSystem.B.dylib".to_string()],
         plt_symbols: Vec::new(),
         weak_plt_symbols: Vec::new(),
