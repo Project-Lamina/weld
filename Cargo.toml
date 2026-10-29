@@ -1,6 +1,7 @@
 [package]
 name = "lamina-weld"
 version = "0.2.0"
+rust-version = "1.88"
 edition = "2024"
 authors = ["Eira <eira@nornity.com>"]
 description = "weld - Cross-platform linker. Fast, minimal, drop-in for ld/lld/mold. Links ELF (Linux), PE (Windows), Mach-O (macOS)."
