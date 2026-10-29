@@ -1,10 +1,13 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
+mod common;
+use common::TempDir;
 use std::{fs, os::unix::fs::symlink, process::Command};
 
 #[test]
 fn rejects_lto_and_unresolved_symbols_before_emission() {
-    let dir = std::env::temp_dir().join(format!("weld-errors-{}", std::process::id()));
+    let guard = TempDir::new("weld-errors");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     for (source, flags, diagnostic) in [
@@ -46,7 +49,7 @@ fn rejects_lto_and_unresolved_symbols_before_emission() {
     ] {
         fs::write(dir.join("input.c"), source).unwrap();
         let output = Command::new("gcc")
-            .current_dir(&dir)
+            .current_dir(dir)
             .args(["-Bdrv", "input.c", "-o", "output"])
             .args(flags)
             .output()
@@ -58,13 +61,12 @@ fn rejects_lto_and_unresolved_symbols_before_emission() {
     }
     fs::write(dir.join("input.c"), "extern int optional(void) __attribute__((weak)); int main(void) { return optional ? optional() : 0; }").unwrap();
     let status = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-Bdrv", "input.c", "-o", "output"])
         .status()
         .unwrap();
     assert!(status.success());
     assert!(Command::new(dir.join("output")).status().unwrap().success());
-    fs::remove_dir_all(dir).unwrap();
 }
 
 fn elf_section_field(bytes: &[u8], sh_type: u32) -> Option<usize> {
@@ -77,7 +79,8 @@ fn elf_section_field(bytes: &[u8], sh_type: u32) -> Option<usize> {
 
 #[test]
 fn rejects_malformed_object_sections_before_allocating() {
-    let dir = std::env::temp_dir().join(format!("weld-malformed-{}", std::process::id()));
+    let guard = TempDir::new("weld-malformed");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -86,7 +89,7 @@ fn rejects_malformed_object_sections_before_allocating() {
     )
     .unwrap();
     let status = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-c", "input.c", "-o", "input.o"])
         .status()
         .unwrap();
@@ -125,7 +128,7 @@ fn rejects_malformed_object_sections_before_allocating() {
         mutant[field..field + 8].copy_from_slice(&value.to_le_bytes());
         fs::write(dir.join("mutant.o"), &mutant).unwrap();
         let output = Command::new("gcc")
-            .current_dir(&dir)
+            .current_dir(dir)
             .args(["-Bdrv", "mutant.o", "-o", "output"])
             .output()
             .unwrap();
@@ -135,12 +138,12 @@ fn rejects_malformed_object_sections_before_allocating() {
         assert!(!stderr.contains("panicked"), "{name}: {stderr}");
         assert!(!dir.join("output").exists());
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn rejects_pc_relative_relocation_that_does_not_fit() {
-    let dir = std::env::temp_dir().join(format!("weld-pc32-{}", std::process::id()));
+    let guard = TempDir::new("weld-pc32");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -149,13 +152,13 @@ fn rejects_pc_relative_relocation_that_does_not_fit() {
     )
     .unwrap();
     let status = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-c", "far.s", "-o", "far.o"])
         .status()
         .unwrap();
     assert!(status.success());
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-Bdrv", "-nostdlib", "-no-pie", "far.o", "-o", "output"])
         .output()
         .unwrap();
@@ -163,12 +166,12 @@ fn rejects_pc_relative_relocation_that_does_not_fit() {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("does not fit in i32"), "{stderr}");
     assert!(!dir.join("output").exists());
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn rejects_duplicate_strong_definitions() {
-    let dir = std::env::temp_dir().join(format!("weld-dupdef-{}", std::process::id()));
+    let guard = TempDir::new("weld-dupdef");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -178,7 +181,7 @@ fn rejects_duplicate_strong_definitions() {
     .unwrap();
     fs::write(dir.join("b.c"), "int dupsym = 2;").unwrap();
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-Bdrv", "a.c", "b.c", "-o", "output"])
         .output()
         .unwrap();
@@ -186,11 +189,11 @@ fn rejects_duplicate_strong_definitions() {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("multiple definition of dupsym"), "{stderr}");
     assert!(!dir.join("output").exists());
-    fs::remove_dir_all(dir).unwrap();
 }
 #[test]
 fn strong_definition_overrides_weak_in_either_order() {
-    let dir = std::env::temp_dir().join(format!("weld-weakdef-{}", std::process::id()));
+    let guard = TempDir::new("weld-weakdef");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -201,7 +204,7 @@ fn strong_definition_overrides_weak_in_either_order() {
     fs::write(dir.join("strong.c"), "int wd(void) { return 42; }").unwrap();
     for order in [["weak.c", "strong.c"], ["strong.c", "weak.c"]] {
         let status = Command::new("gcc")
-            .current_dir(&dir)
+            .current_dir(dir)
             .args(["-Bdrv", order[0], order[1], "-o", "output"])
             .status()
             .unwrap();
@@ -212,12 +215,12 @@ fn strong_definition_overrides_weak_in_either_order() {
             "{order:?}"
         );
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn rejects_relocation_section_targeting_missing_section() {
-    let dir = std::env::temp_dir().join(format!("weld-rela-info-{}", std::process::id()));
+    let guard = TempDir::new("weld-rela-info");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -226,7 +229,7 @@ fn rejects_relocation_section_targeting_missing_section() {
     )
     .unwrap();
     let status = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-c", "input.c", "-o", "input.o"])
         .status()
         .unwrap();
@@ -236,7 +239,7 @@ fn rejects_relocation_section_targeting_missing_section() {
     mutant[rela + 44..rela + 48].copy_from_slice(&0xffff_fff0u32.to_le_bytes());
     fs::write(dir.join("mutant.o"), &mutant).unwrap();
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-Bdrv", "mutant.o", "-o", "output"])
         .output()
         .unwrap();
@@ -244,17 +247,17 @@ fn rejects_relocation_section_targeting_missing_section() {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("does not exist"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn rejects_relocation_offset_that_wraps() {
-    let dir = std::env::temp_dir().join(format!("weld-rela-wrap-{}", std::process::id()));
+    let guard = TempDir::new("weld-rela-wrap");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(dir.join("input.c"), "int main(void) { return 0; }").unwrap();
     let status = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-c", "input.c", "-o", "input.o"])
         .status()
         .unwrap();
@@ -267,7 +270,7 @@ fn rejects_relocation_offset_that_wraps() {
     mutant[rela_off..rela_off + 8].copy_from_slice(&u64::MAX.wrapping_sub(3).to_le_bytes());
     fs::write(dir.join("mutant.o"), &mutant).unwrap();
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-Bdrv", "-nostdlib", "-no-pie", "mutant.o", "-o", "output"])
         .output()
         .unwrap();
@@ -275,12 +278,12 @@ fn rejects_relocation_offset_that_wraps() {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("out of bounds"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn links_common_symbols_with_strong_override() {
-    let dir = std::env::temp_dir().join(format!("weld-common-{}", std::process::id()));
+    let guard = TempDir::new("weld-common");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -296,14 +299,14 @@ fn links_common_symbols_with_strong_override() {
     .unwrap();
     for source in ["a.c", "b.c"] {
         let status = Command::new("gcc")
-            .current_dir(&dir)
+            .current_dir(dir)
             .args(["-fcommon", "-c", source])
             .status()
             .unwrap();
         assert!(status.success());
     }
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args([
             "-Bdrv",
             "-nostdlib",
@@ -322,7 +325,6 @@ fn links_common_symbols_with_strong_override() {
         stderr.is_empty() || !stderr.contains("undefined"),
         "{stderr}"
     );
-    fs::remove_dir_all(dir).unwrap();
 }
 
 fn elf_section(bytes: &[u8], index: usize) -> (u32, u64, u64, u32) {
@@ -337,7 +339,8 @@ fn elf_section(bytes: &[u8], index: usize) -> (u32, u64, u64, u32) {
 
 #[test]
 fn rejects_imported_data_larger_than_cap() {
-    let dir = std::env::temp_dir().join(format!("weld-bigimport-{}", std::process::id()));
+    let guard = TempDir::new("weld-bigimport");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(dir.join("lib.c"), "int bigdata = 1;").unwrap();
@@ -347,7 +350,7 @@ fn rejects_imported_data_larger_than_cap() {
     )
     .unwrap();
     let status = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-shared", "-fPIC", "lib.c", "-o", "libbig.so"])
         .status()
         .unwrap();
@@ -368,7 +371,7 @@ fn rejects_imported_data_larger_than_cap() {
     lib[entry + 16..entry + 24].copy_from_slice(&(1u64 << 40).to_le_bytes());
     fs::write(dir.join("libbig.so"), &lib).unwrap();
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-Bdrv", "-no-pie", "main.c", "-L.", "-lbig", "-o", "output"])
         .output()
         .unwrap();
@@ -379,5 +382,4 @@ fn rejects_imported_data_larger_than_cap() {
         "{stderr}"
     );
     assert!(!stderr.contains("memory allocation"), "{stderr}");
-    fs::remove_dir_all(dir).unwrap();
 }

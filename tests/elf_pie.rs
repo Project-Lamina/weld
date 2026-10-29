@@ -1,5 +1,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
+mod common;
+use common::TempDir;
 use std::{fs, os::unix::fs::symlink, path::Path, process::Command};
 
 fn run(program: &str, args: &[&str], dir: &Path) -> String {
@@ -23,7 +25,8 @@ fn run(program: &str, args: &[&str], dir: &Path) -> String {
 
 #[test]
 fn default_gcc_pie_rebases_data_functions_and_got() {
-    let dir = std::env::temp_dir().join(format!("weld-pie-runtime-{}", std::process::id()));
+    let guard = TempDir::new("weld-pie-runtime");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("prefix")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
     fs::write(
@@ -47,32 +50,32 @@ int main(void) {
         run(
             "gcc",
             &["-Bprefix", flags, "main.c", "data.c", "-o", "output"],
-            &dir,
+            dir,
         );
         for _ in 0..3 {
-            assert_eq!(run("./output", &[], &dir), "42 7 45\n");
+            assert_eq!(run("./output", &[], dir), "42 7 45\n");
         }
-        let header = run("readelf", &["-hW", "output"], &dir);
+        let header = run("readelf", &["-hW", "output"], dir);
         assert!(header.contains("DYN (Position-Independent Executable file)"));
-        let tags = run("readelf", &["-dW", "output"], &dir);
+        let tags = run("readelf", &["-dW", "output"], dir);
         for tag in ["(RELA)", "(RELASZ)", "(RELAENT)", "(RELACOUNT)", "NOW PIE"] {
             assert!(tags.contains(tag), "missing {tag}: {tags}");
         }
-        let headers = run("readelf", &["-lW", "output"], &dir);
+        let headers = run("readelf", &["-lW", "output"], dir);
         assert!(
             headers
                 .lines()
                 .any(|line| line.contains("LOAD") && line.contains("0x0000000000000000"))
         );
-        assert!(run("readelf", &["-rW", "output"], &dir).contains("R_X86_64_RELATIVE"));
+        assert!(run("readelf", &["-rW", "output"], dir).contains("R_X86_64_RELATIVE"));
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn freestanding_pie_preserves_absolute_symbols() {
-    let dir = std::env::temp_dir().join(format!("weld-pie-absolute-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-pie-absolute");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(
         dir.join("input.s"),
         r#"
@@ -105,37 +108,37 @@ constant: .quad absolute
 "#,
     )
     .unwrap();
-    run("as", &["input.s", "-o", "input.o"], &dir);
+    run("as", &["input.s", "-o", "input.o"], dir);
     run(
         env!("CARGO_BIN_EXE_weld"),
         &["-pie", "input.o", "-o", "output"],
-        &dir,
+        dir,
     );
-    run("./output", &[], &dir);
-    let relocs = run("readelf", &["-rW", "output"], &dir);
+    run("./output", &[], dir);
+    let relocs = run("readelf", &["-rW", "output"], dir);
     assert_eq!(relocs.matches("R_X86_64_RELATIVE").count(), 2);
     fs::write(
         dir.join("bad.s"),
         ".text\n.globl _start\n_start: mov $value, %eax\n.data\nvalue: .quad 0\n",
     )
     .unwrap();
-    run("as", &["bad.s", "-o", "bad.o"], &dir);
+    run("as", &["bad.s", "-o", "bad.o"], dir);
     let rejected = Command::new(env!("CARGO_BIN_EXE_weld"))
         .args(["-pie", "bad.o", "-o", "bad"])
-        .current_dir(&dir)
+        .current_dir(dir)
         .output()
         .unwrap();
     assert!(!rejected.status.success());
     assert!(
         String::from_utf8_lossy(&rejected.stderr).contains("requires position independent input")
     );
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn cross_architecture_pie_emits_relative_relocations() {
-    let dir = std::env::temp_dir().join(format!("weld-pie-cross-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-pie-cross");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     for (target, instruction, relocation, interpreter) in [
         (
             "aarch64-linux-gnu",
@@ -154,16 +157,16 @@ fn cross_architecture_pie_emits_relative_relocations() {
         run(
             "clang",
             &["-target", target, "-c", "input.s", "-o", "input.o"],
-            &dir,
+            dir,
         );
         run(
             env!("CARGO_BIN_EXE_weld"),
             &["--pie", "input.o", "-o", "output"],
-            &dir,
+            dir,
         );
-        let relocs = run("readelf", &["-rW", "output"], &dir);
+        let relocs = run("readelf", &["-rW", "output"], dir);
         assert_eq!(relocs.matches(relocation).count(), 1, "{relocs}");
-        let symbols = run("nm", &["output"], &dir);
+        let symbols = run("nm", &["output"], dir);
         let value = symbols
             .lines()
             .find_map(|line| {
@@ -180,12 +183,11 @@ fn cross_architecture_pie_emits_relative_relocations() {
             .last()
             .unwrap();
         assert_eq!(u64::from_str_radix(addend, 16).unwrap(), value + 8);
-        assert!(run("readelf", &["-dW", "output"], &dir).contains("PIE"));
-        assert!(run("readelf", &["-lW", "output"], &dir).contains(interpreter));
+        assert!(run("readelf", &["-dW", "output"], dir).contains("PIE"));
+        assert!(run("readelf", &["-lW", "output"], dir).contains(interpreter));
         assert!(
-            run("readelf", &["-hW", "output"], &dir)
+            run("readelf", &["-hW", "output"], dir)
                 .contains("DYN (Position-Independent Executable file)")
         );
     }
-    fs::remove_dir_all(dir).unwrap();
 }

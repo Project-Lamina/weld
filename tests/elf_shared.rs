@@ -1,5 +1,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
+mod common;
+use common::TempDir;
 use std::{fs, os::unix::fs::symlink, path::Path, process::Command};
 
 fn run(program: &str, args: &[&str], dir: &Path) -> String {
@@ -18,7 +20,8 @@ fn run(program: &str, args: &[&str], dir: &Path) -> String {
 
 #[test]
 fn gcc_shared_object_loads_with_dlopen() {
-    let dir = std::env::temp_dir().join(format!("weld-shared-{}", std::process::id()));
+    let guard = TempDir::new("weld-shared");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("prefix")).unwrap();
     symlink(env!("CARGO_BIN_EXE_weld"), dir.join("prefix/ld")).unwrap();
     fs::write(
@@ -57,36 +60,37 @@ int main(void) {
             "-o",
             "libweldshared.so",
         ],
-        &dir,
+        dir,
     );
-    let header = run("readelf", &["-hW", "libweldshared.so"], &dir);
+    let header = run("readelf", &["-hW", "libweldshared.so"], dir);
     assert!(header.contains("DYN (Shared object file)"), "{header}");
-    let tags = run("readelf", &["-dW", "libweldshared.so"], &dir);
+    let tags = run("readelf", &["-dW", "libweldshared.so"], dir);
     assert!(
         tags.contains("(SONAME)") && tags.contains("libweldshared.so"),
         "{tags}"
     );
-    let symbols = run("readelf", &["--dyn-syms", "-W", "libweldshared.so"], &dir);
+    let symbols = run("readelf", &["--dyn-syms", "-W", "libweldshared.so"], dir);
     assert!(symbols.contains("shared_add"), "{symbols}");
-    run("gcc", &["main.c", "-o", "main", "-ldl"], &dir);
-    assert_eq!(run("./main", &[], &dir), "6 42 weld\nprint:x\n");
+    run("gcc", &["main.c", "-o", "main", "-ldl"], dir);
+    assert_eq!(run("./main", &[], dir), "6 42 weld\nprint:x\n");
 }
 
 #[test]
 fn shared_rejects_non_x86_64_targets() {
-    let dir = std::env::temp_dir().join(format!("weld-shared-arch-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let guard = TempDir::new("weld-shared-arch");
+    let dir = guard.path();
+    fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("f.s"), "    .text\n    .globl f\nf:\n    ret\n").unwrap();
     let assembled = Command::new("ras")
         .args(["--target", "aarch64_linux", "-o", "f.o", "f.s"])
-        .current_dir(&dir)
+        .current_dir(dir)
         .status();
     if !matches!(assembled, Ok(status) if status.success()) {
         return;
     }
     let output = Command::new(env!("CARGO_BIN_EXE_weld"))
         .args(["-shared", "-o", "libf.so", "f.o"])
-        .current_dir(&dir)
+        .current_dir(dir)
         .output()
         .unwrap();
     assert!(!output.status.success());

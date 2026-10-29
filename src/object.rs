@@ -909,6 +909,7 @@ mod tests {
 #[cfg(test)]
 mod archive_selection_tests {
     use super::*;
+    use crate::test_support::TempDir;
     use std::process::Command;
 
     fn assemble(dir: &std::path::Path, name: &str, src: &str) -> Option<PathBuf> {
@@ -926,8 +927,9 @@ mod archive_selection_tests {
 
     #[test]
     fn indexed_selection_matches_eager_order_and_leaves_unused_members_unparsed() {
-        let dir = std::env::temp_dir().join(format!("weld-index-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = TempDir::new("weld-index-test");
+        let dir = guard.path();
+        std::fs::create_dir_all(dir).unwrap();
         let sources = [
             ("early", ".globl choice\nchoice:\n ret\n"),
             ("unused", ".globl unused\nunused:\n ret\n"),
@@ -937,7 +939,7 @@ mod archive_selection_tests {
         ];
         let Some(paths) = sources
             .iter()
-            .map(|(name, src)| assemble(&dir, name, src))
+            .map(|(name, src)| assemble(dir, name, src))
             .collect::<Option<Vec<_>>>()
         else {
             return;
@@ -1007,18 +1009,18 @@ mod archive_selection_tests {
         assert!(fallback.index.is_none());
         assert!(fallback.members.iter().all(|entry| entry.symbols.is_some()));
         assert_eq!(objects, select(&mut fallback));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn pulls_only_members_reachable_from_undefined_symbols() {
-        let dir = std::env::temp_dir().join(format!("weld-archive-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = TempDir::new("weld-archive-test");
+        let dir = guard.path();
+        std::fs::create_dir_all(dir).unwrap();
         let (Some(main), Some(a), Some(b), Some(c)) = (
-            assemble(&dir, "main", ".globl _start\n_start:\n call dep_fn\n ret\n"),
-            assemble(&dir, "used", ".globl used_fn\nused_fn:\n ret\n"),
-            assemble(&dir, "unused", ".globl unused_fn\nunused_fn:\n ret\n"),
-            assemble(&dir, "dep", ".globl dep_fn\ndep_fn:\n call used_fn\n ret\n"),
+            assemble(dir, "main", ".globl _start\n_start:\n call dep_fn\n ret\n"),
+            assemble(dir, "used", ".globl used_fn\nused_fn:\n ret\n"),
+            assemble(dir, "unused", ".globl unused_fn\nunused_fn:\n ret\n"),
+            assemble(dir, "dep", ".globl dep_fn\ndep_fn:\n call used_fn\n ret\n"),
         ) else {
             return;
         };

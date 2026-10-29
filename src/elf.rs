@@ -491,6 +491,7 @@ pub fn parse_elf64_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     #[test]
     fn test_parse_elf_header() {
@@ -561,7 +562,8 @@ mod tests {
         data[60..62].copy_from_slice(&1u16.to_le_bytes());
         data[64 + 4..64 + 8].copy_from_slice(&11u32.to_le_bytes());
         data[64 + 32..64 + 40].copy_from_slice(&(1u64 << 40).to_le_bytes());
-        let path = std::env::temp_dir().join(format!("weld-dyn-table-{}.so", std::process::id()));
+        let tmp = TempDir::new("weld-dyn-table");
+        let path = tmp.path().join("table.so");
         std::fs::write(&path, &data).unwrap();
         let result = read_dynamic_tables(&path);
         std::fs::remove_file(&path).unwrap();

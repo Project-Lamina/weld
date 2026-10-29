@@ -1,5 +1,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
+mod common;
+use common::TempDir;
 use std::{fs, path::Path, process::Command};
 
 fn run(program: &str, args: &[&str], dir: &Path) -> String {
@@ -33,8 +35,9 @@ fn pt_tls(dir: &Path, output: &str) -> Vec<u64> {
         .collect()
 }
 
-fn link_both(name: &str, sources: &[&str], cflags: &[&str]) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("weld-tls-{name}-{}", std::process::id()));
+fn link_both(name: &str, sources: &[&str], cflags: &[&str]) -> TempDir {
+    let guard = TempDir::new(&format!("weld-tls-{name}"));
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     let mut objects = Vec::new();
@@ -44,24 +47,25 @@ fn link_both(name: &str, sources: &[&str], cflags: &[&str]) -> std::path::PathBu
         let object = format!("unit{i}.o");
         let mut args = cflags.to_vec();
         args.extend(["-c", &file, "-o", &object]);
-        run("gcc", &args, &dir);
+        run("gcc", &args, dir);
         objects.push(object);
     }
     let mut ld_args = vec!["-no-pie"];
     ld_args.extend(objects.iter().map(String::as_str));
     ld_args.extend(["-o", "reference"]);
-    run("gcc", &ld_args, &dir);
+    run("gcc", &ld_args, dir);
     let mut weld_args = vec!["-no-pie", "-B", "drv/"];
     weld_args.extend(objects.iter().map(String::as_str));
     weld_args.extend(["-o", "weld"]);
-    run("gcc", &weld_args, &dir);
-    dir
+    run("gcc", &weld_args, dir);
+    guard
 }
 
 fn link_and_compare(name: &str, sources: &[&str]) {
-    let dir = link_both(name, sources, &["-fno-pic"]);
-    let weld = pt_tls(&dir, "weld");
-    let reference = pt_tls(&dir, "reference");
+    let guard = link_both(name, sources, &["-fno-pic"]);
+    let dir = guard.path();
+    let weld = pt_tls(dir, "weld");
+    let reference = pt_tls(dir, "reference");
     assert_eq!(
         weld[0] % weld[3],
         0,
@@ -72,14 +76,13 @@ fn link_and_compare(name: &str, sources: &[&str]) {
         reference[1..],
         "PT_TLS (filesz, memsz, align) for {name}"
     );
-    fs::remove_dir_all(dir).unwrap();
 }
 
 fn compare_program_output(name: &str, sources: &[&str], cflags: &[&str]) -> String {
-    let dir = link_both(name, sources, cflags);
-    let expected = run("./reference", &[], &dir);
-    assert_eq!(run("./weld", &[], &dir), expected, "{name} output");
-    fs::remove_dir_all(dir).unwrap();
+    let guard = link_both(name, sources, cflags);
+    let dir = guard.path();
+    let expected = run("./reference", &[], dir);
+    assert_eq!(run("./weld", &[], dir), expected, "{name} output");
     expected
 }
 
@@ -158,7 +161,8 @@ fn local_exec_offsets_hold_across_object_files_with_ld() {
 
 #[test]
 fn static_link_without_libc_keeps_pt_tls_for_local_exec_thread_locals() {
-    let dir = std::env::temp_dir().join(format!("weld-tls-static-{}", std::process::id()));
+    let guard = TempDir::new("weld-tls-static");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -166,21 +170,20 @@ fn static_link_without_libc_keeps_pt_tls_for_local_exec_thread_locals() {
         "__thread int value = 5; __thread long wide[3]; void _start(void) { value += (int)wide[0]; }",
     )
     .unwrap();
-    run("gcc", &["-fno-pic", "-c", "main.c", "-o", "main.o"], &dir);
+    run("gcc", &["-fno-pic", "-c", "main.c", "-o", "main.o"], dir);
     run(
         "gcc",
         &["-static", "-nostdlib", "-B", "drv/", "main.o", "-o", "weld"],
-        &dir,
+        dir,
     );
     run(
         "gcc",
         &["-static", "-nostdlib", "main.o", "-o", "reference"],
-        &dir,
+        dir,
     );
-    let weld = pt_tls(&dir, "weld");
-    let reference = pt_tls(&dir, "reference");
+    let weld = pt_tls(dir, "weld");
+    let reference = pt_tls(dir, "reference");
     assert_eq!(weld[1..], reference[1..]);
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -196,7 +199,8 @@ fn initial_exec_offsets_match_ld_across_object_files() {
 
 #[test]
 fn initial_exec_offsets_survive_pie_output() {
-    let dir = std::env::temp_dir().join(format!("weld-tls-pie-{}", std::process::id()));
+    let guard = TempDir::new("weld-tls-pie");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(dir.join("unit.c"), format!("{DEFINITIONS}\n{PROBE_MAIN}")).unwrap();
@@ -210,16 +214,16 @@ fn initial_exec_offsets_survive_pie_output() {
             "-o",
             "unit.o",
         ],
-        &dir,
+        dir,
     );
-    run("gcc", &["-pie", "-B", "drv/", "unit.o", "-o", "weld"], &dir);
-    assert_eq!(run("./weld", &[], &dir), "-96 -64 -32 -92 2 9 6 120\n");
-    fs::remove_dir_all(dir).unwrap();
+    run("gcc", &["-pie", "-B", "drv/", "unit.o", "-o", "weld"], dir);
+    assert_eq!(run("./weld", &[], dir), "-96 -64 -32 -92 2 9 6 120\n");
 }
 
 #[test]
 fn initial_exec_rejects_thread_local_from_shared_library() {
-    let dir = std::env::temp_dir().join(format!("weld-tls-shared-{}", std::process::id()));
+    let guard = TempDir::new("weld-tls-shared");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -237,10 +241,10 @@ fn initial_exec_rejects_thread_local_from_shared_library() {
             "-o",
             "unit.o",
         ],
-        &dir,
+        dir,
     );
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-B", "drv/", "unit.o", "-o", "weld"])
         .output()
         .unwrap();
@@ -250,7 +254,6 @@ fn initial_exec_rejects_thread_local_from_shared_library() {
         stderr.contains("thread-locals from shared libraries are not supported"),
         "{stderr}"
     );
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -265,25 +268,26 @@ fn global_dynamic_calls_relax_to_local_exec_like_ld() {
 
 #[test]
 fn global_dynamic_relaxation_is_correct_in_pie() {
-    let dir = std::env::temp_dir().join(format!("weld-tls-gd-pie-{}", std::process::id()));
+    let guard = TempDir::new("weld-tls-gd-pie");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(dir.join("defs.c"), DEFINITIONS).unwrap();
     fs::write(dir.join("probe.c"), format!("{DECLARATIONS}\n{PROBE_MAIN}")).unwrap();
-    run("gcc", &["-fPIC", "-c", "defs.c", "-o", "defs.o"], &dir);
-    run("gcc", &["-fPIC", "-c", "probe.c", "-o", "probe.o"], &dir);
+    run("gcc", &["-fPIC", "-c", "defs.c", "-o", "defs.o"], dir);
+    run("gcc", &["-fPIC", "-c", "probe.c", "-o", "probe.o"], dir);
     run(
         "gcc",
         &["-pie", "-B", "drv/", "defs.o", "probe.o", "-o", "weld"],
-        &dir,
+        dir,
     );
-    assert_eq!(run("./weld", &[], &dir), "-96 -64 -32 -92 2 9 6 120\n");
-    fs::remove_dir_all(dir).unwrap();
+    assert_eq!(run("./weld", &[], dir), "-96 -64 -32 -92 2 9 6 120\n");
 }
 
 #[test]
 fn local_exec_rejects_undefined_weak_thread_local() {
-    let dir = std::env::temp_dir().join(format!("weld-tls-weak-{}", std::process::id()));
+    let guard = TempDir::new("weld-tls-weak");
+    let dir = guard.path();
     fs::create_dir_all(dir.join("drv")).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_weld"), dir.join("drv/ld")).unwrap();
     fs::write(
@@ -291,9 +295,9 @@ fn local_exec_rejects_undefined_weak_thread_local() {
         "extern __thread int weak_value __attribute__((weak)); int main(void) { return &weak_value != 0; }",
     )
     .unwrap();
-    run("gcc", &["-fno-pic", "-c", "unit.c", "-o", "unit.o"], &dir);
+    run("gcc", &["-fno-pic", "-c", "unit.c", "-o", "unit.o"], dir);
     let output = Command::new("gcc")
-        .current_dir(&dir)
+        .current_dir(dir)
         .args(["-no-pie", "-B", "drv/", "unit.o", "-o", "weld"])
         .output()
         .unwrap();
@@ -303,5 +307,4 @@ fn local_exec_rejects_undefined_weak_thread_local() {
         stderr.contains("thread-local symbol weak_value is not defined by the inputs"),
         "{stderr}"
     );
-    fs::remove_dir_all(dir).unwrap();
 }

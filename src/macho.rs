@@ -422,8 +422,9 @@ mod tests {
         if !main_add_c.exists() {
             return;
         }
-        let tmp = std::env::temp_dir();
-        let obj = tmp.join("weld_parse_symbol_test.o");
+        use crate::test_support::TempDir;
+        let tmp = TempDir::new("weld_parse_symbol_test");
+        let obj = tmp.path().join("weld_parse_symbol_test.o");
         let cc = Command::new("clang")
             .args(["-c", "-o"])
             .arg(&obj)
