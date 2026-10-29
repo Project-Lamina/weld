@@ -307,9 +307,6 @@ fn link_multi_object_parsed(
     timer.mark("resolve symbols");
     let mut dynamic_info: Option<DynamicLinkInfo> = None;
 
-    // Resolve library names to sonames.  Any lib matching "c" or "System"
-    // (legacy names) as well as any library the resolver can locate as a
-    // shared object triggers PLT generation.
     let mut resolver = LibraryResolver::new(arch, TargetPlatform::current());
     for path in opts.search_paths.iter().rev() {
         resolver.add_path(path.clone());
@@ -550,9 +547,6 @@ fn link_multi_object_parsed(
         }
     }
 
-    // Pre-scan all objects to find referenced symbol names, assign a GOT slot per
-    // unique name, then fill each slot once global_symbols is final (PLT entries
-    // included). For external symbols without a definition, the slot stays 0.
     timer.mark("dynamic sections");
     let mut got_symbol_map: HashMap<String, u64> = HashMap::default();
     let mut tls_got_names: HashSet<String> = HashSet::default();
@@ -779,7 +773,6 @@ fn link_multi_object_parsed(
         }
     }
 
-    // Local symbols and PLT stubs for external functions get their resolved addresses here.
     let tls = tls_segment(&layout)?;
     if let Some(&got_idx) = layout.section_by_name.get(".got") {
         let got_base = layout.sections[got_idx].vaddr;
@@ -1248,14 +1241,8 @@ mod tests {
         let result = link_multi_object(&objects, None).expect("link_multi_object");
         assert!(!result.layout.sections.is_empty());
         assert!(result.layout.section_by_name.contains_key(".text"));
-        let text_idx = result
-            .layout
-            .section_by_name
-            .get(".text")
-            .copied()
-            .unwrap_or(0);
-        let text = &result.layout.sections[text_idx];
-        assert!(text.data.len() >= 2);
+        assert!(result.symbol_addrs.contains_key("main"));
+        assert!(result.symbol_addrs.contains_key("foo"));
     }
 
     #[test]

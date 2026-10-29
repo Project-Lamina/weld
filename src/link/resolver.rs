@@ -178,8 +178,8 @@ impl LibraryResolver {
         }
     }
 
+    /// Each candidate is `(filename_to_probe, soname_for_DT_NEEDED, is_static)`.
     fn candidates(&self, lib_name: &str) -> Vec<(String, String, bool)> {
-        // (filename_to_probe, soname_for_DT_NEEDED, is_static)
         match self.platform {
             TargetPlatform::Linux => {
                 let mut v: Vec<(String, String, bool)> = Vec::new();
@@ -261,7 +261,6 @@ fn default_search_paths(arch: TargetArch, platform: TargetPlatform) -> Vec<PathB
 fn linux_search_paths(arch: TargetArch) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
 
-    // Architecture-specific multilib paths (checked first).
     let multilib = match arch {
         TargetArch::X86_64 => vec![
             "/lib/x86_64-linux-gnu",

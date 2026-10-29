@@ -106,7 +106,6 @@ pub fn apply_relocations(
             let p = place as i64;
             let base = layout.sections[merged_idx].vaddr as i64;
 
-            // Resolve symbol address (may be None for undefined externals).
             let sym_addr: Option<i64> = symbol_addrs
                 .get(rel.r_sym as usize)
                 .and_then(|o| *o)
@@ -121,7 +120,6 @@ pub fn apply_relocations(
             match rel.r_type {
                 reloc_type::R_RISCV_NONE => {}
 
-                // Absolute 32-bit: *(u32*)P = S + A
                 reloc_type::R_RISCV_32 => {
                     let s = require_sym(sym_addr)?;
                     let val = s.wrapping_add(a) as u32;
@@ -132,7 +130,6 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off, val);
                 }
 
-                // Absolute 64-bit: *(u64*)P = S + A
                 reloc_type::R_RISCV_64 => {
                     let s = require_sym(sym_addr)?;
                     let val = s.wrapping_add(a) as u64;
@@ -143,7 +140,6 @@ pub fn apply_relocations(
                     write_u64_le(&mut merged.data, off, val);
                 }
 
-                // Dynamic: *(u64*)P = B + A
                 reloc_type::R_RISCV_RELATIVE => {
                     let val = base.wrapping_add(a) as u64;
                     let merged = &mut layout.sections[merged_idx];
@@ -153,7 +149,6 @@ pub fn apply_relocations(
                     write_u64_le(&mut merged.data, off, val);
                 }
 
-                // B-type branch: patch offset = (S+A-P) into B-type immediate.
                 reloc_type::R_RISCV_BRANCH => {
                     let s = require_sym(sym_addr)?;
                     let offset = s.wrapping_add(a).wrapping_sub(p) as i32;
@@ -165,7 +160,6 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off, patch_b_type(instr, offset));
                 }
 
-                // J-type JAL: patch offset = (S+A-P).
                 reloc_type::R_RISCV_JAL => {
                     let s = require_sym(sym_addr)?;
                     let offset = s.wrapping_add(a).wrapping_sub(p) as i32;
@@ -177,8 +171,6 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off, patch_j_type(instr, offset));
                 }
 
-                // CALL / CALL_PLT: AUIPC+JALR pair (8 bytes).
-                // The AUIPC gets the hi20 of (S+A-P), JALR gets the lo12.
                 reloc_type::R_RISCV_CALL | reloc_type::R_RISCV_CALL_PLT => {
                     let s = require_sym(sym_addr)?;
                     let diff = s.wrapping_add(a).wrapping_sub(p);
@@ -194,7 +186,6 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off + 4, patch_i_imm12(jalr, lo12));
                 }
 
-                // PCREL_HI20: AUIPC — store hi20 in cache keyed by PC for the LO12 below.
                 reloc_type::R_RISCV_PCREL_HI20 => {
                     let s = require_sym(sym_addr)?;
                     let diff = s.wrapping_add(a).wrapping_sub(p);
@@ -208,8 +199,6 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off, patch_u_imm20(instr, hi20));
                 }
 
-                // PCREL_LO12_I: I-type load/JALR — lo12 of the paired AUIPC.
-                // The symbol for this reloc points to the AUIPC instruction itself.
                 reloc_type::R_RISCV_PCREL_LO12_I => {
                     let auipc_pc = require_sym(sym_addr)? as u64;
                     let diff = hi20_cache.get(&auipc_pc).copied().ok_or_else(|| {
@@ -231,7 +220,6 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off, patch_i_imm12(instr, lo12));
                 }
 
-                // PCREL_LO12_S: S-type store — lo12 of the paired AUIPC.
                 reloc_type::R_RISCV_PCREL_LO12_S => {
                     let auipc_pc = require_sym(sym_addr)? as u64;
                     let diff = hi20_cache.get(&auipc_pc).copied().ok_or_else(|| {
@@ -253,7 +241,6 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off, patch_s_imm12(instr, lo12));
                 }
 
-                // Absolute HI20: LUI — upper 20 bits of (S+A).
                 reloc_type::R_RISCV_HI20 => {
                     let s = require_sym(sym_addr)?;
                     let val = s.wrapping_add(a);
@@ -266,7 +253,6 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off, patch_u_imm20(instr, hi20));
                 }
 
-                // Absolute LO12_I: I-type — lower 12 bits of (S+A).
                 reloc_type::R_RISCV_LO12_I => {
                     let s = require_sym(sym_addr)?;
                     let val = s.wrapping_add(a);
@@ -280,7 +266,6 @@ pub fn apply_relocations(
                     write_u32_le(&mut merged.data, off, patch_i_imm12(instr, lo12));
                 }
 
-                // Absolute LO12_S: S-type — lower 12 bits of (S+A).
                 reloc_type::R_RISCV_LO12_S => {
                     let s = require_sym(sym_addr)?;
                     let val = s.wrapping_add(a);

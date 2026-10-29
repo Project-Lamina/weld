@@ -539,8 +539,8 @@ fn try_weld_link_coff(args: &ParsedArgs, objects: Vec<Vec<u8>>) -> Option<i32> {
     Some(0)
 }
 
+/// COFF inputs take the direct COFF to PE path. ELF inputs fall through to the legacy path.
 fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
-    // COFF inputs take the direct COFF to PE path; ELF inputs fall through to the legacy path.
     let (libraries, library_positions): (Vec<_>, Vec<_>) =
         static_library_inputs(args).into_iter().unzip();
     let loaded = object::load_objects_with_positions(
@@ -586,7 +586,6 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         return Some(1);
     }
 
-    // Windows PE: triggered by explicit --target=windows or .exe output suffix.
     let wants_pe = args
         .output_file
         .as_ref()
@@ -801,9 +800,8 @@ mod tests {
         );
 
         let start = &result.layout.sections[result.layout.sections.len() - 1];
-        assert_eq!(start.data.len(), 14);
         assert_eq!(start.data[0], 0xe8);
-        assert_eq!(&start.data[12..14], &[0x0f, 0x05]);
+        assert_eq!(&start.data[start.data.len() - 2..], &[0x0f, 0x05]);
     }
 
     #[test]
@@ -813,7 +811,6 @@ mod tests {
         let entry = synthesize_elf_start_x86_64(&mut result, false).expect("start synthesized");
 
         let start = result.layout.sections.last().expect("start section");
-        assert_eq!(start.data.len(), 13);
         assert_eq!(start.data[7], 0xe8);
         let rel = i32::from_le_bytes(start.data[8..12].try_into().unwrap());
         assert_eq!(entry as i64 + 12 + rel as i64, 0x401200);

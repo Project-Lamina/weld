@@ -75,7 +75,6 @@ fn build_import_section(
     let num_dlls = entries.len();
     let idt_size = (num_dlls + 1) * 20;
 
-    // Compute per-DLL ILT offsets (each ILT immediately follows the IDT).
     let mut ilt_offsets: Vec<usize> = Vec::with_capacity(num_dlls);
     let mut ilt_total_size = 0usize;
     for e in entries {
@@ -99,7 +98,6 @@ fn build_import_section(
         for (_, name) in &e.symbols {
             sym_offs.push(hint_name_cursor);
             hint_name_cursor += 2 + name.len() + 1; // hint(u16) + name + NUL
-            // DWORD-align each IMAGE_IMPORT_BY_NAME
             hint_name_cursor = align_up_usize(hint_name_cursor, 2);
         }
         hint_name_offsets.push(sym_offs);
@@ -297,7 +295,6 @@ pub fn emit_pe_executable(
     let mut dos = [0u8; SIZEOF_DOS_STUB];
     dos[0] = 0x4D;
     dos[1] = 0x5A;
-    // Minimum DOS stub: set e_lfanew at offset 0x3C
     let e_lfanew = SIZEOF_DOS_STUB as u32;
     dos[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
     out.write_all(&dos)?;
