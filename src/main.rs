@@ -248,10 +248,63 @@ fn synthesize_elf_start_aarch64(result: &mut LinkResult) -> Option<u64> {
     Some(start)
 }
 
+/// Write a freestanding `_start` for PowerPC64 ELFv2 into the reserved section:
+/// set r2 to `.TOC.`, load main's global entry into r12, call it, then call
+/// `exit` (r3 still holds main's result) or issue the exit syscall.
+fn synthesize_elf_start_ppc64(result: &mut LinkResult) -> Option<u64> {
+    let main_addr = result
+        .symbol_addrs
+        .get("main")
+        .or_else(|| result.symbol_addrs.get("_main"))
+        .copied()?;
+    let toc = result.symbol_addrs.get(".TOC.").copied()?;
+    let index = result
+        .layout
+        .section_by_name
+        .get(".text.__weld_start")
+        .copied()?;
+    let start = result.layout.sections[index].vaddr;
+    let exit_addr = result.symbol_addrs.get("exit").copied();
+
+    let ha = |v: u64| ((v + 0x8000) >> 16) & 0xFFFF;
+    let lo = |v: u64| v & 0xFFFF;
+    let dform = |opcode: u32, rt: u32, ra: u32, si: u64| {
+        (opcode << 26) | (rt << 21) | (ra << 16) | (si as u32 & 0xFFFF)
+    };
+    let bl = |at: u64, target: u64| -> Option<u32> {
+        let disp = target as i64 - at as i64;
+        if disp & 3 != 0 || !(-(1 << 25)..(1 << 25)).contains(&disp) {
+            return None;
+        }
+        Some(0x4800_0001 | (disp as u32 & 0x03FF_FFFC))
+    };
+
+    let mut words = vec![
+        dform(15, 2, 0, ha(toc)),
+        dform(14, 2, 2, lo(toc)),
+        dform(15, 12, 0, ha(main_addr)),
+        dform(14, 12, 12, lo(main_addr)),
+    ];
+    words.push(bl(start + 4 * words.len() as u64, main_addr)?);
+    match exit_addr {
+        Some(addr) => {
+            words.push(dform(15, 12, 0, ha(addr)));
+            words.push(dform(14, 12, 12, lo(addr)));
+            words.push(bl(start + 4 * words.len() as u64, addr)?);
+        }
+        None => words.extend([dform(14, 0, 0, 1), 0x4400_0002]),
+    }
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let data = &mut result.layout.sections[index].data;
+    data.get_mut(..code.len())?.copy_from_slice(&code);
+    Some(start)
+}
+
 fn synthesize_elf_start(result: &mut LinkResult, freebsd_abi: bool) -> Option<u64> {
     match TargetArch::from_elf_machine(result.e_machine)? {
         TargetArch::X86_64 => synthesize_elf_start_x86_64(result, freebsd_abi),
         TargetArch::AArch64 => synthesize_elf_start_aarch64(result),
+        TargetArch::PowerPc64 => synthesize_elf_start_ppc64(result),
         TargetArch::RiscV => None,
     }
 }

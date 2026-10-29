@@ -224,6 +224,7 @@ fn emit_image(
         .to_le_bytes(),
     );
     ehdr[18..20].copy_from_slice(&arch.to_elf_machine().to_le_bytes());
+    ehdr[48..52].copy_from_slice(&arch.elf_flags().to_le_bytes());
     ehdr[20..24].copy_from_slice(&EV_CURRENT_U32.to_le_bytes());
     ehdr[24..32].copy_from_slice(&entry.to_le_bytes());
     ehdr[32..40].copy_from_slice(&64u64.to_le_bytes());

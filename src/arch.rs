@@ -6,6 +6,7 @@ pub enum TargetArch {
     X86_64,
     AArch64,
     RiscV,
+    PowerPc64,
 }
 
 impl TargetArch {
@@ -15,6 +16,7 @@ impl TargetArch {
             62 => Some(Self::X86_64),
             183 => Some(Self::AArch64),
             243 => Some(Self::RiscV),
+            21 => Some(Self::PowerPc64),
             _ => None,
         }
     }
@@ -25,6 +27,7 @@ impl TargetArch {
             "elf_x86_64" | "elf_x86_64_fbsd" => Some(Self::X86_64),
             "aarch64linux" | "aarch64elf" | "aarch64_elf" => Some(Self::AArch64),
             "elf64lriscv" | "elf32lriscv" => Some(Self::RiscV),
+            "elf64lppc" => Some(Self::PowerPc64),
             _ => None,
         }
     }
@@ -35,6 +38,7 @@ impl TargetArch {
             Self::X86_64 => 62,
             Self::AArch64 => 183,
             Self::RiscV => 243,
+            Self::PowerPc64 => 21,
         }
     }
 
@@ -44,6 +48,15 @@ impl TargetArch {
             Self::X86_64 => 0x400000,
             Self::AArch64 => 0x400000,
             Self::RiscV => 0x10000,
+            Self::PowerPc64 => 0x10000000,
+        }
+    }
+
+    /// ELF `e_flags`: ELFv2 for PowerPC64, zero elsewhere.
+    pub fn elf_flags(self) -> u32 {
+        match self {
+            Self::PowerPc64 => 2,
+            _ => 0,
         }
     }
 
@@ -57,7 +70,7 @@ impl TargetArch {
         match self {
             Self::X86_64 => 0x01000007,
             Self::AArch64 => 0x0100000C,
-            Self::RiscV => 0,
+            Self::RiscV | Self::PowerPc64 => 0,
         }
     }
 
@@ -80,6 +93,10 @@ mod tests {
         assert_eq!(TargetArch::from_elf_machine(62), Some(TargetArch::X86_64));
         assert_eq!(TargetArch::from_elf_machine(183), Some(TargetArch::AArch64));
         assert_eq!(TargetArch::from_elf_machine(243), Some(TargetArch::RiscV));
+        assert_eq!(
+            TargetArch::from_elf_machine(21),
+            Some(TargetArch::PowerPc64)
+        );
         assert_eq!(TargetArch::from_elf_machine(0), None);
     }
 
@@ -87,5 +104,6 @@ mod tests {
     fn test_arch_to_elf_machine() {
         assert_eq!(TargetArch::X86_64.to_elf_machine(), 62);
         assert_eq!(TargetArch::AArch64.to_elf_machine(), 183);
+        assert_eq!(TargetArch::PowerPc64.to_elf_machine(), 21);
     }
 }
