@@ -19,7 +19,6 @@ use std::path::PathBuf;
 /// stubs, stub helper, and GOT slots.
 type StubTriple = (Vec<u8>, Vec<u8>, Vec<u8>);
 
-const PAGE_SIZE: u64 = 4096;
 const SEG_BASE: u64 = 0x100000000;
 const VM_ADDR_BIAS: u64 = 0x4000;
 const SECTION_TYPE_MASK: u32 = 0x0000_00ff;

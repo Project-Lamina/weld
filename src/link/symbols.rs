@@ -4,13 +4,13 @@ use std::borrow::Cow;
 
 use super::{
     MergedLayout, ObjectSectionContrib, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_SYMTAB, STB_LOCAL,
-    STB_WEAK, merge_sections_single_object,
+    STB_WEAK,
 };
 use crate::{
     collections::{HashMap, HashSet},
     elf::{
-        SectionHeader, Symbol, get_strtab_from_section, get_strtab_string, parse_elf64_slice,
-        parse_rela_section, parse_symtab,
+        SectionHeader, Symbol, get_strtab_from_section, get_strtab_string, parse_rela_section,
+        parse_symtab,
     },
 };
 
@@ -22,8 +22,6 @@ pub(super) type ResolvedSymbols = (HashMap<String, ResolvedSymbol>, Vec<Option<u
 #[derive(Debug, Clone)]
 pub struct ResolvedSymbol {
     pub address: Option<u64>,
-    pub size: u64,
-    pub is_defined: bool,
     pub is_weak: bool,
 }
 #[derive(Debug, Clone)]
@@ -128,28 +126,26 @@ where
         let name = get_strtab_string(strtab, sym.name_offset)
             .unwrap_or_else(|| format!("<sym_{}>", sym.name_offset));
 
-        let (address, is_defined) = match sym.st_shndx {
-            SHN_UNDEF => (None, false),
-            SHN_ABS => (Some(sym.st_value), true),
+        let address = match sym.st_shndx {
+            SHN_UNDEF => None,
+            SHN_ABS => Some(sym.st_value),
             SHN_COMMON => {
                 let bss = layout
                     .section_by_name
                     .get(".bss")
                     .map(|&i| &layout.sections[i]);
                 match (bss, commons.get(&name)) {
-                    (Some(bss), Some(&offset)) => (Some(bss.vaddr + offset), true),
-                    _ => (None, false),
+                    (Some(bss), Some(&offset)) => Some(bss.vaddr + offset),
+                    _ => None,
                 }
             }
             shndx => {
                 let section_name = names.get(shndx as usize).map(String::as_str).unwrap_or("");
-                if let Some(&merged_idx) = layout.section_by_name.get(section_name) {
+                layout.section_by_name.get(section_name).map(|&merged_idx| {
                     let merged = &layout.sections[merged_idx];
                     let base_offset = section_offset(section_name).unwrap_or(0);
-                    (Some(merged.vaddr + base_offset + sym.st_value), true)
-                } else {
-                    (None, false)
-                }
+                    merged.vaddr + base_offset + sym.st_value
+                })
             }
         };
 
@@ -166,8 +162,6 @@ where
                 name,
                 ResolvedSymbol {
                     address,
-                    size: sym.st_size,
-                    is_defined,
                     is_weak: sym.bind == STB_WEAK || sym.st_shndx == SHN_COMMON,
                 },
             );
@@ -255,16 +249,6 @@ fn strtab_str(strtab: &[u8], offset: u32) -> Option<&str> {
     std::str::from_utf8(&rest[..end]).ok()
 }
 
-pub fn resolve_symbols(
-    data: &[u8],
-    layout: &MergedLayout,
-    sections: &[SectionHeader],
-    names: &[String],
-) -> Result<ResolvedSymbols, String> {
-    let no_commons = HashMap::default();
-    resolve_symbols_with_offsets(data, layout, sections, names, &no_commons, |_| Some(0))
-}
-
 pub(super) fn resolve_symbols_for_object(
     data: &[u8],
     layout: &MergedLayout,
@@ -278,14 +262,4 @@ pub(super) fn resolve_symbols_for_object(
             .get(section_name)
             .map(|contrib| contrib.offset_in_merged)
     })
-}
-
-/// Merge sections and resolve symbols for a single ELF64 object in one step.
-pub fn merge_and_resolve(
-    data: &[u8],
-) -> Result<(MergedLayout, HashMap<String, ResolvedSymbol>), String> {
-    let (_header, sections, names) = parse_elf64_slice(data)?;
-    let layout = merge_sections_single_object(data)?;
-    let (symbols, _by_index) = resolve_symbols(data, &layout, &sections, &names)?;
-    Ok((layout, symbols))
 }

@@ -167,17 +167,6 @@ impl LibraryResolver {
         None
     }
 
-    /// Return all known resolved names without file-system access.
-    /// Useful for producing `DT_NEEDED` sonames when the library is
-    /// expected to be present at runtime but not at link time.
-    pub fn expected_soname(&self, lib_name: &str) -> String {
-        match self.platform {
-            TargetPlatform::Linux => format!("lib{}.so.6", lib_name),
-            TargetPlatform::MacOS => format!("lib{}.dylib", lib_name),
-            TargetPlatform::Windows => format!("{}.dll", lib_name),
-        }
-    }
-
     /// Each candidate is `(filename_to_probe, soname_for_DT_NEEDED, is_static)`.
     fn candidates(&self, lib_name: &str) -> Vec<(String, String, bool)> {
         match self.platform {
@@ -363,15 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn test_expected_soname() {
-        let r = LibraryResolver::new(TargetArch::X86_64, TargetPlatform::Linux);
-        assert_eq!(r.expected_soname("c"), "libc.so.6");
-
-        let r = LibraryResolver::new(TargetArch::AArch64, TargetPlatform::MacOS);
-        assert_eq!(r.expected_soname("c"), "libc.dylib");
-    }
-
-    #[test]
     fn test_add_path_prepended() {
         let mut r = LibraryResolver::new(TargetArch::X86_64, TargetPlatform::Linux);
         let extra = PathBuf::from("/custom/lib");
@@ -397,12 +377,6 @@ mod tests {
             cands.iter().any(|(f, _, _)| f == "kernel32.dll"),
             "expected kernel32.dll candidate"
         );
-    }
-
-    #[test]
-    fn test_expected_soname_windows() {
-        let r = LibraryResolver::new(TargetArch::X86_64, TargetPlatform::Windows);
-        assert_eq!(r.expected_soname("kernel32"), "kernel32.dll");
     }
 
     #[test]
