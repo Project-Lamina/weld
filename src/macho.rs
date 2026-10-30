@@ -1,10 +1,6 @@
 //! Mach-O 64-bit object reader.
 //! Parses header, LC_SEGMENT_64 with sections, LC_SYMTAB for object files.
 
-#![allow(dead_code)]
-
-use std::path::Path;
-
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
 const MH_CIGAM_64: u32 = 0xCFFAEDFE;
 const MH_OBJECT: u32 = 1;
@@ -13,31 +9,12 @@ const LC_SEGMENT_64: u32 = 0x19;
 const LC_SYMTAB: u32 = 0x0b;
 const LC_SYMSEG: u32 = 0x02;
 
-const CPU_TYPE_X86_64: u32 = 0x01000007;
-const CPU_TYPE_ARM64: u32 = 0x0100000C;
-
 const N_TYPE: u8 = 0x0e;
 const N_SECT: u8 = 0x0e;
-const N_EXT: u8 = 0x01;
 const N_WEAK_REF: u16 = 0x0040;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MachoCpuType {
-    X86_64,
-    Arm64,
-}
-
-impl MachoCpuType {
-    pub fn from_raw(v: u32) -> Option<Self> {
-        match v {
-            CPU_TYPE_X86_64 => Some(Self::X86_64),
-            CPU_TYPE_ARM64 => Some(Self::Arm64),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MachoSegment {
     pub name: String,
     pub vmaddr: u64,
@@ -70,7 +47,6 @@ pub const ARM64_RELOC_GOT_LOAD_PAGEOFF12: u32 = 6;
 pub const ARM64_RELOC_TLVP_LOAD_PAGE21: u32 = 8;
 pub const ARM64_RELOC_TLVP_LOAD_PAGEOFF12: u32 = 9;
 pub const ARM64_RELOC_ADDEND: u32 = 10;
-pub const X86_64_RELOC_BRANCH: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MachoReloc {
@@ -98,7 +74,9 @@ pub struct Macho64Header {
     pub cputype: u32,
     pub filetype: u32,
     pub ncmds: u32,
+    #[allow(dead_code)]
     pub sizeofcmds: u32,
+    #[allow(dead_code)]
     pub segments: Vec<MachoSegment>,
 }
 
@@ -259,7 +237,9 @@ fn parse_symtab(
 ) -> Vec<MachoSymbol> {
     let mut symbols = Vec::new();
     let soff = symoff as usize;
-    let st_end = (stroff + strsize) as usize;
+    let st_end = (stroff as usize)
+        .saturating_add(strsize as usize)
+        .min(data.len());
     for i in 0..nsyms {
         let off = soff + i as usize * 16;
         if data.len() < off + 16 {
@@ -271,10 +251,9 @@ fn parse_symtab(
         let n_desc = read_u16_le(data, off + 6).unwrap_or(0);
         let n_value = read_u64_le(data, off + 8).unwrap_or(0);
 
-        let name = if n_strx > 0 && st_end > stroff as usize + n_strx {
-            let sstart = stroff as usize + n_strx;
-            let s = &data[sstart..];
-            String::from_utf8_lossy(trim_cstr(s)).to_string()
+        let sstart = (stroff as usize).saturating_add(n_strx);
+        let name = if n_strx > 0 && sstart < st_end {
+            String::from_utf8_lossy(trim_cstr(&data[sstart..st_end])).to_string()
         } else {
             String::new()
         };
@@ -297,8 +276,9 @@ fn parse_symtab(
 }
 
 pub fn parse_macho_relocs(data: &[u8], reloff: u32, nreloc: u32) -> Vec<MachoReloc> {
-    let mut out = Vec::with_capacity(nreloc as usize);
     let base = reloff as usize;
+    let readable = data.len().saturating_sub(base) / 8;
+    let mut out = Vec::with_capacity((nreloc as usize).min(readable));
     for i in 0..nreloc {
         let off = base + i as usize * 8;
         if data.len() < off + 8 {
@@ -372,11 +352,6 @@ pub fn parse_macho64_object(data: &[u8]) -> Result<Macho64Object, String> {
     })
 }
 
-pub fn parse_macho64_file(path: &Path) -> Result<Macho64Header, String> {
-    let data = std::fs::read(path).map_err(|e| format!("read failed: {}", e))?;
-    parse_macho64_header(&data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +420,60 @@ mod tests {
             "main_add.o should have at least 4 symbols, got {}",
             parsed.symbols.len()
         );
+    }
+
+    #[test]
+    fn symtab_string_offset_past_end_of_file_yields_no_name() {
+        let mut data = vec![0u8; 72];
+        data[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
+        data[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+        data[12..16].copy_from_slice(&MH_OBJECT.to_le_bytes());
+        data[16..20].copy_from_slice(&1u32.to_le_bytes());
+        data[20..24].copy_from_slice(&24u32.to_le_bytes());
+        data[32..36].copy_from_slice(&LC_SYMTAB.to_le_bytes());
+        data[36..40].copy_from_slice(&24u32.to_le_bytes());
+        data[40..44].copy_from_slice(&56u32.to_le_bytes());
+        data[44..48].copy_from_slice(&1u32.to_le_bytes());
+        data[48..52].copy_from_slice(&72u32.to_le_bytes());
+        data[52..56].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[56..60].copy_from_slice(&1u32.to_le_bytes());
+        data[60] = N_SECT;
+        data[61] = 1;
+
+        let parsed = parse_macho64_object(&data).expect("parse");
+        assert_eq!(parsed.symbols.len(), 1);
+        assert_eq!(parsed.symbols[0].name, "");
+    }
+
+    #[test]
+    fn symtab_string_table_bounds_that_overflow_yield_no_name() {
+        let mut data = vec![0u8; 72];
+        data[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
+        data[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+        data[12..16].copy_from_slice(&MH_OBJECT.to_le_bytes());
+        data[16..20].copy_from_slice(&1u32.to_le_bytes());
+        data[20..24].copy_from_slice(&24u32.to_le_bytes());
+        data[32..36].copy_from_slice(&LC_SYMTAB.to_le_bytes());
+        data[36..40].copy_from_slice(&24u32.to_le_bytes());
+        data[40..44].copy_from_slice(&56u32.to_le_bytes());
+        data[44..48].copy_from_slice(&1u32.to_le_bytes());
+        data[48..52].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        data[52..56].copy_from_slice(&0x20u32.to_le_bytes());
+        data[56..60].copy_from_slice(&1u32.to_le_bytes());
+        data[60] = N_SECT;
+        data[61] = 1;
+
+        let parsed = parse_macho64_object(&data).expect("parse");
+        assert_eq!(parsed.symbols.len(), 1);
+        assert_eq!(parsed.symbols[0].name, "");
+    }
+
+    #[test]
+    fn reloc_count_beyond_the_file_does_not_reserve_for_every_claimed_entry() {
+        let data = vec![0u8; 16];
+        let relocs = parse_macho_relocs(&data, 0, 0xFFFF_FFFF);
+        assert_eq!(relocs.len(), 2);
+        assert!(relocs.capacity() < 1024);
     }
 
     #[test]

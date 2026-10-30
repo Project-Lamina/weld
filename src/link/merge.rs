@@ -1,8 +1,8 @@
 //! Merge input object sections into one output layout.
 
 use super::{
-    SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_COMMON, SHN_UNDEF, SHT_NOBITS, SHT_PROGBITS,
-    parse_symtab_view, runtime,
+    SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_COMMON, SHT_NOBITS, SHT_PROGBITS, parse_symtab_view,
+    runtime,
 };
 use crate::{
     collections::HashMap,
@@ -10,8 +10,6 @@ use crate::{
         MAX_NOBITS_SIZE, MAX_SECTION_ALIGN, SectionHeader, get_strtab_string, parse_elf64_slice,
     },
 };
-use std::path::Path;
-
 #[derive(Debug, Clone)]
 pub struct MergedSection {
     pub entsize: u64,
@@ -34,24 +32,6 @@ pub struct MergedLayout {
     pub sections: Vec<MergedSection>,
     pub section_by_name: HashMap<String, usize>,
 }
-pub(super) fn reserve_start(
-    layout: &mut MergedLayout,
-    sections: &[SectionHeader],
-    data: &[u8],
-) -> Result<(), String> {
-    let Some((symbols, strings)) = parse_symtab_view(data, sections)? else {
-        return Ok(());
-    };
-    if symbols.iter().any(|s| {
-        s.st_shndx != SHN_UNDEF
-            && get_strtab_string(strings, s.name_offset).as_deref() == Some("_start")
-    }) {
-        return Ok(());
-    }
-    reserve_start_section(layout);
-    Ok(())
-}
-
 pub(super) fn reserve_start_section(layout: &mut MergedLayout) {
     let end = image_end(layout).unwrap_or(0x400000);
     layout
@@ -183,22 +163,6 @@ pub(crate) fn segment_class(section: &MergedSection) -> u8 {
     }
 }
 
-pub(super) fn move_nobits(layout: &mut MergedLayout) {
-    let mut end = layout
-        .sections
-        .iter()
-        .filter(|s| s.sh_type != SHT_NOBITS && is_allocatable(s.flags))
-        .map(|s| s.vaddr + s.data.len() as u64)
-        .max()
-        .unwrap_or(0x400000);
-    for section in &mut layout.sections {
-        if section.sh_type == SHT_NOBITS {
-            end = align_up(end, section.align);
-            section.vaddr = end;
-            end += section.data.len() as u64;
-        }
-    }
-}
 pub(super) fn align_up(value: u64, align: u64) -> u64 {
     if align == 0 {
         return value;
@@ -420,54 +384,7 @@ pub(super) fn append_merged_section(
 
 /// Merge allocatable sections from a single ELF64 object into a linear layout
 /// starting at the architecture-conventional load base (`0x400000`).
-pub fn merge_sections_single_object(data: &[u8]) -> Result<MergedLayout, String> {
-    let (_header, sections, names) = parse_elf64_slice(data)?;
-    let to_merge = collect_mergeable_sections(&sections, &names);
-
-    let mut layout = MergedLayout {
-        sections: Vec::new(),
-        section_by_name: HashMap::default(),
-    };
-
-    let mut vaddr: u64 = 0x400000;
-
-    for (name, sh) in &to_merge {
-        let align = sh.sh_addralign.max(1);
-        let allocatable = is_allocatable(sh.sh_flags);
-        if allocatable {
-            vaddr = align_up(vaddr, align);
-        }
-
-        let data_slice = read_section_data(data, sh);
-
-        let merged = MergedSection {
-            entsize: sh.sh_entsize,
-            sh_type: sh.sh_type,
-            name: name.clone(),
-            data: data_slice,
-            vaddr: if allocatable { vaddr } else { 0 },
-            flags: sh.sh_flags,
-            align,
-        };
-
-        let idx = layout.sections.len();
-        layout.section_by_name.insert(name.clone(), idx);
-        layout.sections.push(merged);
-
-        if allocatable {
-            vaddr += sh.sh_size;
-        }
-    }
-
-    Ok(layout)
-}
-
 /// Read an ELF64 object file from `path` and merge its allocatable sections.
-pub fn merge_object_file(path: &Path) -> Result<MergedLayout, String> {
-    let data = std::fs::read(path).map_err(|e| format!("read failed: {}", e))?;
-    merge_sections_single_object(&data)
-}
-
 /// Per-object section contribution: offset within merged section, size.
 #[derive(Debug, Clone)]
 pub struct ObjectSectionContrib {
@@ -530,10 +447,22 @@ pub(super) fn remap_merge_offsets(
         };
         for relocation_section in obj.sections.iter().filter(|s| s.sh_type == 4) {
             let target = contribution(relocation_section.sh_info as usize);
-            for off in (relocation_section.sh_offset as usize
-                ..(relocation_section.sh_offset + relocation_section.sh_size) as usize)
-                .step_by(24)
-            {
+            let entsize = relocation_section.sh_entsize as usize;
+            if entsize != 0 && entsize != 24 {
+                return Err(format!("relocation entry size {entsize} is not 24"));
+            }
+            let start = relocation_section.sh_offset as usize;
+            let size = relocation_section.sh_size as usize;
+            if !size.is_multiple_of(24) {
+                return Err(format!(
+                    "relocation section size {size} is not a multiple of 24"
+                ));
+            }
+            let end = start
+                .checked_add(size)
+                .filter(|&end| end <= obj.data.len())
+                .ok_or("relocation section extends past end of file")?;
+            for off in (start..end).step_by(24) {
                 let relocation = crate::elf::parse_rela_entry(&obj.data[off..off + 24], 0)?;
                 if let Some(target) = target {
                     let mapped = target.mapped_offset(relocation.r_offset);

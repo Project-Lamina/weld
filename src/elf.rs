@@ -1,26 +1,6 @@
 //! Minimal ELF64 parser for relocatable object files.
 
-#![allow(dead_code)]
-
 use std::path::Path;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
-pub enum ElfType {
-    Relocatable = 1,
-    Executable = 2,
-    Dynamic = 3,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
-pub enum SectionType {
-    Null = 0,
-    Progbits = 1,
-    Symtab = 2,
-    Strtab = 3,
-    Rela = 4,
-}
 
 const SHT_NULL: u32 = 0;
 const SHT_NOBITS: u32 = 8;
@@ -28,7 +8,6 @@ pub const MAX_SECTION_ALIGN: u64 = 1 << 21;
 pub const MAX_NOBITS_SIZE: u64 = 1 << 32;
 const SHT_SYMTAB: u32 = 2;
 const SHT_DYNSYM: u32 = 11;
-const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
 const SHT_GNU_VERDEF: u32 = 0x6ffffffd;
 const SHT_GNU_VERSYM: u32 = 0x6fffffff;
@@ -47,7 +26,6 @@ pub mod reloc_type {
     /// Relaxable GOTPCREL forms. weld does not relax, so they behave as GOTPCREL.
     pub const R_X86_64_GOTPCRELX: u32 = 41;
     pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
-    pub const R_X86_64_JUMP_SLOT: u32 = 7;
     pub const R_X86_64_TLSGD: u32 = 19;
     pub const R_X86_64_TLSLD: u32 = 20;
     pub const R_X86_64_DTPOFF32: u32 = 21;
@@ -100,24 +78,6 @@ pub mod reloc_type {
     pub const R_RISCV_LO12_I: u32 = 27;
     pub const R_RISCV_LO12_S: u32 = 28;
     pub const R_RISCV_RELAX: u32 = 51;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum SymBind {
-    Local = 0,
-    Global = 1,
-    Weak = 2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum SymType {
-    Notype = 0,
-    Object = 1,
-    Func = 2,
-    Section = 3,
-    File = 4,
 }
 
 #[derive(Debug, Clone)]
@@ -267,11 +227,15 @@ pub fn get_strtab_string(strtab: &[u8], offset: u32) -> Option<String> {
 pub fn parse_symtab(data: &[u8], symtab_sh: &SectionHeader) -> Result<Vec<Symbol>, String> {
     let sym_start = symtab_sh.sh_offset as usize;
     let entsize = symtab_sh.sh_entsize as usize;
-    let count = (symtab_sh.sh_size as usize)
-        .checked_div(entsize)
-        .unwrap_or((symtab_sh.sh_size as usize) / ELF64_SYM_SIZE);
+    if entsize != 0 && entsize != ELF64_SYM_SIZE {
+        return Err(format!(
+            "symbol table entry size {entsize} is not {ELF64_SYM_SIZE}"
+        ));
+    }
+    let count = (symtab_sh.sh_size as usize) / ELF64_SYM_SIZE;
+    let readable = data.len().saturating_sub(sym_start) / ELF64_SYM_SIZE;
 
-    let mut symbols = Vec::with_capacity(count);
+    let mut symbols = Vec::with_capacity(count.min(readable));
     for i in 0..count {
         let off = sym_start + i * ELF64_SYM_SIZE;
         let sym = parse_symbol_entry(data, off)?;
@@ -349,13 +313,6 @@ fn file_size(file: &std::fs::File) -> Result<u64, String> {
     file.metadata()
         .map(|m| m.len())
         .map_err(|e| format!("read failed: {}", e))
-}
-
-pub fn parse_elf64_file(
-    path: &Path,
-) -> Result<(Elf64Header, Vec<SectionHeader>, Vec<String>), String> {
-    let data = std::fs::read(path).map_err(|e| format!("read failed: {}", e))?;
-    parse_elf64_slice(&data)
 }
 
 #[derive(Debug, Clone)]
@@ -525,6 +482,26 @@ mod tests {
         assert_eq!(sym.sym_type, 2);
         assert_eq!(sym.st_shndx, 1);
         assert_eq!(sym.st_value, 0x100);
+    }
+
+    #[test]
+    fn symbol_table_with_an_unexpected_entry_size_is_rejected() {
+        let data = vec![0u8; 48];
+        let mut header = SectionHeader {
+            name_offset: 0,
+            sh_type: 2,
+            sh_flags: 0,
+            sh_addr: 0,
+            sh_offset: 0,
+            sh_size: 48,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: 1,
+            sh_entsize: ELF64_SYM_SIZE as u64,
+        };
+        assert_eq!(parse_symtab(&data, &header).expect("parse").len(), 2);
+        header.sh_entsize = 48;
+        assert!(parse_symtab(&data, &header).is_err());
     }
 
     #[test]
