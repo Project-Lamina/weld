@@ -383,3 +383,53 @@ fn rejects_imported_data_larger_than_cap() {
     );
     assert!(!stderr.contains("memory allocation"), "{stderr}");
 }
+
+#[test]
+fn rejects_merge_relocation_section_with_a_partial_entry() {
+    let guard = TempDir::new("weld-merge-rela");
+    let dir = guard.path();
+    fs::write(
+        dir.join("merge.s"),
+        r#"
+.section .rodata.str1.1,"aMS",@progbits,1
+.globl merged
+merged: .asciz "repeated string"
+.Lduplicate: .asciz "repeated string"
+.section .data.rel.ro,"aw"
+.globl pointer
+pointer: .quad .Lduplicate + 3
+.text
+.globl _start
+_start:
+    lea merged(%rip),%rax
+    mov $60,%eax
+    xor %edi,%edi
+    syscall
+"#,
+    )
+    .unwrap();
+    let status = Command::new("as")
+        .current_dir(dir)
+        .args(["merge.s", "-o", "merge.o"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut mutant = fs::read(dir.join("merge.o")).unwrap();
+    let rela = elf_section_field(&mutant, 4).unwrap();
+    let tail = (mutant.len() - 32) as u64;
+    mutant[rela + 24..rela + 32].copy_from_slice(&tail.to_le_bytes());
+    mutant[rela + 32..rela + 40].copy_from_slice(&32u64.to_le_bytes());
+    fs::write(dir.join("mutant.o"), &mutant).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_weld"))
+        .current_dir(dir)
+        .args(["-o", "output", "mutant.o"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("is not a multiple of 24"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!dir.join("output").exists());
+}

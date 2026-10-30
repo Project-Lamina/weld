@@ -131,7 +131,10 @@ pub(crate) fn parse(coff: &[u8]) -> Object<'_> {
     };
     object.symbol_table_offset = sym_off;
     object.symbol_count = n_syms;
-    let strtab = string_table(coff, sym_off, n_syms);
+    let strtab = string_table(coff, sym_off, n_syms).unwrap_or_else(|| {
+        object.symbols_truncated = true;
+        &[]
+    });
     read_symbols(coff, sym_off, n_syms, strtab, &mut object);
     read_sections(coff, n_sections, opt_size, strtab, &mut object);
     if object.symbols_truncated {
@@ -146,13 +149,14 @@ fn note(object: &mut Object<'_>, problem: Problem) {
     }
 }
 
-fn string_table(coff: &[u8], sym_off: usize, n_syms: usize) -> &[u8] {
+fn string_table(coff: &[u8], sym_off: usize, n_syms: usize) -> Option<&[u8]> {
     if n_syms == 0 {
-        return &[];
+        return Some(&[]);
     }
-    let off = sym_off + n_syms * SYMBOL_SIZE;
-    let size = read_u32(coff, off).unwrap_or(4) as usize;
-    &coff[off.min(coff.len())..(off + size).min(coff.len())]
+    let off = sym_off.checked_add(n_syms.checked_mul(SYMBOL_SIZE)?)?;
+    let size = read_u32(coff, off)? as usize;
+    let end = off.saturating_add(size).min(coff.len());
+    Some(&coff[off..end])
 }
 
 fn read_symbols(
@@ -355,6 +359,16 @@ mod tests {
         );
         assert_eq!(coff_reloc_span(&data, 20, 3, 0), Some((20, 3)));
         assert_eq!(coff_reloc_span(&data, 20, u16::MAX, 0), Some((20, 65535)));
+    }
+
+    #[test]
+    fn truncated_string_table_header_is_reported_not_guessed() {
+        let mut data = vec![0u8; 36 + SYMBOL_SIZE + 2];
+        data[8..12].copy_from_slice(&36u32.to_le_bytes());
+        data[12..16].copy_from_slice(&1u32.to_le_bytes());
+        data[36 + 4..36 + 8].copy_from_slice(&4u32.to_le_bytes());
+        let object = parse(&data);
+        assert!(matches!(object.problem, Some(Problem::SymbolTable)));
     }
 
     #[test]
