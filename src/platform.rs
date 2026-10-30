@@ -1,8 +1,7 @@
 //! Target platform support.
 
-#![allow(dead_code)]
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum TargetPlatform {
     Linux,
     MacOS,
@@ -26,18 +25,6 @@ impl TargetPlatform {
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
             Self::Linux
-        }
-    }
-
-    pub fn supports_native_linking(self) -> bool {
-        matches!(self, Self::Linux | Self::MacOS)
-    }
-
-    pub fn output_format(self) -> &'static str {
-        match self {
-            Self::Linux => "ELF",
-            Self::MacOS => "Mach-O",
-            Self::Windows => "PE",
         }
     }
 }
