@@ -1,12 +1,10 @@
-//! Section merging and layout for single-object linking.
+//! Section merging and layout for linking one or more objects.
 //!
 //! Architecture-specific relocation logic lives in parallel modules:
 //! - x86_64: x86_64.rs
 //! - aarch64: aarch64.rs
 //! - riscv: riscv.rs
 //! - powerpc64: ppc64.rs
-
-#![allow(dead_code)]
 
 mod aarch64;
 mod dynamic;
@@ -31,8 +29,7 @@ use dynamic::{
 };
 pub(crate) use merge::segment_class;
 pub use merge::{
-    MergedLayout, MergedSection, ObjectSectionContrib, merge_sections_multi_object,
-    merge_sections_single_object, tls_segment,
+    MergedLayout, MergedSection, ObjectSectionContrib, merge_sections_multi_object, tls_segment,
 };
 use merge::{align_up, image_end, is_allocatable, is_debug_section, reserve_start_section};
 pub use relocatable::link_relocatable;
@@ -132,10 +129,6 @@ pub struct LinkOptions {
 /// Links ELF64 objects with `LinkOptions::default()`. `libs` names the libraries to
 /// resolve. Unless `static_link` is set, an x86_64 link that names a shared library
 /// (or `c` / `System`) gets PLT and GOT entries for its undefined symbols.
-pub fn link_multi_object(objects: &[&[u8]], libs: Option<&[String]>) -> Result<LinkResult, String> {
-    link_multi_object_with_options(objects, libs, &LinkOptions::default())
-}
-
 pub fn link_multi_object_with_options(
     objects: &[&[u8]],
     libs: Option<&[String]>,
@@ -1149,8 +1142,6 @@ pub fn apply_relocations(
 
 #[cfg(test)]
 mod tests {
-    use super::merge::merge_object_file;
-    use super::symbols::merge_and_resolve;
     use super::*;
     use crate::test_support::TempDir;
     use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
@@ -1162,42 +1153,6 @@ mod tests {
         assert_eq!(align_up(15, 16), 16);
         assert_eq!(align_up(16, 16), 16);
         assert_eq!(align_up(17, 16), 32);
-    }
-
-    #[test]
-    fn test_merge_ras_object() {
-        let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
-        let tmp_dir = TempDir::new("weld_merge_test");
-        let tmp = tmp_dir.path().join("weld_merge_test.o");
-
-        let mut ras =
-            ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras");
-        ras.assemble(asm, &tmp).expect("assemble");
-
-        let layout = merge_object_file(&tmp).expect("merge");
-        let _ = std::fs::remove_file(&tmp);
-
-        assert!(!layout.sections.is_empty());
-        assert!(layout.section_by_name.contains_key(".text"));
-    }
-
-    #[test]
-    fn test_merge_and_resolve() {
-        let asm = ".text\n.globl main\nmain:\n  movq $42, %rax\n  ret\n";
-        let tmp_dir = TempDir::new("weld_resolve_test");
-        let tmp = tmp_dir.path().join("weld_resolve_test.o");
-
-        let mut ras =
-            ras::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras");
-        ras.assemble(asm, &tmp).expect("assemble");
-
-        let data = std::fs::read(&tmp).expect("read");
-        let _ = std::fs::remove_file(&tmp);
-
-        let (layout, symbols) = merge_and_resolve(&data).expect("merge_and_resolve");
-        assert!(!layout.sections.is_empty());
-        assert!(layout.section_by_name.contains_key(".text"));
-        assert!(symbols.is_empty() || symbols.contains_key("main"));
     }
 
     #[test]
@@ -1238,7 +1193,8 @@ mod tests {
         let _ = std::fs::remove_file(&tmp2);
 
         let objects: Vec<&[u8]> = vec![&d1, &d2];
-        let result = link_multi_object(&objects, None).expect("link_multi_object");
+        let result = link_multi_object_with_options(&objects, None, &LinkOptions::default())
+            .expect("link_multi_object");
         assert!(!result.layout.sections.is_empty());
         assert!(result.layout.section_by_name.contains_key(".text"));
         assert!(result.symbol_addrs.contains_key("main"));

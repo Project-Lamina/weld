@@ -7,9 +7,12 @@ lookup uses `.a` files exclusively. Output uses `ET_EXEC` without an interpreter
 or dynamic symbol tables; `.init_array` and `.fini_array` are preserved for startup
 code to execute.
 
-Static glibc linking remains unsupported. Inputs requiring TLS (`.tdata` / `.tbss`)
-or GNU IFUNC resolvers fail before output is created. TLS needs segment layout,
-`PT_TLS`, and thread-pointer relocations; static IFUNC needs resolver stubs and
-IRELATIVE startup relocation tables. Weld does not yet supply these facilities.
-GCC LTO inputs also fail explicitly with their input filename. Unresolved strong
-symbols are link errors; unresolved weak symbols remain permitted.
+Static glibc linking remains unsupported. Inputs requiring GNU IFUNC resolvers
+fail before output is created; static IFUNC needs resolver stubs and IRELATIVE
+startup relocation tables, which weld does not yet supply. TLS is supported:
+`.tdata` and `.tbss` are laid out under `PT_TLS`, local-exec and initial-exec
+relocations are applied against the thread pointer, and global-dynamic sequences
+relax to local-exec. Local-dynamic TLS and thread-local symbols imported from a
+shared library are rejected with an error. GCC LTO inputs also fail explicitly
+with their input filename. Unresolved strong symbols are link errors;
+unresolved weak symbols remain permitted.
