@@ -141,7 +141,7 @@ pub fn emit_macho_executable(
     if cputype == 0 {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "RISC-V not supported for Mach-O",
+            "Mach-O output supports x86_64 and arm64 only",
         ));
     }
 
@@ -800,7 +800,7 @@ pub fn emit_macho_executable_dynamic(
     if cputype == 0 {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "RISC-V not supported for Mach-O",
+            "Mach-O output supports x86_64 and arm64 only",
         ));
     }
 

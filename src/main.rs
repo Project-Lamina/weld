@@ -532,10 +532,15 @@ fn try_weld_link_coff(args: &ParsedArgs, objects: Vec<Vec<u8>>) -> Option<i32> {
         eprintln!("weld: {error}");
         return Some(1);
     }
-    let out_file = create_output(out_path).ok()?;
-    let mut out = std::io::BufWriter::new(out_file);
-    std::io::Write::write_all(&mut out, &image).ok()?;
-    out.flush().ok()?;
+    let write = create_output(out_path).and_then(|file| {
+        let mut out = std::io::BufWriter::new(file);
+        std::io::Write::write_all(&mut out, &image)?;
+        out.flush()
+    });
+    if let Err(error) = write {
+        eprintln!("weld: {}: {error}", out_path.display());
+        return Some(1);
+    }
     Some(0)
 }
 
@@ -724,7 +729,10 @@ fn main() {
                                 )
                                 .err(),
                                 ObjectFormat::Coff => {
-                                    Some("COFF/PE linking not yet implemented".to_string())
+                                    let mut image: Vec<u8> = Vec::new();
+                                    emit::pe::link_and_emit_pe_from_coffs(&refs, &mut image)
+                                        .err()
+                                        .map(|error| error.to_string())
                                 }
                             };
                             if let Some(e) = err {
