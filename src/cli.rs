@@ -1,5 +1,9 @@
 use std::path::PathBuf;
 
+pub const TARGET_OSES: [&str; 7] = [
+    "none", "linux", "freebsd", "orbis", "ps4", "prospero", "ps5",
+];
+
 #[derive(Debug, Default)]
 pub struct ParsedArgs {
     pub output_file: Option<PathBuf>,
@@ -44,7 +48,10 @@ pub fn print_usage() {
     eprintln!("  -l <lib>                    Link library (e.g. -lc)");
     eprintln!("  -m <emulation>               Target emulation (e.g. elf_x86_64)");
     eprintln!("  --dynamic-linker <path>     Dynamic linker path");
-    eprintln!("  --target <os>               Target OS (e.g. linux, orbis, prospero, freebsd)");
+    eprintln!(
+        "  --target <os>               Target OS ({})",
+        TARGET_OSES.join(", ")
+    );
     eprintln!("  -v, --verbose               Verbose output");
     eprintln!("  -h, --help                  This help");
     eprintln!("  --version                   Print version");
@@ -200,6 +207,12 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             }
             "--target" => {
                 let next = take_required_arg(argv, &mut i, "--target")?;
+                if !TARGET_OSES.contains(&next.as_str()) {
+                    return Err(format!(
+                        "unknown --target {next}, expected one of {}",
+                        TARGET_OSES.join(", ")
+                    ));
+                }
                 args.target_os = Some(next);
             }
             "-v" | "--verbose" => args.verbose = true,
@@ -307,6 +320,24 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_target_os_is_rejected() {
+        let argv: Vec<String> = ["--target", "lnux", "a.o"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let Err(error) = parse_args(&argv) else {
+            panic!("should reject");
+        };
+        assert!(error.contains("unknown --target lnux"), "{error}");
+
+        let argv: Vec<String> = ["--target", "freebsd", "a.o"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_args(&argv).is_ok());
+    }
 
     #[test]
     fn parses_clang_macos_linker_flags_without_treating_versions_as_inputs() {
