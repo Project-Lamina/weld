@@ -540,18 +540,27 @@ fn apply_macho_relocations(
 
                 if wants_direct_bind {
                     if let Some(s) = sym {
-                        let mut bind_addend = read_addend(&merged.data, off, r.r_length) as i64;
-                        if bind_addend == 0 && s.name == "__tlv_bootstrap" {
-                            bind_addend = 8;
-                        }
+                        let bind_addend = read_addend(&merged.data, off, r.r_length) as i64;
                         direct_bind_symbol = Some((s.name.clone(), s.is_weak_ref, bind_addend));
                     }
                     0
+                } else if let RelocKind::X86Pcrel {
+                    through_got: true, ..
+                } = kind
+                {
+                    let name = sym.map(|s| s.name.as_str()).unwrap_or("?");
+                    got_slot_by_symbol
+                        .and_then(|m| m.get(name).copied())
+                        .ok_or_else(|| format!("x86_64 GOT reference to {name} has no GOT slot"))?
                 } else {
-                    let is_got_reloc = r.r_type == ARM64_RELOC_GOT_LOAD_PAGE21
-                        || r.r_type == ARM64_RELOC_GOT_LOAD_PAGEOFF12;
-                    let is_tlvp_reloc = r.r_type == ARM64_RELOC_TLVP_LOAD_PAGE21
-                        || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12;
+                    let is_got_reloc = matches!(
+                        kind,
+                        RelocKind::Arm64GotLoadPage21 | RelocKind::Arm64GotLoadPageOff12
+                    );
+                    let is_tlvp_reloc = matches!(
+                        kind,
+                        RelocKind::Arm64TlvpPage21 | RelocKind::Arm64TlvpPageOff12
+                    );
                     let use_got_slot = sym
                         .map(|s| {
                             if is_tlvp_reloc {
