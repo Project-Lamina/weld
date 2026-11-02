@@ -401,10 +401,8 @@ fn build_bind_opcodes(
         buf.push(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | ((data_segment_index as u8) & 0x0F));
         push_uleb128(&mut buf, *off);
         buf.push(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
-        if *addend != 0 {
-            buf.push(BIND_OPCODE_SET_ADDEND_SLEB);
-            push_sleb128(&mut buf, *addend);
-        }
+        buf.push(BIND_OPCODE_SET_ADDEND_SLEB);
+        push_sleb128(&mut buf, *addend);
         buf.push(BIND_OPCODE_DO_BIND);
     }
     buf.push(BIND_OPCODE_DONE);
@@ -1137,6 +1135,16 @@ pub fn emit_macho_executable_dynamic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_bind_sets_addend_on_every_bind() {
+        let binds = [
+            (0u64, "__tlv_bootstrap".to_string(), false, 8i64),
+            (8u64, "__tlv_bootstrap".to_string(), false, 0i64),
+        ];
+        let ops = build_bind_opcodes(&[], &[], 2, 0, &binds);
+        assert!(ops.ends_with(&[0x60, 0x00, 0x90, 0x00]));
+    }
 
     #[test]
     fn test_emit_macho_header() {
