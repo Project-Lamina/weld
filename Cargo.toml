@@ -21,9 +21,3 @@ log = "0.4"
 [dev-dependencies]
 lamina-platform = { version = "0.2.0" }
 ras = { package = "lamina-ras", version = "0.2.0", features = ["encoder"] }
-
-[patch.crates-io]
-lamina-platform = { path = "../lamina/lamina-platform" }
-lamina-mir = { path = "../lamina/lamina-mir" }
-lamina-codegen = { path = "../lamina/lamina-codegen" }
-lamina-ras = { path = "../ras" }
