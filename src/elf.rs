@@ -444,6 +444,63 @@ pub fn parse_elf64_slice(
     Ok((header, sections, names))
 }
 
+/// The `DT_SONAME` of a shared object, which is the name a dependant must record
+/// in `DT_NEEDED` so the dynamic loader can find it through the ldconfig cache.
+/// `None` when the object declares none, which is legal.
+pub fn read_soname(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const SHT_DYNAMIC: u32 = 6;
+    const DT_NULL: u64 = 0;
+    const DT_SONAME: u64 = 14;
+
+    let read_at = |file: &mut std::fs::File, off: u64, buf: &mut [u8]| -> Option<()> {
+        file.seek(SeekFrom::Start(off)).ok()?;
+        file.read_exact(buf).ok()
+    };
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header_bytes = [0u8; 64];
+    read_at(&mut file, 0, &mut header_bytes)?;
+    let header = parse_elf64_header(&header_bytes).ok()?;
+    let shnum = header.e_shnum as usize;
+    let mut table = vec![0u8; shnum.checked_mul(64)?];
+    read_at(&mut file, header.e_shoff, &mut table)?;
+    let sections = (0..shnum)
+        .map(|i| parse_section_header(&table, (i * 64) as u64))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+
+    let dynamic = sections.iter().find(|s| s.sh_type == SHT_DYNAMIC)?;
+    let strtab = sections.get(dynamic.sh_link as usize)?;
+    let file_len = file_size(&file).ok()?;
+    if dynamic.sh_offset.checked_add(dynamic.sh_size)? > file_len
+        || strtab.sh_offset.checked_add(strtab.sh_size)? > file_len
+    {
+        return None;
+    }
+
+    let mut entries = vec![0u8; usize::try_from(dynamic.sh_size).ok()?];
+    read_at(&mut file, dynamic.sh_offset, &mut entries)?;
+    let mut name_offset = None;
+    for entry in entries.as_chunks::<16>().0 {
+        let tag = u64::from_le_bytes(entry[..8].try_into().ok()?);
+        if tag == DT_NULL {
+            break;
+        }
+        if tag == DT_SONAME {
+            name_offset = Some(u64::from_le_bytes(entry[8..].try_into().ok()?));
+        }
+    }
+    let name_offset = usize::try_from(name_offset?).ok()?;
+
+    let mut strings = vec![0u8; usize::try_from(strtab.sh_size).ok()?];
+    read_at(&mut file, strtab.sh_offset, &mut strings)?;
+    let rest = strings.get(name_offset..)?;
+    let end = rest.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&rest[..end]).ok().map(String::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +601,43 @@ mod tests {
         let result = read_dynamic_tables(&path);
         std::fs::remove_file(&path).unwrap();
         assert!(result.unwrap_err().contains("extends past end of file"));
+    }
+
+    #[test]
+    fn soname_is_read_from_the_dynamic_section() {
+        let mut data = vec![0u8; 64 + 64 * 3 + 64];
+        data[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        data[4] = 2;
+        data[5] = 1;
+        data[16..18].copy_from_slice(&3u16.to_le_bytes());
+        data[18..20].copy_from_slice(&62u16.to_le_bytes());
+        data[40..48].copy_from_slice(&64u64.to_le_bytes());
+        data[60..62].copy_from_slice(&3u16.to_le_bytes());
+
+        let dyn_off = (64 + 64 * 3) as u64;
+        let str_off = dyn_off + 32;
+        let dynamic = 64 + 64;
+        data[dynamic + 4..dynamic + 8].copy_from_slice(&6u32.to_le_bytes());
+        data[dynamic + 24..dynamic + 32].copy_from_slice(&dyn_off.to_le_bytes());
+        data[dynamic + 32..dynamic + 40].copy_from_slice(&32u64.to_le_bytes());
+        data[dynamic + 40..dynamic + 44].copy_from_slice(&2u32.to_le_bytes());
+        let strtab = 64 + 64 * 2;
+        data[strtab + 4..strtab + 8].copy_from_slice(&3u32.to_le_bytes());
+        data[strtab + 24..strtab + 32].copy_from_slice(&str_off.to_le_bytes());
+        data[strtab + 32..strtab + 40].copy_from_slice(&16u64.to_le_bytes());
+
+        let d = dyn_off as usize;
+        data[d..d + 8].copy_from_slice(&14u64.to_le_bytes());
+        data[d + 8..d + 16].copy_from_slice(&1u64.to_le_bytes());
+        data[d + 16..d + 24].copy_from_slice(&0u64.to_le_bytes());
+        let st = str_off as usize;
+        data[st..st + 14].copy_from_slice(b"\0libfoo.so.6\0\0");
+
+        let tmp = TempDir::new("weld-soname");
+        let path = tmp.path().join("libfoo.so");
+        std::fs::write(&path, &data).unwrap();
+        let got = read_soname(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(got.as_deref(), Some("libfoo.so.6"));
     }
 }

@@ -69,15 +69,16 @@ impl LibraryResolver {
                         }
                         continue;
                     }
-                    let soname = if !is_static && soname.ends_with(".so") {
-                        path.canonicalize()
-                            .ok()
-                            .and_then(|real| {
-                                real.file_name().map(|n| n.to_string_lossy().into_owned())
+                    let soname = if *is_static {
+                        soname.clone()
+                    } else {
+                        crate::elf::read_soname(&path)
+                            .or_else(|| {
+                                path.canonicalize().ok().and_then(|real| {
+                                    real.file_name().map(|n| n.to_string_lossy().into_owned())
+                                })
                             })
                             .unwrap_or_else(|| soname.clone())
-                    } else {
-                        soname.clone()
                     };
                     return Some(ResolvedLibrary {
                         path,
@@ -158,9 +159,10 @@ impl LibraryResolver {
                 .iter()
                 .map(|dir| dir.join(&file_name))
                 .find(|candidate| candidate.is_file())?;
+            let soname = crate::elf::read_soname(&found).unwrap_or(file_name);
             return Some(ResolvedLibrary {
                 path: found,
-                soname: file_name,
+                soname,
                 is_static: false,
             });
         }
