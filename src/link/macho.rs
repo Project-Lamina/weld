@@ -1192,7 +1192,7 @@ pub fn link_macho_multi_object(
         )?;
     }
 
-    let dynamic = if layout.section_by_name.contains_key("__got") {
+    let dynamic = if layout.section_by_name.contains_key("__got") || !direct_binds.is_empty() {
         let plt_symbols = undefined;
         if std::env::var("WELD_TRACE_UNDEF").ok().as_deref() == Some("1") {
             let tlv_bootstrap_count = plt_symbols
@@ -1463,6 +1463,29 @@ fn merge_macho_sections_multi(
         }
     }
 
+    if section_cumul
+        .keys()
+        .any(|name| name.starts_with("__DATA_DIRTY.__thread_"))
+    {
+        return Err("thread-local sections in __DATA_DIRTY are not supported".to_string());
+    }
+    let thread_data = "__DATA.__thread_data".to_string();
+    let bss_align = section_aligns.get("__DATA.__thread_bss").copied();
+    let data_len = section_cumul.get(&thread_data).copied();
+    if let (Some(bss_align), Some(data_len)) = (bss_align, data_len) {
+        let padded = align_up(data_len, bss_align);
+        if padded > data_len {
+            let pad = (padded - data_len) as usize;
+            merged_data
+                .entry(thread_data.clone())
+                .or_default()
+                .push((vec![0u8; pad], pad as u64));
+            section_cumul.insert(thread_data.clone(), padded);
+        }
+        let data_align = section_aligns.entry(thread_data).or_insert(0);
+        *data_align = (*data_align).max(bss_align);
+    }
+
     let mut layout = MergedLayout {
         sections: Vec::new(),
         section_by_name: HashMap::default(),
@@ -1538,4 +1561,74 @@ fn merge_macho_sections_multi(
     }
 
     Ok((layout, section_contribs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::macho::Macho64Header;
+
+    fn thread_section(
+        segname: &str,
+        sectname: &str,
+        size: u64,
+        align: u32,
+        flags: u32,
+    ) -> MachoSection {
+        MachoSection {
+            sectname: sectname.into(),
+            segname: segname.into(),
+            addr: 0,
+            size,
+            offset: 0,
+            align,
+            reloff: 0,
+            nreloc: 0,
+            flags,
+        }
+    }
+
+    fn object_with(sections: Vec<MachoSection>, data: Vec<u8>) -> Macho64Object {
+        Macho64Object {
+            header: Macho64Header {
+                cputype: 0x0100_000C,
+                filetype: 1,
+                ncmds: 0,
+                sizeofcmds: 0,
+                segments: Vec::new(),
+            },
+            sections,
+            symbols: Vec::new(),
+            data,
+        }
+    }
+
+    #[test]
+    fn thread_bss_starts_where_thread_data_ends() {
+        let obj = object_with(
+            vec![
+                thread_section("__DATA", "__thread_data", 5, 3, 0x11),
+                thread_section("__DATA", "__thread_bss", 4, 4, 0x12),
+            ],
+            vec![0xAB; 5],
+        );
+        let (layout, _) = merge_macho_sections_multi(&[obj]).expect("merges");
+        let data = &layout.sections[layout.section_by_name["__DATA.__thread_data"]];
+        let bss = &layout.sections[layout.section_by_name["__DATA.__thread_bss"]];
+        assert_eq!(&data.data[..5], &[0xAB; 5]);
+        assert_eq!(data.data.len(), 16);
+        assert_eq!(bss.vaddr, data.vaddr + 16);
+        assert_eq!(bss.vaddr % 16, 0);
+        assert_eq!(data.vaddr % 16, 0);
+        assert_eq!(bss.data.len(), 4);
+    }
+
+    #[test]
+    fn thread_data_in_dirty_segment_is_error() {
+        let obj = object_with(
+            vec![thread_section("__DATA_DIRTY", "__thread_data", 4, 3, 0x11)],
+            vec![0; 4],
+        );
+        assert!(merge_macho_sections_multi(&[obj]).is_err());
+    }
 }
