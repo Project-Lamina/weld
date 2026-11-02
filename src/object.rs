@@ -906,7 +906,9 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// Fixtures are built with `as` and `ar`, and the assertions are about ELF
+// archives, so these only mean anything on a host whose `as` emits ELF.
+#[cfg(all(test, target_os = "linux"))]
 mod archive_selection_tests {
     use super::*;
     use crate::test_support::TempDir;
