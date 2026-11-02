@@ -98,6 +98,17 @@ fn is_data_layout_section(name: &str) -> bool {
     false
 }
 
+/// A TLV descriptor is thunk, key, offset. dyld fills the key at load time, so
+/// the image must carry zero there. The thunk is bound and the offset is written
+/// by the relocation, so both are left alone.
+fn clear_tlv_descriptor_keys(data: &mut [u8]) {
+    let mut i = 0usize;
+    while i + 24 <= data.len() {
+        write_u64_le(data, i + 8, 0);
+        i += 24;
+    }
+}
+
 fn is_thread_vars_section(name: &str) -> bool {
     name == "__DATA.__thread_vars" || name == "__DATA_DIRTY.__thread_vars"
 }
@@ -840,16 +851,7 @@ fn apply_macho_relocations(
         }
 
         if is_thread_vars_section(&merged.name) {
-            let tv_size = merged.data.len() as u64;
-            let mut i = 0usize;
-            while i + 24 <= merged.data.len() {
-                let init_off = read_u64_le(&merged.data, i + 16).unwrap_or(0) & 0xffff_ffff;
-                let desc_off = i as u64;
-                let q2_low = tv_size.saturating_sub(16).saturating_sub(desc_off);
-                write_u64_le(&mut merged.data, i + 8, (init_off << 32) | 0x102);
-                write_u64_le(&mut merged.data, i + 16, ((0x58u64) << 32) | q2_low);
-                i += 24;
-            }
+            clear_tlv_descriptor_keys(&mut merged.data);
         }
     }
 
@@ -1601,6 +1603,25 @@ mod tests {
             symbols: Vec::new(),
             data,
         }
+    }
+
+    #[test]
+    fn tlv_descriptor_keeps_its_thunk_and_offset_and_zeroes_its_key() {
+        let mut data = vec![0u8; 48];
+        for (i, slot) in [(0usize, 0x1111u64), (8, 0x2222), (16, 0x30)]
+            .into_iter()
+            .chain([(24usize, 0x4444u64), (32, 0x5555), (40, 0x60)])
+        {
+            data[i..i + 8].copy_from_slice(&slot.to_le_bytes());
+        }
+        clear_tlv_descriptor_keys(&mut data);
+        let at = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+        assert_eq!(at(0), 0x1111, "thunk must survive for the bind");
+        assert_eq!(at(8), 0, "dyld fills the key, so the image carries zero");
+        assert_eq!(at(16), 0x30, "offset is what the relocation wrote");
+        assert_eq!(at(24), 0x4444);
+        assert_eq!(at(32), 0);
+        assert_eq!(at(40), 0x60);
     }
 
     #[test]
