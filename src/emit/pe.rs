@@ -453,6 +453,11 @@ const IMAGE_REL_BASED_DIR64: u16 = 10;
 const BASE_RELOC_PAGE: u32 = 0x1000;
 const DATA_DIR_BASE_RELOC: usize = 5;
 const DATA_DIR_EXCEPTION: usize = 3;
+const DATA_DIR_TLS: usize = 9;
+const TLS_DIRECTORY_SIZE: usize = 40;
+const TLS_INDEX_SYMBOL: &str = "_tls_index";
+const TLS_USED_SYMBOL: &str = "_tls_used";
+const IMAGE_REL_AMD64_SECREL: u16 = 0x000E;
 const PDATA_RECORD_SIZE: usize = 12;
 const IMAGE_REL_AMD64_REL32_5: u16 = 0x0009;
 const IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
@@ -472,6 +477,7 @@ enum CoffRegion {
     ReadOnly = 1,
     Writable = 2,
     Pdata = 3,
+    Tls = 4,
 }
 
 #[derive(Clone, Copy)]
@@ -491,6 +497,7 @@ struct CoffSection<'a> {
     offset: usize,
     comdat: Option<CoffComdat>,
     keep: bool,
+    uninit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2064,7 +2071,9 @@ fn parse_coff_object(object: usize, coff_data: &[u8]) -> Result<ParsedCoff<'_>> 
             if sec.skipped {
                 return None;
             }
-            let region = if sec.name == ".pdata" || sec.name.starts_with(".pdata$") {
+            let region = if sec.name == ".tls" || sec.name.starts_with(".tls$") {
+                CoffRegion::Tls
+            } else if sec.name == ".pdata" || sec.name.starts_with(".pdata$") {
                 CoffRegion::Pdata
             } else if sec.flags & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 {
                 CoffRegion::Text
@@ -2093,6 +2102,7 @@ fn parse_coff_object(object: usize, coff_data: &[u8]) -> Result<ParsedCoff<'_>> 
                 offset: 0,
                 comdat,
                 keep: true,
+                uninit: sec.flags & coff::IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0,
             })
         })
         .collect();
@@ -2265,6 +2275,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                 .map(move |rec| (oi, rec.tag))
         })
         .collect();
+    let mut tls_refs = false;
     let mut undefined: Vec<&str> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::default();
     for (oi, syms) in syms_of.iter().enumerate() {
@@ -2293,6 +2304,10 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                 || s.name.is_empty()
                 || defs.contains_key(s.name.as_str())
             {
+                continue;
+            }
+            if matches!(s.name.as_str(), TLS_INDEX_SYMBOL | TLS_USED_SYMBOL) {
+                tls_refs = true;
                 continue;
             }
             if s.value != 0 {
@@ -2335,8 +2350,17 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
     let thunk_index: HashMap<&str, usize> =
         undefined.iter().enumerate().map(|(i, n)| (*n, i)).collect();
 
-    let mut region_len = [0usize; 4];
-    for sec in sections.iter_mut().filter(|sec| sec.keep) {
+    if defs.contains_key(TLS_USED_SYMBOL) {
+        return Err(coff_error(format!(
+            "{TLS_USED_SYMBOL} is defined by an input; weld builds the TLS directory itself"
+        )));
+    }
+
+    let mut region_len = [0usize; 5];
+    for sec in sections
+        .iter_mut()
+        .filter(|sec| sec.keep && !matches!(sec.region, CoffRegion::Tls))
+    {
         let r = sec.region as usize;
         let align = match sec.region {
             CoffRegion::Pdata => {
@@ -2355,6 +2379,39 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         region_len[r] += sec.size;
     }
 
+    if let Some(sec) = sections
+        .iter()
+        .find(|sec| sec.keep && matches!(sec.region, CoffRegion::Tls) && sec.align > 8)
+    {
+        return Err(coff_error(format!(
+            "thread-local section {} in object {} is aligned above 8 bytes, which the TLS directory cannot express",
+            sec.name, sec.object
+        )));
+    }
+    let mut tls_init_len = 0usize;
+    for uninit in [false, true] {
+        for sec in sections
+            .iter_mut()
+            .filter(|sec| sec.keep && matches!(sec.region, CoffRegion::Tls) && sec.uninit == uninit)
+        {
+            let at = align_up_usize(region_len[CoffRegion::Tls as usize], sec.align);
+            sec.offset = at;
+            region_len[CoffRegion::Tls as usize] = at + sec.size;
+        }
+        if !uninit {
+            tls_init_len = region_len[CoffRegion::Tls as usize];
+        }
+    }
+    let tls_len = region_len[CoffRegion::Tls as usize];
+    let has_tls = tls_refs || tls_len > 0;
+    let tls_index_off = if has_tls && !defs.contains_key(TLS_INDEX_SYMBOL) {
+        let off = align_up_usize(region_len[CoffRegion::Writable as usize], 4);
+        region_len[CoffRegion::Writable as usize] = off + 4;
+        Some(off)
+    } else {
+        None
+    };
+
     let needs_main_stub = false;
     let thunks_off = region_len[CoffRegion::Text as usize];
     let stub_off = thunks_off + undefined.len() * 6;
@@ -2362,14 +2419,15 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
 
     let has_data = region_len[CoffRegion::Writable as usize] > 0;
     let has_pdata = region_len[CoffRegion::Pdata as usize] > 0;
-    let has_base_relocs = sections.iter().any(|sec| {
-        sec.keep
-            && sec
-                .relocs
-                .iter()
-                .any(|&(_, _, t)| t == IMAGE_REL_AMD64_ADDR64 || t == IMAGE_REL_AMD64_ADDR32)
-    });
-    let n_regions = 2 + usize::from(has_data) + usize::from(has_pdata);
+    let has_base_relocs = has_tls
+        || sections.iter().any(|sec| {
+            sec.keep
+                && sec
+                    .relocs
+                    .iter()
+                    .any(|&(_, _, t)| t == IMAGE_REL_AMD64_ADDR64 || t == IMAGE_REL_AMD64_ADDR32)
+        });
+    let n_regions = 2 + usize::from(has_data) + usize::from(has_pdata) + usize::from(tls_len > 0);
     let n_out_sections = n_regions + usize::from(has_base_relocs);
     let headers_raw: usize = SIZEOF_DOS_STUB
         + SIZEOF_PE_SIGNATURE
@@ -2462,25 +2520,33 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         );
     }
 
-    let rdata_len = rdata_import_off + import_bytes.len();
+    let tls_dir_off = align_up_usize(rdata_import_off + import_bytes.len(), 8);
+    let rdata_len = if has_tls {
+        tls_dir_off + TLS_DIRECTORY_SIZE
+    } else {
+        rdata_import_off + import_bytes.len()
+    };
     let data_rva = rdata_rva + align_up(rdata_len as u64, SECTION_ALIGN) as u32;
-    let pdata_rva = data_rva
+    let tls_rva = data_rva
         + align_up(
             region_len[CoffRegion::Writable as usize] as u64,
             SECTION_ALIGN,
         ) as u32;
-    let region_rva = [text_rva, rdata_rva, data_rva, pdata_rva];
+    let pdata_rva = tls_rva + align_up(tls_len as u64, SECTION_ALIGN) as u32;
+    let region_rva = [text_rva, rdata_rva, data_rva, pdata_rva, tls_rva];
     let region_size = [
         text_size,
         rdata_len,
         region_len[CoffRegion::Writable as usize],
         region_len[CoffRegion::Pdata as usize],
+        tls_len,
     ];
     let region_base = [
         0usize,
         (rdata_rva - text_rva) as usize,
         (data_rva - text_rva) as usize,
         (pdata_rva - text_rva) as usize,
+        (tls_rva - text_rva) as usize,
     ];
     let mut blob = vec![0u8; region_base[3] + region_size[3]];
 
@@ -2516,6 +2582,18 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
             }
             CoffDef::Absolute(v) => i64::from(v),
         }
+    };
+    let tls_dir_rva = rdata_rva + tls_dir_off as u32;
+    let tls_dir_va = IMAGE_BASE + u64::from(tls_dir_rva);
+    let tls_va = IMAGE_BASE + u64::from(tls_rva);
+    let tls_index_va: u64 = match defs.get(TLS_INDEX_SYMBOL) {
+        Some(&(def @ CoffDef::Section { .. }, _)) => def_va(def) as u64,
+        Some(_) => {
+            return Err(coff_error(format!(
+                "{TLS_INDEX_SYMBOL} must be a data symbol"
+            )));
+        }
+        None => IMAGE_BASE + u64::from(data_rva) + tls_index_off.unwrap_or(0) as u64,
     };
     let is_undefined_external = |sym: &coff::Symbol| {
         sym.section == IMAGE_SYM_UNDEFINED_SECTION
@@ -2571,6 +2649,12 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                 });
             }
             if is_undefined_external(sym) {
+                if sym.name == TLS_INDEX_SYMBOL {
+                    return Ok((tls_index_va as i64, true));
+                }
+                if sym.name == TLS_USED_SYMBOL {
+                    return Ok((tls_dir_va as i64, true));
+                }
                 if let Some(base) = sym.name.strip_prefix(IMPORT_SYMBOL_PREFIX) {
                     return sym_iat_va
                         .get(base)
@@ -2647,6 +2731,17 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
                         base_relocs.push((site_rva, IMAGE_REL_BASED_DIR64));
                     }
                 }
+                IMAGE_REL_AMD64_SECREL => {
+                    let (target, _) = resolve(object, sym_idx as usize, false, &sec.name)?;
+                    let offset = target + addend - tls_va as i64;
+                    if offset < 0 || offset >= tls_len as i64 {
+                        return Err(coff_error(format!(
+                            "SECREL in {} names a symbol outside .tls",
+                            sec.name
+                        )));
+                    }
+                    blob[at..at + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+                }
                 IMAGE_REL_AMD64_ADDR32 => {
                     // The loader adds its base delta to these 32 bits only, so the stored
                     // value is a usable pointer only while the image stays below 4 GiB.
@@ -2685,6 +2780,19 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         }
     }
 
+    if has_tls {
+        let mut dir = [0u8; TLS_DIRECTORY_SIZE];
+        dir[0..8].copy_from_slice(&tls_va.to_le_bytes());
+        dir[8..16].copy_from_slice(&(tls_va + tls_init_len as u64).to_le_bytes());
+        dir[16..24].copy_from_slice(&tls_index_va.to_le_bytes());
+        dir[32..36].copy_from_slice(&((tls_len - tls_init_len) as u32).to_le_bytes());
+        let dir_at = region_base[1] + tls_dir_off;
+        blob[dir_at..dir_at + TLS_DIRECTORY_SIZE].copy_from_slice(&dir);
+        for field in [0u32, 8, 16] {
+            base_relocs.push((tls_dir_rva + field, IMAGE_REL_BASED_DIR64));
+        }
+    }
+
     let entry_sym = syms_of.iter().enumerate().find_map(|(oi, syms)| {
         syms.iter()
             .position(|s| s.section > 0 && (s.name == "main" || s.name == "_main"))
@@ -2717,6 +2825,15 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         ));
         sec_rvas.push(data_rva);
     }
+    if tls_len > 0 {
+        let at = region_base[4];
+        pe_sections.push(PeSection::new(
+            ".tls",
+            blob[at..at + tls_len].to_vec(),
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+        ));
+        sec_rvas.push(tls_rva);
+    }
     if has_pdata {
         let at = region_base[3];
         pe_sections.push(PeSection::new(
@@ -2726,6 +2843,11 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         ));
         sec_rvas.push(pdata_rva);
     }
+    let tls_dir = if has_tls {
+        (tls_dir_rva, TLS_DIRECTORY_SIZE as u32)
+    } else {
+        (0, 0)
+    };
     let pdata_dir = if has_pdata {
         (pdata_rva, region_size[3] as u32)
     } else {
@@ -2770,6 +2892,7 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         iat_sz,
         base_reloc_dir,
         pdata_dir,
+        tls_dir,
     )
 }
 
@@ -2788,6 +2911,7 @@ fn emit_pe_raw(
     iat_size: u32,
     base_reloc_dir: (u32, u32),
     pdata_dir: (u32, u32),
+    tls_dir: (u32, u32),
 ) -> Result<()> {
     let mut dos = [0u8; SIZEOF_DOS_STUB];
     dos[0] = b'M';
@@ -2854,6 +2978,8 @@ fn emit_pe_raw(
     );
     write_u32_at_off(&mut opt, 112 + DATA_DIR_EXCEPTION * 8, pdata_dir.0);
     write_u32_at_off(&mut opt, 112 + DATA_DIR_EXCEPTION * 8 + 4, pdata_dir.1);
+    write_u32_at_off(&mut opt, 112 + DATA_DIR_TLS * 8, tls_dir.0);
+    write_u32_at_off(&mut opt, 112 + DATA_DIR_TLS * 8 + 4, tls_dir.1);
     out.write_all(&opt)?;
 
     for (i, sec) in sections.iter().enumerate() {
@@ -3981,5 +4107,245 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("data lies outside"), "{message}");
+    }
+
+    const TLS_FLAGS: u32 =
+        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    const TLS_BSS_FLAGS: u32 =
+        coff::IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+
+    struct PeSectionInfo {
+        name: String,
+        vsize: u32,
+        rva: u32,
+        raw: u32,
+    }
+
+    fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    fn u64_at(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
+    fn pe_section_table(out: &[u8]) -> Vec<PeSectionInfo> {
+        let e_lfanew = u32_at(out, 0x3C) as usize;
+        let count = u16::from_le_bytes([out[e_lfanew + 6], out[e_lfanew + 7]]) as usize;
+        let first = e_lfanew + 4 + SIZEOF_COFF_HEADER + SIZEOF_OPTIONAL_HEADER as usize;
+        (0..count)
+            .map(|i| {
+                let at = first + i * SIZEOF_SECTION_HEADER;
+                PeSectionInfo {
+                    name: String::from_utf8_lossy(&out[at..at + 8])
+                        .trim_end_matches('\0')
+                        .to_string(),
+                    vsize: u32_at(out, at + 8),
+                    rva: u32_at(out, at + 12),
+                    raw: u32_at(out, at + 20),
+                }
+            })
+            .collect()
+    }
+
+    fn pe_section<'a>(sections: &'a [PeSectionInfo], name: &str) -> &'a PeSectionInfo {
+        sections
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no {name} section"))
+    }
+
+    fn data_directory(out: &[u8], index: usize) -> (u32, u32) {
+        let e_lfanew = u32_at(out, 0x3C) as usize;
+        let at = e_lfanew + 4 + SIZEOF_COFF_HEADER + 112 + index * 8;
+        (u32_at(out, at), u32_at(out, at + 4))
+    }
+
+    fn file_offset(sections: &[PeSectionInfo], rva: u32) -> usize {
+        let s = sections
+            .iter()
+            .find(|s| rva >= s.rva && rva < s.rva + s.vsize)
+            .unwrap_or_else(|| panic!("rva {rva:#x} is outside every section"));
+        (s.raw + (rva - s.rva)) as usize
+    }
+
+    fn base_reloc_sites(dir: &[u8]) -> Vec<u32> {
+        let mut sites = Vec::new();
+        let mut at = 0;
+        while at + 8 <= dir.len() {
+            let page = u32_at(dir, at);
+            let block = u32_at(dir, at + 4) as usize;
+            for e in (at + 8..at + block).step_by(2) {
+                let entry = u16::from_le_bytes([dir[e], dir[e + 1]]);
+                if entry >> 12 != 0 {
+                    sites.push(page + u32::from(entry & 0xFFF));
+                }
+            }
+            at += block;
+        }
+        sites
+    }
+
+    fn tls_directory_fields(
+        out: &[u8],
+        sections: &[PeSectionInfo],
+    ) -> (u64, u64, u64, u64, u32, u32) {
+        let (dir_rva, dir_size) = data_directory(out, DATA_DIR_TLS);
+        assert_eq!(dir_size as usize, TLS_DIRECTORY_SIZE);
+        let at = file_offset(sections, dir_rva);
+        (
+            u64_at(out, at),
+            u64_at(out, at + 8),
+            u64_at(out, at + 16),
+            u64_at(out, at + 24),
+            u32_at(out, at + 32),
+            u32_at(out, at + 36),
+        )
+    }
+
+    #[test]
+    fn test_coff_tls_directory_and_index_resolve() {
+        let text = [0x8B, 0x0D, 0, 0, 0, 0, 0x8B, 0x80, 0, 0, 0, 0, 0xC3];
+        let text_relocs = [
+            (2, 7, IMAGE_REL_AMD64_REL32),
+            (8, 8, IMAGE_REL_AMD64_SECREL),
+        ];
+        let tls_init = [0x11, 0x22, 0x33, 0x44];
+        let mut obj = coff_object(
+            &[
+                text_section(&text, &text_relocs),
+                TestSection {
+                    name: ".tls$AAA",
+                    flags: TLS_FLAGS,
+                    data: &tls_init,
+                    relocs: &[],
+                    selection: 0,
+                    assoc: 0,
+                },
+                TestSection {
+                    name: ".tls$ZZZ",
+                    flags: TLS_BSS_FLAGS,
+                    data: &[],
+                    relocs: &[],
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                (
+                    "_tls_index",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_EXTERNAL,
+                    0,
+                ),
+                ("tls_var", 2, IMAGE_SYM_CLASS_EXTERNAL, 4),
+            ],
+        );
+        let bss_size_at = 20 + 2 * SIZEOF_SECTION_HEADER + 16;
+        obj[bss_size_at..bss_size_at + 4].copy_from_slice(&16u32.to_le_bytes());
+
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+
+        let sections = pe_section_table(&out);
+        let text_sec = pe_section(&sections, ".text");
+        let tls_sec = pe_section(&sections, ".tls");
+        let data_sec = pe_section(&sections, ".data");
+        assert_eq!(tls_sec.vsize, 4 + 16);
+
+        let (start, end, index, callbacks, zero_fill, characteristics) =
+            tls_directory_fields(&out, &sections);
+        let tls_va = IMAGE_BASE + u64::from(tls_sec.rva);
+        assert_eq!(start, tls_va);
+        assert_eq!(end, tls_va + 4);
+        assert_eq!(zero_fill, 16);
+        assert_eq!(callbacks, 0);
+        assert_eq!(characteristics, 0);
+        assert_eq!(
+            &out[tls_sec.raw as usize..tls_sec.raw as usize + 4],
+            &tls_init
+        );
+
+        let index_rva = (index - IMAGE_BASE) as u32;
+        assert!(index_rva >= data_sec.rva && index_rva + 4 <= data_sec.rva + data_sec.vsize);
+        let slot = file_offset(&sections, index_rva);
+        assert_eq!(&out[slot..slot + 4], &[0, 0, 0, 0]);
+
+        let text_at = text_sec.raw as usize;
+        let field_va = IMAGE_BASE + u64::from(text_sec.rva) + 2;
+        let disp = u32_at(&out, text_at + 2) as i32;
+        assert_eq!(field_va as i64 + 4 + i64::from(disp), index as i64);
+        assert_eq!(u32_at(&out, text_at + 8), 4);
+
+        let (reloc_rva, reloc_size) = data_directory(&out, DATA_DIR_BASE_RELOC);
+        let reloc_at = file_offset(&sections, reloc_rva);
+        let sites = base_reloc_sites(&out[reloc_at..reloc_at + reloc_size as usize]);
+        let (dir_rva, _) = data_directory(&out, DATA_DIR_TLS);
+        for field in [0, 8, 16] {
+            assert!(
+                sites.contains(&(dir_rva + field)),
+                "no base reloc at field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_coff_tls_index_without_template_still_emits_directory() {
+        let text = [0x8B, 0x0D, 0, 0, 0, 0, 0xC3];
+        let obj = coff_object(
+            &[text_section(&text, &[(2, 3, IMAGE_REL_AMD64_REL32)])],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                (
+                    "_tls_index",
+                    IMAGE_SYM_UNDEFINED_SECTION,
+                    IMAGE_SYM_CLASS_EXTERNAL,
+                    0,
+                ),
+            ],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+
+        let sections = pe_section_table(&out);
+        assert!(sections.iter().all(|s| s.name != ".tls"));
+        let (start, end, index, _, zero_fill, _) = tls_directory_fields(&out, &sections);
+        assert_eq!(start, end);
+        assert_eq!(zero_fill, 0);
+        let data_sec = pe_section(&sections, ".data");
+        let index_rva = (index - IMAGE_BASE) as u32;
+        assert!(index_rva >= data_sec.rva && index_rva + 4 <= data_sec.rva + data_sec.vsize);
+    }
+
+    #[test]
+    fn test_coff_secrel_outside_tls_is_error() {
+        let text = [0x8B, 0x80, 0, 0, 0, 0, 0xC3];
+        let obj = coff_object(
+            &[text_section(&text, &[(2, 2, IMAGE_REL_AMD64_SECREL)])],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("outside .tls"), "{message}");
+    }
+
+    #[test]
+    fn test_coff_defined_tls_used_is_error() {
+        let text = [0xC3];
+        let obj = coff_object(
+            &[text_section(&text, &[])],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("_tls_used", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+            ],
+        );
+        let mut out = Vec::new();
+        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("_tls_used"), "{message}");
     }
 }

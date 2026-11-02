@@ -1184,6 +1184,7 @@ mod macho_layout_tests {
         name: String,
         addr: u64,
         size: u64,
+        flags: u32,
     }
 
     struct Seg {
@@ -1216,10 +1217,12 @@ mod macho_layout_tests {
                         .to_string();
                     let addr = u64::from_le_bytes(image[s + 32..s + 40].try_into().unwrap());
                     let sz = u64::from_le_bytes(image[s + 40..s + 48].try_into().unwrap());
+                    let flags = u32::from_le_bytes(image[s + 64..s + 68].try_into().unwrap());
                     sects.push(Sect {
                         name: sn,
                         addr,
                         size: sz,
+                        flags,
                     });
                 }
                 out.push(Seg {
@@ -1232,6 +1235,83 @@ mod macho_layout_tests {
             off += size;
         }
         out
+    }
+
+    fn tls_layout() -> MergedLayout {
+        let data_base = 0x100008000u64;
+        let section = |name: &str, data: Vec<u8>, vaddr: u64, align: u64| MergedSection {
+            entsize: 0,
+            sh_type: 1,
+            name: name.to_string(),
+            data,
+            vaddr,
+            flags: 2,
+            align,
+        };
+        MergedLayout {
+            sections: vec![
+                MergedSection {
+                    entsize: 0,
+                    sh_type: 1,
+                    name: "__text".to_string(),
+                    data: vec![0u8; 0x28],
+                    vaddr: 0x100004000,
+                    flags: 2 | 4,
+                    align: 2,
+                },
+                section("__DATA.__thread_vars", vec![0u8; 24], data_base, 3),
+                section("__DATA.__thread_data", vec![0x5a; 16], data_base + 24, 4),
+                section("__DATA.__thread_bss", vec![0u8; 16], data_base + 40, 4),
+            ],
+            section_by_name: HashMap::default(),
+        }
+    }
+
+    #[test]
+    fn thread_sections_keep_tls_types_and_bind_tlv_bootstrap() {
+        let layout = tls_layout();
+        let dyn_info = DynamicLinkInfo {
+            pie: true,
+            shared: false,
+            needed: Vec::new(),
+            plt_symbols: Vec::new(),
+            weak_plt_symbols: Vec::new(),
+            interpreter: None,
+            macho_rebase_addrs: Vec::new(),
+            macho_direct_binds: vec![(0x100008000, "__tlv_bootstrap".to_string(), false, 0)],
+        };
+        let mut image = Vec::new();
+        emit_macho_executable_dynamic(
+            &layout,
+            TargetArch::AArch64,
+            0x100004000,
+            &dyn_info,
+            &mut image,
+        )
+        .expect("emit");
+
+        let segs = segments_and_sections(&image);
+        let data_seg = segs.iter().find(|s| s.name == "__DATA").expect("__DATA");
+        let find = |name: &str| {
+            data_seg
+                .sects
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no {name}"))
+        };
+        let vars = find("__thread_vars");
+        let data = find("__thread_data");
+        let bss = find("__thread_bss");
+        assert_eq!(vars.flags & 0xff, 0x13);
+        assert_eq!(data.flags & 0xff, 0x11);
+        assert_eq!(bss.flags & 0xff, 0x12);
+        assert_eq!(bss.addr, data.addr + data.size);
+        assert_eq!(data.addr, vars.addr + vars.size);
+        assert!(
+            image
+                .windows(b"__tlv_bootstrap\0".len())
+                .any(|w| w == b"__tlv_bootstrap\0")
+        );
     }
 
     #[test]
