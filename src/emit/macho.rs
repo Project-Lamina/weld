@@ -710,8 +710,8 @@ pub fn emit_macho_executable_dynamic(
             sh_type: 1,
             name: "__data".to_string(),
             data: vec![0u8; 8],
-            vaddr: 0,
-            flags: 0,
+            vaddr: SEG_BASE + 0x8000,
+            flags: 2,
             align: 3,
         });
     }
@@ -911,7 +911,15 @@ pub fn emit_macho_executable_dynamic(
             let (segname, sectname) = section_name_fields(&sec.name);
             let (flags, reserved1, reserved2) = section_meta(sectname);
             let base = 72 + i * SECT64_SIZE;
-            let sec_offset_in_segment = sec.vaddr - data_base;
+            let Some(sec_offset_in_segment) = sec.vaddr.checked_sub(data_base) else {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "section {} at {:#x} lies before __DATA at {:#x}",
+                        sec.name, sec.vaddr, data_base
+                    ),
+                ));
+            };
             let sec_file_offset = data_file_off + sec_offset_in_segment;
             data_seg[base..base + 16].copy_from_slice(&pad_segname(sectname));
             data_seg[base + 16..base + 32].copy_from_slice(&pad_segname(segname));
@@ -1155,5 +1163,131 @@ mod tests {
         assert!(out.len() >= 32);
         assert_eq!(&out[0..4], &0xFEEDFACFu32.to_le_bytes());
         assert_eq!(&out[4..8], &0x01000007u32.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod macho_layout_tests {
+    use super::*;
+
+    /// Every section a Mach-O declares must sit inside its own segment, and no
+    /// two segments may overlap, or dyld aborts the process before `main`.
+    struct Sect {
+        name: String,
+        addr: u64,
+        size: u64,
+    }
+
+    struct Seg {
+        name: String,
+        vmaddr: u64,
+        vmsize: u64,
+        sects: Vec<Sect>,
+    }
+
+    fn segments_and_sections(image: &[u8]) -> Vec<Seg> {
+        let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap()) as usize;
+        let mut off = 32usize;
+        let mut out = Vec::new();
+        for _ in 0..ncmds {
+            let cmd = u32::from_le_bytes(image[off..off + 4].try_into().unwrap());
+            let size = u32::from_le_bytes(image[off + 4..off + 8].try_into().unwrap()) as usize;
+            if cmd == LC_SEGMENT_64 {
+                let name = String::from_utf8_lossy(&image[off + 8..off + 24])
+                    .trim_end_matches('\0')
+                    .to_string();
+                let vmaddr = u64::from_le_bytes(image[off + 24..off + 32].try_into().unwrap());
+                let vmsize = u64::from_le_bytes(image[off + 32..off + 40].try_into().unwrap());
+                let nsects =
+                    u32::from_le_bytes(image[off + 64..off + 68].try_into().unwrap()) as usize;
+                let mut sects = Vec::new();
+                for i in 0..nsects {
+                    let s = off + 72 + i * 80;
+                    let sn = String::from_utf8_lossy(&image[s..s + 16])
+                        .trim_end_matches('\0')
+                        .to_string();
+                    let addr = u64::from_le_bytes(image[s + 32..s + 40].try_into().unwrap());
+                    let sz = u64::from_le_bytes(image[s + 40..s + 48].try_into().unwrap());
+                    sects.push(Sect {
+                        name: sn,
+                        addr,
+                        size: sz,
+                    });
+                }
+                out.push(Seg {
+                    name,
+                    vmaddr,
+                    vmsize,
+                    sects,
+                });
+            }
+            off += size;
+        }
+        out
+    }
+
+    #[test]
+    fn every_section_sits_inside_its_segment_without_data_input() {
+        let layout = MergedLayout {
+            sections: vec![MergedSection {
+                entsize: 0,
+                sh_type: 1,
+                name: "__text".to_string(),
+                data: vec![0u8; 0x28],
+                vaddr: 0x100004000,
+                flags: 2 | 4,
+                align: 2,
+            }],
+            section_by_name: HashMap::default(),
+        };
+        let dyn_info = DynamicLinkInfo {
+            pie: true,
+            shared: false,
+            needed: Vec::new(),
+            plt_symbols: Vec::new(),
+            weak_plt_symbols: Vec::new(),
+            interpreter: None,
+            macho_rebase_addrs: Vec::new(),
+            macho_direct_binds: Vec::new(),
+        };
+        let mut image = Vec::new();
+        emit_macho_executable_dynamic(
+            &layout,
+            TargetArch::AArch64,
+            0x100004000,
+            &dyn_info,
+            &mut image,
+        )
+        .expect("emit");
+
+        let segs = segments_and_sections(&image);
+        for seg in &segs {
+            for sect in &seg.sects {
+                assert!(
+                    sect.addr >= seg.vmaddr && sect.addr + sect.size <= seg.vmaddr + seg.vmsize,
+                    "{}.{} at {:#x}+{:#x} is outside {} at {:#x}+{:#x}",
+                    seg.name,
+                    sect.name,
+                    sect.addr,
+                    sect.size,
+                    seg.name,
+                    seg.vmaddr,
+                    seg.vmsize
+                );
+            }
+        }
+        let loaded: Vec<_> = segs.iter().filter(|s| s.name != "__PAGEZERO").collect();
+        for pair in loaded.windows(2) {
+            let (first, next) = (pair[0], pair[1]);
+            assert!(
+                first.vmaddr + first.vmsize <= next.vmaddr,
+                "{} at {:#x}+{:#x} overlaps {} at {:#x}",
+                first.name,
+                first.vmaddr,
+                first.vmsize,
+                next.name,
+                next.vmaddr
+            );
+        }
     }
 }
