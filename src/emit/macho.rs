@@ -18,6 +18,8 @@ const MH_NOUNDEFS: u32 = 0x1;
 const MH_DYLDLINK: u32 = 0x4;
 const MH_TWOLEVEL: u32 = 0x80;
 const MH_PIE: u32 = 0x200000;
+/// dyld only walks thread-local descriptors when the header declares them.
+const MH_HAS_TLV_DESCRIPTORS: u32 = 0x800000;
 const CPU_TYPE_X86_64: u32 = 0x01000007;
 const CPU_TYPE_ARM64: u32 = 0x0100000C;
 const LC_SEGMENT_64: u32 = 0x19;
@@ -775,6 +777,9 @@ pub fn emit_macho_executable_dynamic_with(
     }
     let text_sections: Vec<&MergedSection> = text_sections_owned.iter().collect();
     let data_sections: Vec<&MergedSection> = data_sections_owned.iter().collect();
+    let has_thread_vars = data_sections
+        .iter()
+        .any(|s| section_name_fields(&s.name).1 == "__thread_vars");
 
     let text_layout = MergedLayout {
         sections: text_sections_owned.clone(),
@@ -1156,7 +1161,10 @@ pub fn emit_macho_executable_dynamic_with(
     hdr[12..16].copy_from_slice(&MH_EXECUTABLE.to_le_bytes());
     hdr[16..20].copy_from_slice(&total_cmds.to_le_bytes());
     hdr[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
-    let flags = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE;
+    let mut flags = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE;
+    if has_thread_vars {
+        flags |= MH_HAS_TLV_DESCRIPTORS;
+    }
     hdr[24..28].copy_from_slice(&flags.to_le_bytes());
     out.write_all(&hdr)?;
     out.write_all(&lc_buf)?;
@@ -1329,6 +1337,52 @@ mod macho_layout_tests {
             ],
             section_by_name: HashMap::default(),
         }
+    }
+
+    #[test]
+    fn thread_vars_set_the_tlv_descriptor_header_flag() {
+        let dyn_info = DynamicLinkInfo {
+            pie: true,
+            shared: false,
+            needed: Vec::new(),
+            plt_symbols: Vec::new(),
+            weak_plt_symbols: Vec::new(),
+            interpreter: None,
+            macho_rebase_addrs: Vec::new(),
+            macho_direct_binds: vec![(0x100008000, "__tlv_bootstrap".to_string(), false, 0)],
+        };
+        let emit = |layout: &MergedLayout| {
+            let mut image = Vec::new();
+            emit_macho_executable_dynamic(
+                layout,
+                TargetArch::AArch64,
+                0x100004000,
+                &dyn_info,
+                &mut image,
+            )
+            .expect("emit");
+            image
+        };
+        let with_tls = emit(&tls_layout());
+        let without = emit(&MergedLayout {
+            sections: vec![MergedSection {
+                entsize: 0,
+                sh_type: 1,
+                name: "__text".to_string(),
+                data: vec![0u8; 0x28],
+                vaddr: 0x100004000,
+                flags: 2 | 4,
+                align: 2,
+            }],
+            section_by_name: HashMap::default(),
+        });
+        let flags = |img: &[u8]| u32::from_le_bytes(img[24..28].try_into().unwrap());
+        assert_ne!(
+            flags(&with_tls) & MH_HAS_TLV_DESCRIPTORS,
+            0,
+            "dyld skips thread-local setup without this flag"
+        );
+        assert_eq!(flags(&without) & MH_HAS_TLV_DESCRIPTORS, 0);
     }
 
     #[test]
