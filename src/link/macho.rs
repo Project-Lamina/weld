@@ -10,7 +10,8 @@ use crate::{
         ARM64_RELOC_ADDEND, ARM64_RELOC_BRANCH26, ARM64_RELOC_GOT_LOAD_PAGE21,
         ARM64_RELOC_GOT_LOAD_PAGEOFF12, ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12,
         ARM64_RELOC_TLVP_LOAD_PAGE21, ARM64_RELOC_TLVP_LOAD_PAGEOFF12, GENERIC_RELOC_VANILLA,
-        Macho64Object, MachoSection, MachoSymbol, parse_macho_relocs, parse_macho64_object,
+        Macho64Object, MachoReloc, MachoSection, MachoSymbol, parse_macho_relocs,
+        parse_macho64_object,
     },
 };
 use std::path::PathBuf;
@@ -27,6 +28,15 @@ const S_GB_ZEROFILL: u32 = 0xc;
 const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
 const N_WEAK_DEF: u16 = 0x0080;
 const N_EXT: u8 = 0x01;
+const X86_64_RELOC_SIGNED: u32 = 1;
+const X86_64_RELOC_BRANCH: u32 = 2;
+const X86_64_RELOC_GOT_LOAD: u32 = 3;
+const X86_64_RELOC_GOT: u32 = 4;
+const X86_64_RELOC_SUBTRACTOR: u32 = 5;
+const X86_64_RELOC_SIGNED_1: u32 = 6;
+const X86_64_RELOC_SIGNED_2: u32 = 7;
+const X86_64_RELOC_SIGNED_4: u32 = 8;
+const X86_64_RELOC_TLV: u32 = 9;
 
 fn macho_section_merge_order(sectname: &str) -> usize {
     match sectname {
@@ -417,11 +427,97 @@ fn section_offset_from_contrib(contrib: &HashMap<u8, ObjectSectionContrib>) -> H
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelocKind {
+    Generic,
+    Addend,
+    Arm64Branch26,
+    Arm64Page21,
+    Arm64PageOff12,
+    Arm64GotLoadPage21,
+    Arm64GotLoadPageOff12,
+    Arm64TlvpPage21,
+    Arm64TlvpPageOff12,
+    /// A 32-bit pc-relative field. `adjust` is the number of instruction bytes
+    /// that follow the field. `through_got` marks references that must resolve
+    /// to a GOT slot instead of the symbol itself.
+    X86Pcrel {
+        adjust: u64,
+        through_got: bool,
+    },
+}
+
+fn decode_arm64_reloc_kind(r_type: u32) -> Result<RelocKind, String> {
+    Ok(match r_type {
+        GENERIC_RELOC_VANILLA => RelocKind::Generic,
+        ARM64_RELOC_ADDEND => RelocKind::Addend,
+        ARM64_RELOC_BRANCH26 => RelocKind::Arm64Branch26,
+        ARM64_RELOC_PAGE21 => RelocKind::Arm64Page21,
+        ARM64_RELOC_PAGEOFF12 => RelocKind::Arm64PageOff12,
+        ARM64_RELOC_GOT_LOAD_PAGE21 => RelocKind::Arm64GotLoadPage21,
+        ARM64_RELOC_GOT_LOAD_PAGEOFF12 => RelocKind::Arm64GotLoadPageOff12,
+        ARM64_RELOC_TLVP_LOAD_PAGE21 => RelocKind::Arm64TlvpPage21,
+        ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => RelocKind::Arm64TlvpPageOff12,
+        other => return Err(format!("unsupported Mach-O relocation type {}", other)),
+    })
+}
+
+fn decode_x86_64_reloc_kind(r: &MachoReloc) -> Result<RelocKind, String> {
+    let pcrel32 = |adjust: u64, through_got: bool| {
+        if r.r_pcrel && r.r_length == 2 {
+            Ok(RelocKind::X86Pcrel {
+                adjust,
+                through_got,
+            })
+        } else {
+            Err(format!(
+                "x86_64 relocation type {} must be a 32-bit pc-relative field (pcrel={}, length={})",
+                r.r_type, r.r_pcrel, r.r_length
+            ))
+        }
+    };
+    match r.r_type {
+        GENERIC_RELOC_VANILLA => {
+            if r.r_pcrel || r.r_length != 3 {
+                Err(format!(
+                    "x86_64 UNSIGNED relocation must be a 64-bit absolute field (pcrel={}, length={})",
+                    r.r_pcrel, r.r_length
+                ))
+            } else {
+                Ok(RelocKind::Generic)
+            }
+        }
+        X86_64_RELOC_SIGNED | X86_64_RELOC_BRANCH => pcrel32(0, false),
+        X86_64_RELOC_GOT_LOAD | X86_64_RELOC_GOT => pcrel32(0, true),
+        X86_64_RELOC_SIGNED_1 => pcrel32(1, false),
+        X86_64_RELOC_SIGNED_2 => pcrel32(2, false),
+        X86_64_RELOC_SIGNED_4 => pcrel32(4, false),
+        X86_64_RELOC_SUBTRACTOR => Err("x86_64 SUBTRACTOR relocations are not supported".into()),
+        X86_64_RELOC_TLV => Err("x86_64 TLV relocations are not supported".into()),
+        other => Err(format!(
+            "unsupported x86_64 Mach-O relocation type {}",
+            other
+        )),
+    }
+}
+
+fn decode_reloc_kind(arch: TargetArch, r: &MachoReloc) -> Result<RelocKind, String> {
+    match arch {
+        TargetArch::X86_64 => decode_x86_64_reloc_kind(r),
+        TargetArch::AArch64 => decode_arm64_reloc_kind(r.r_type),
+        _ => Err(format!(
+            "Mach-O relocations are not supported for {:?}",
+            arch
+        )),
+    }
+}
+
 // Relocation application requires the full object context and all output-layout
 // references simultaneously. A builder struct would not reduce real complexity here.
 #[allow(clippy::too_many_arguments)]
 fn apply_macho_relocations(
     obj: &Macho64Object,
+    arch: TargetArch,
     layout: &mut MergedLayout,
     _symbol_addrs: &HashMap<String, u64>,
     symbol_addr_by_idx: &[Option<u64>],
@@ -498,7 +594,8 @@ fn apply_macho_relocations(
         let mut addend_by_address: HashMap<u32, i64> = HashMap::default();
 
         for r in &relocs {
-            if r.r_type == ARM64_RELOC_ADDEND {
+            let kind = decode_reloc_kind(arch, r)?;
+            if kind == RelocKind::Addend {
                 addend_by_address.insert(r.r_address, decode_arm64_reloc_addend(r.r_symbolnum));
                 continue;
             }
@@ -532,7 +629,7 @@ fn apply_macho_relocations(
                     .map(|s| {
                         !s.is_defined
                             && is_thread_vars_section(&merged.name)
-                            && r.r_type == GENERIC_RELOC_VANILLA
+                            && kind == RelocKind::Generic
                             && r.r_length == 3
                             && !r.r_pcrel
                     })
@@ -588,6 +685,18 @@ fn apply_macho_relocations(
                     addr
                 }
             } else {
+                if matches!(
+                    kind,
+                    RelocKind::X86Pcrel {
+                        through_got: true,
+                        ..
+                    }
+                ) {
+                    return Err(format!(
+                        "x86_64 GOT reference at offset 0x{:x} has no external symbol",
+                        off
+                    ));
+                }
                 let sect_idx = r.r_symbolnum as u8;
 
                 vaddr_by_sect.get(&sect_idx).copied().unwrap_or(0)
@@ -664,9 +773,10 @@ fn apply_macho_relocations(
                 if r.r_extern
                     && let Some(sym) = obj.symbols.get(r.r_symbolnum as usize)
                 {
-                    if r.r_type == ARM64_RELOC_TLVP_LOAD_PAGE21
-                        || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12
-                    {
+                    if matches!(
+                        kind,
+                        RelocKind::Arm64TlvpPage21 | RelocKind::Arm64TlvpPageOff12
+                    ) {
                         let sec_info = if sym.sect != 0 {
                             obj.sections
                                 .get((sym.sect - 1) as usize)
@@ -720,8 +830,8 @@ fn apply_macho_relocations(
                 }
             }
 
-            match r.r_type {
-                GENERIC_RELOC_VANILLA => match r.r_length {
+            match kind {
+                RelocKind::Generic => match r.r_length {
                     0 => {
                         let addend = read_addend(&merged.data, off, r.r_length);
                         let mut value = base_runtime.wrapping_add(addend);
@@ -774,7 +884,7 @@ fn apply_macho_relocations(
                     }
                     _ => {}
                 },
-                ARM64_RELOC_BRANCH26 => {
+                RelocKind::Arm64Branch26 => {
                     if merged.data.len() < off + 4 {
                         return Err("branch reloc: buffer too short".to_string());
                     }
@@ -799,7 +909,9 @@ fn apply_macho_relocations(
                     let patched = (insn & 0xfc00_0000) | imm26_bits;
                     write_u32_le(&mut merged.data, off, patched);
                 }
-                ARM64_RELOC_PAGE21 | ARM64_RELOC_GOT_LOAD_PAGE21 | ARM64_RELOC_TLVP_LOAD_PAGE21 => {
+                RelocKind::Arm64Page21
+                | RelocKind::Arm64GotLoadPage21
+                | RelocKind::Arm64TlvpPage21 => {
                     if merged.data.len() < off + 4 {
                         return Err("page21 reloc: buffer too short".to_string());
                     }
@@ -821,9 +933,9 @@ fn apply_macho_relocations(
                     let patched = (insn & 0x9F00001F) | (imm_lo << 29) | (imm_hi << 5);
                     write_u32_le(&mut merged.data, off, patched);
                 }
-                ARM64_RELOC_PAGEOFF12
-                | ARM64_RELOC_TLVP_LOAD_PAGEOFF12
-                | ARM64_RELOC_GOT_LOAD_PAGEOFF12 => {
+                RelocKind::Arm64PageOff12
+                | RelocKind::Arm64TlvpPageOff12
+                | RelocKind::Arm64GotLoadPageOff12 => {
                     if merged.data.len() < off + 4 {
                         return Err("pageoff12 reloc: buffer too short".to_string());
                     }
@@ -832,7 +944,7 @@ fn apply_macho_relocations(
                     let addend = insn_addend + extra_addend;
                     let target = add_signed_u64(base_runtime, addend);
                     let pageoff = (target & 0x0fff) as u32;
-                    let patched = if r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+                    let patched = if kind == RelocKind::Arm64TlvpPageOff12
                         && r.r_extern
                         && obj
                             .symbols
@@ -852,9 +964,21 @@ fn apply_macho_relocations(
                     })?;
                     write_u32_le(&mut merged.data, off, patched);
                 }
-                ARM64_RELOC_ADDEND => {}
-                _ => {
-                    return Err(format!("unsupported Mach-O relocation type {}", r.r_type));
+                RelocKind::Addend => {}
+                RelocKind::X86Pcrel { adjust, .. } => {
+                    if merged.data.len() < off + 4 {
+                        return Err("x86_64 pc-relative reloc: buffer too short".to_string());
+                    }
+                    let addend = read_u32_le(&merged.data, off).unwrap_or(0) as i32 as i128;
+                    let target = base_runtime as i128 + addend;
+                    let disp = target - (place_runtime as i128 + 4 + adjust as i128);
+                    let disp = i32::try_from(disp).map_err(|_| {
+                        format!(
+                            "x86_64 pc-relative reloc out of range: target=0x{:x} place=0x{:x}",
+                            target, place_runtime
+                        )
+                    })?;
+                    write_u32_le(&mut merged.data, off, disp as u32);
                 }
             }
         }
@@ -877,6 +1001,7 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let symbol_addr_by_idx = symbol_addr_by_index(&obj, &layout, &symbol_addrs);
     apply_macho_relocations(
         &obj,
+        arch,
         &mut layout,
         &symbol_addrs,
         &symbol_addr_by_idx,
@@ -1114,6 +1239,68 @@ pub fn link_macho_multi_object(
         }
     }
 
+    if arch == TargetArch::X86_64 {
+        for obj in &objects {
+            for sec in &obj.sections {
+                if sec.nreloc == 0 {
+                    continue;
+                }
+                let merged_name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
+                if !layout.section_by_name.contains_key(&merged_name) {
+                    continue;
+                }
+                for r in parse_macho_relocs(&obj.data, sec.reloff, sec.nreloc) {
+                    let kind = decode_reloc_kind(arch, &r)?;
+                    if !matches!(
+                        kind,
+                        RelocKind::X86Pcrel {
+                            through_got: true,
+                            ..
+                        }
+                    ) {
+                        continue;
+                    }
+                    let name = obj
+                        .symbols
+                        .get(r.r_symbolnum as usize)
+                        .filter(|_| r.r_extern)
+                        .map(|s| s.name.clone())
+                        .ok_or_else(|| {
+                            format!(
+                                "x86_64 GOT reference at offset 0x{:x} has no external symbol",
+                                r.r_address
+                            )
+                        })?;
+                    if !global_symbols.contains_key(&name) {
+                        return Err(format!(
+                            "x86_64 GOT reference to undefined symbol {} is not supported",
+                            name
+                        ));
+                    }
+                    if got_symbol_set.insert(name.clone()) {
+                        got_symbols.push(name);
+                    }
+                }
+            }
+        }
+        if !got_symbols.is_empty() {
+            let last = layout.sections.last().ok_or("no sections")?;
+            let got_vaddr = align_up_bytes(last.vaddr + last.data.len() as u64, 0x8000);
+            layout.sections.push(MergedSection {
+                entsize: 0,
+                sh_type: 1,
+                name: "__got".into(),
+                data: vec![0u8; got_symbols.len() * 8],
+                vaddr: got_vaddr,
+                flags: 2,
+                align: 8,
+            });
+            layout
+                .section_by_name
+                .insert("__got".into(), layout.sections.len() - 1);
+        }
+    }
+
     let (text_shift, data_shift) = compute_runtime_shifts(&layout);
 
     if let Some(stubs_idx) = layout.section_by_name.get("__stubs").copied() {
@@ -1190,6 +1377,7 @@ pub fn link_macho_multi_object(
         let offset_map = section_offset_from_contrib(contrib);
         apply_macho_relocations(
             obj,
+            arch,
             &mut layout,
             &global_symbols,
             &symbol_addrs,
@@ -1575,7 +1763,7 @@ fn merge_macho_sections_multi(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::macho::Macho64Header;
 
@@ -1660,5 +1848,458 @@ mod tests {
             vec![0; 4],
         );
         assert!(merge_macho_sections_multi(&[obj]).is_err());
+    }
+
+    pub(crate) const X86_64_CPU: u32 = 0x0100_0007;
+    const RELOC_SIGNED_4: u32 = 8;
+
+    pub(crate) struct TestReloc {
+        address: u32,
+        symbolnum: u32,
+        pcrel: bool,
+        length: u32,
+        external: bool,
+        rtype: u32,
+    }
+
+    pub(crate) struct TestSection {
+        segname: &'static str,
+        sectname: &'static str,
+        data: Vec<u8>,
+        relocs: Vec<TestReloc>,
+    }
+
+    pub(crate) struct TestSymbol {
+        name: &'static str,
+        sect: u8,
+        value: u64,
+        external: bool,
+    }
+
+    pub(crate) fn reloc(
+        address: u32,
+        symbolnum: u32,
+        pcrel: bool,
+        length: u32,
+        external: bool,
+        rtype: u32,
+    ) -> TestReloc {
+        TestReloc {
+            address,
+            symbolnum,
+            pcrel,
+            length,
+            external,
+            rtype,
+        }
+    }
+
+    pub(crate) fn macho_object(
+        cputype: u32,
+        sections: &[TestSection],
+        symbols: &[TestSymbol],
+    ) -> Vec<u8> {
+        let seg_cmd_size = 72 + 80 * sections.len();
+        let mut out = vec![0u8; 32 + seg_cmd_size + 24];
+        let mut data_offsets = Vec::new();
+        for sec in sections {
+            data_offsets.push(out.len());
+            out.extend_from_slice(&sec.data);
+        }
+        let mut reloc_offsets = Vec::new();
+        for sec in sections {
+            reloc_offsets.push(out.len());
+            for r in &sec.relocs {
+                let info = (r.symbolnum & 0x00ff_ffff)
+                    | ((r.pcrel as u32) << 24)
+                    | (r.length << 25)
+                    | ((r.external as u32) << 27)
+                    | (r.rtype << 28);
+                out.extend_from_slice(&r.address.to_le_bytes());
+                out.extend_from_slice(&info.to_le_bytes());
+            }
+        }
+        let symoff = out.len();
+        let mut strtab = vec![0u8];
+        for s in symbols {
+            let strx = strtab.len() as u32;
+            strtab.extend_from_slice(s.name.as_bytes());
+            strtab.push(0);
+            let n_type = (if s.sect == 0 { 0 } else { 0x0e }) | s.external as u8;
+            out.extend_from_slice(&strx.to_le_bytes());
+            out.push(n_type);
+            out.push(s.sect);
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&s.value.to_le_bytes());
+        }
+        let stroff = out.len();
+        out.extend_from_slice(&strtab);
+
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(&0xFEEDFACFu32.to_le_bytes());
+        hdr.extend_from_slice(&cputype.to_le_bytes());
+        hdr.extend_from_slice(&3u32.to_le_bytes());
+        hdr.extend_from_slice(&1u32.to_le_bytes());
+        hdr.extend_from_slice(&2u32.to_le_bytes());
+        hdr.extend_from_slice(&((seg_cmd_size + 24) as u32).to_le_bytes());
+        hdr.extend_from_slice(&0u32.to_le_bytes());
+        hdr.extend_from_slice(&0u32.to_le_bytes());
+        out[..32].copy_from_slice(&hdr);
+
+        let mut seg = Vec::new();
+        seg.extend_from_slice(&0x19u32.to_le_bytes());
+        seg.extend_from_slice(&(seg_cmd_size as u32).to_le_bytes());
+        seg.extend_from_slice(&[0u8; 16]);
+        seg.extend_from_slice(&[0u8; 32]);
+        seg.extend_from_slice(&7u32.to_le_bytes());
+        seg.extend_from_slice(&7u32.to_le_bytes());
+        seg.extend_from_slice(&(sections.len() as u32).to_le_bytes());
+        seg.extend_from_slice(&0u32.to_le_bytes());
+        for (i, sec) in sections.iter().enumerate() {
+            let mut sh = Vec::new();
+            let mut sectname = [0u8; 16];
+            sectname[..sec.sectname.len()].copy_from_slice(sec.sectname.as_bytes());
+            let mut segname = [0u8; 16];
+            segname[..sec.segname.len()].copy_from_slice(sec.segname.as_bytes());
+            sh.extend_from_slice(&sectname);
+            sh.extend_from_slice(&segname);
+            sh.extend_from_slice(&0u64.to_le_bytes());
+            sh.extend_from_slice(&(sec.data.len() as u64).to_le_bytes());
+            sh.extend_from_slice(&(data_offsets[i] as u32).to_le_bytes());
+            sh.extend_from_slice(&4u32.to_le_bytes());
+            sh.extend_from_slice(&(reloc_offsets[i] as u32).to_le_bytes());
+            sh.extend_from_slice(&(sec.relocs.len() as u32).to_le_bytes());
+            sh.extend_from_slice(&0u32.to_le_bytes());
+            sh.extend_from_slice(&[0u8; 12]);
+            seg.extend_from_slice(&sh);
+        }
+        out[32..32 + seg_cmd_size].copy_from_slice(&seg);
+
+        let mut symtab = Vec::new();
+        symtab.extend_from_slice(&2u32.to_le_bytes());
+        symtab.extend_from_slice(&24u32.to_le_bytes());
+        symtab.extend_from_slice(&(symoff as u32).to_le_bytes());
+        symtab.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
+        symtab.extend_from_slice(&(stroff as u32).to_le_bytes());
+        symtab.extend_from_slice(&(strtab.len() as u32).to_le_bytes());
+        let at = 32 + seg_cmd_size;
+        out[at..at + 24].copy_from_slice(&symtab);
+        out
+    }
+
+    pub(crate) fn text(data: Vec<u8>, relocs: Vec<TestReloc>) -> TestSection {
+        TestSection {
+            segname: "__TEXT",
+            sectname: "__text",
+            data,
+            relocs,
+        }
+    }
+
+    pub(crate) fn data_sect(data: Vec<u8>) -> TestSection {
+        TestSection {
+            segname: "__DATA",
+            sectname: "__data",
+            data,
+            relocs: Vec::new(),
+        }
+    }
+
+    pub(crate) fn defined(name: &'static str, sect: u8, value: u64) -> TestSymbol {
+        TestSymbol {
+            name,
+            sect,
+            value,
+            external: true,
+        }
+    }
+
+    pub(crate) fn undefined(name: &'static str) -> TestSymbol {
+        TestSymbol {
+            name,
+            sect: 0,
+            value: 0,
+            external: true,
+        }
+    }
+
+    fn i32_at(data: &[u8], off: usize) -> i64 {
+        i32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as i64
+    }
+
+    fn text_bytes(layout: &MergedLayout) -> (&[u8], u64) {
+        let sec = &layout.sections[layout.section_by_name[".text"]];
+        (&sec.data, sec.vaddr)
+    }
+
+    pub(crate) fn link_pair(a: Vec<u8>, b: Vec<u8>) -> Result<LinkResult, String> {
+        link_macho_multi_object(&[a.as_slice(), b.as_slice()], None, &[], &[])
+    }
+
+    #[test]
+    fn x86_branch_to_symbol_in_other_object_patches_rel32() {
+        let caller = macho_object(
+            X86_64_CPU,
+            &[text(
+                vec![0x90, 0x90, 0x90, 0x90, 0xE8, 0, 0, 0, 0, 0xC3],
+                vec![reloc(5, 0, true, 2, true, X86_64_RELOC_BRANCH)],
+            )],
+            &[undefined("_callee")],
+        );
+        let callee = macho_object(
+            X86_64_CPU,
+            &[text(vec![0xC3], Vec::new())],
+            &[defined("_callee", 1, 0)],
+        );
+        let result = link_pair(caller, callee).expect("links");
+        let (bytes, text_vaddr) = text_bytes(&result.layout);
+        assert_eq!(bytes[4], 0xE8);
+        let target = result.symbol_addrs["_callee"];
+        let place = text_vaddr + 5;
+        assert_eq!(i32_at(bytes, 5), target as i64 - (place as i64 + 4));
+    }
+
+    #[test]
+    fn x86_branch_in_single_object_patches_rel32() {
+        let obj = macho_object(
+            X86_64_CPU,
+            &[text(
+                vec![0xE8, 0, 0, 0, 0, 0xC3, 0xC3, 0xC3],
+                vec![reloc(1, 0, true, 2, true, X86_64_RELOC_BRANCH)],
+            )],
+            &[defined("_self", 1, 6)],
+        );
+        let result = link_macho_single_object(&obj).expect("links");
+        let (bytes, text_vaddr) = text_bytes(&result.layout);
+        assert_eq!(
+            i32_at(bytes, 1),
+            (text_vaddr as i64 + 6) - (text_vaddr as i64 + 1 + 4)
+        );
+    }
+
+    #[test]
+    fn x86_signed_4_skips_the_trailing_immediate() {
+        let user = macho_object(
+            X86_64_CPU,
+            &[text(
+                vec![0xC7, 0x05, 0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44],
+                vec![reloc(2, 0, true, 2, true, RELOC_SIGNED_4)],
+            )],
+            &[undefined("_var")],
+        );
+        let home = macho_object(
+            X86_64_CPU,
+            &[data_sect(vec![0; 8])],
+            &[defined("_var", 1, 0)],
+        );
+        let result = link_pair(user, home).expect("links");
+        let (bytes, text_vaddr) = text_bytes(&result.layout);
+        let (text_shift, data_shift) = compute_runtime_shifts(&result.layout);
+        let target = result.symbol_addrs["_var"] + data_shift;
+        let place = text_vaddr + text_shift + 2;
+        assert_eq!(i32_at(bytes, 2), target as i64 - (place as i64 + 4 + 4));
+        assert_eq!(
+            &bytes[6..10],
+            &[0x11, 0x22, 0x33, 0x44],
+            "immediate is untouched"
+        );
+    }
+
+    #[test]
+    fn x86_signed_non_extern_resolves_against_section_base() {
+        let obj = macho_object(
+            X86_64_CPU,
+            &[text(
+                vec![8, 0, 0, 0, 0xC3, 0xC3, 0xC3, 0xC3, 0xC3, 0xC3, 0xC3, 0xC3],
+                vec![reloc(0, 1, true, 2, false, X86_64_RELOC_SIGNED)],
+            )],
+            &[],
+        );
+        let result = link_macho_single_object(&obj).expect("links");
+        let (bytes, text_vaddr) = text_bytes(&result.layout);
+        assert_eq!(
+            i32_at(bytes, 0),
+            (text_vaddr as i64 + 8) - (text_vaddr as i64 + 4)
+        );
+    }
+
+    #[test]
+    fn x86_got_load_points_at_a_prefilled_slot() {
+        let user = macho_object(
+            X86_64_CPU,
+            &[text(
+                vec![0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3],
+                vec![reloc(3, 0, true, 2, true, X86_64_RELOC_GOT_LOAD)],
+            )],
+            &[undefined("_var")],
+        );
+        let home = macho_object(
+            X86_64_CPU,
+            &[data_sect(vec![0x2A; 8])],
+            &[defined("_var", 1, 0)],
+        );
+        let result = link_pair(user, home).expect("links");
+        let (bytes, text_vaddr) = text_bytes(&result.layout);
+        let got = &result.layout.sections[result.layout.section_by_name["__got"]];
+        let slot = got.vaddr;
+        let (text_shift, data_shift) = compute_runtime_shifts(&result.layout);
+        let var = result.symbol_addrs["_var"];
+        assert_eq!(
+            u64::from_le_bytes(got.data[..8].try_into().unwrap()),
+            var + data_shift
+        );
+        let slot_runtime = slot + data_shift;
+        let place = text_vaddr + text_shift + 3;
+        assert_eq!(i32_at(bytes, 3), slot_runtime as i64 - (place as i64 + 4));
+        let dynamic = result.dynamic.expect("got needs dynamic info");
+        assert!(dynamic.macho_rebase_addrs.contains(&slot));
+    }
+
+    #[test]
+    fn x86_got_to_undefined_symbol_is_error() {
+        let user = macho_object(
+            X86_64_CPU,
+            &[text(
+                vec![0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3],
+                vec![reloc(3, 0, true, 2, true, X86_64_RELOC_GOT_LOAD)],
+            )],
+            &[undefined("_ext")],
+        );
+        let home = macho_object(
+            X86_64_CPU,
+            &[text(vec![0xC3], Vec::new())],
+            &[defined("_home", 1, 0)],
+        );
+        let Err(err) = link_pair(user, home) else {
+            panic!("must fail")
+        };
+        assert!(err.contains("undefined symbol _ext"), "{err}");
+    }
+
+    #[test]
+    fn x86_branch_to_undefined_symbol_is_error() {
+        let obj = macho_object(
+            X86_64_CPU,
+            &[text(
+                vec![0xE8, 0, 0, 0, 0, 0xC3],
+                vec![reloc(1, 0, true, 2, true, X86_64_RELOC_BRANCH)],
+            )],
+            &[undefined("_printf")],
+        );
+        let Err(err) = link_macho_single_object(&obj) else {
+            panic!("must fail")
+        };
+        assert!(err.contains("undefined symbol"), "{err}");
+    }
+
+    #[test]
+    fn x86_relocation_types_without_support_are_errors() {
+        let cases = [
+            (X86_64_RELOC_SUBTRACTOR, 2, false, "SUBTRACTOR"),
+            (X86_64_RELOC_TLV, 2, true, "TLV"),
+            (12, 2, true, "unsupported x86_64"),
+            (X86_64_RELOC_SIGNED, 2, false, "32-bit pc-relative"),
+            (0, 2, false, "64-bit absolute"),
+        ];
+        for (rtype, length, pcrel, want) in cases {
+            let obj = macho_object(
+                X86_64_CPU,
+                &[text(
+                    vec![0; 8],
+                    vec![reloc(0, 0, pcrel, length, true, rtype)],
+                )],
+                &[defined("_s", 1, 0)],
+            );
+            let err = link_macho_single_object(&obj)
+                .err()
+                .unwrap_or_else(|| panic!("type {rtype} must be refused"));
+            assert!(err.contains(want), "type {rtype}: {err}");
+        }
+    }
+
+    #[test]
+    fn arm64_subtractor_is_still_refused_by_its_own_type() {
+        let Err(err) = decode_reloc_kind(
+            TargetArch::AArch64,
+            &MachoReloc {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: false,
+                r_length: 3,
+                r_extern: true,
+                r_type: 1,
+            },
+        ) else {
+            panic!("arm64 type 1 is unsupported")
+        };
+        assert_eq!(err, "unsupported Mach-O relocation type 1");
+    }
+
+    #[test]
+    fn x86_relocation_types_decode_to_their_own_kinds() {
+        let rel = |rtype: u32, pcrel: bool, length: u32| MachoReloc {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: pcrel,
+            r_length: length,
+            r_extern: true,
+            r_type: rtype,
+        };
+        let decode = |r: MachoReloc| decode_reloc_kind(TargetArch::X86_64, &r);
+        assert_eq!(decode(rel(0, false, 3)), Ok(RelocKind::Generic));
+        assert_eq!(
+            decode(rel(2, true, 2)),
+            Ok(RelocKind::X86Pcrel {
+                adjust: 0,
+                through_got: false
+            })
+        );
+        assert_eq!(
+            decode(rel(1, true, 2)),
+            Ok(RelocKind::X86Pcrel {
+                adjust: 0,
+                through_got: false
+            })
+        );
+        assert_eq!(
+            decode(rel(3, true, 2)),
+            Ok(RelocKind::X86Pcrel {
+                adjust: 0,
+                through_got: true
+            })
+        );
+        assert_eq!(
+            decode(rel(4, true, 2)),
+            Ok(RelocKind::X86Pcrel {
+                adjust: 0,
+                through_got: true
+            })
+        );
+        assert_eq!(
+            decode(rel(6, true, 2)),
+            Ok(RelocKind::X86Pcrel {
+                adjust: 1,
+                through_got: false
+            })
+        );
+        assert_eq!(
+            decode(rel(7, true, 2)),
+            Ok(RelocKind::X86Pcrel {
+                adjust: 2,
+                through_got: false
+            })
+        );
+        assert_eq!(
+            decode(rel(8, true, 2)),
+            Ok(RelocKind::X86Pcrel {
+                adjust: 4,
+                through_got: false
+            })
+        );
+        assert!(decode(rel(5, false, 3)).is_err());
+        assert!(decode(rel(9, true, 2)).is_err());
+        assert!(decode(rel(12, true, 2)).is_err());
+        assert!(decode(rel(0, true, 3)).is_err());
+        assert!(decode(rel(2, false, 2)).is_err());
     }
 }

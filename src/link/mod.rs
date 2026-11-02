@@ -115,6 +115,8 @@ pub struct LinkOptions {
     pub static_link: bool,
     /// `ld --dynamic-linker`.
     pub interpreter: Option<String>,
+    /// `--target` OS, which picks the default dynamic linker.
+    pub target_os: Option<String>,
     /// `ld -L`.
     pub search_paths: Vec<PathBuf>,
     /// `ld -rpath`, joined into one `DT_RUNPATH`.
@@ -124,6 +126,21 @@ pub struct LinkOptions {
     pub object_positions: Vec<usize>,
     pub gc_sections: bool,
     pub gc_roots: Vec<String>,
+}
+
+/// The dynamic linker for an executable: `--dynamic-linker`, else the default for
+/// `--target`. `None` leaves the choice to the architecture's default.
+fn requested_interpreter(opts: &LinkOptions) -> Result<Option<String>, String> {
+    if let Some(path) = opts.interpreter.as_ref() {
+        return Ok(Some(path.clone()));
+    }
+    match opts.target_os.as_deref() {
+        None | Some("linux") => Ok(None),
+        Some("freebsd") => Ok(Some("/libexec/ld-elf.so.1".to_string())),
+        Some(os) => Err(format!(
+            "no default dynamic linker is known for --target {os}; pass --dynamic-linker"
+        )),
+    }
 }
 
 /// Links ELF64 objects with `LinkOptions::default()`. `libs` names the libraries to
@@ -523,17 +540,21 @@ fn link_multi_object_parsed(
 
             // ld's --dynamic-linker when given. The default is glibc's on x86-64, which
             // is the only arch this branch runs for; it is wrong under musl.
-            let interpreter = opts
-                .interpreter
-                .clone()
-                .unwrap_or_else(|| "/lib64/ld-linux-x86-64.so.2".to_string());
+            let interpreter = if opts.shared {
+                None
+            } else {
+                Some(
+                    requested_interpreter(opts)?
+                        .unwrap_or_else(|| "/lib64/ld-linux-x86-64.so.2".to_string()),
+                )
+            };
             dynamic_info = Some(DynamicLinkInfo {
                 pie: opts.pie,
                 shared: opts.shared,
                 needed: needed.clone(),
                 plt_symbols: undefined,
                 weak_plt_symbols: Vec::new(),
-                interpreter: (!opts.shared).then_some(interpreter),
+                interpreter,
                 macho_rebase_addrs: Vec::new(),
                 macho_direct_binds: Vec::new(),
             });
@@ -655,7 +676,7 @@ fn link_multi_object_parsed(
         dynamic_info = Some(pie::add_dynamic(
             &mut layout,
             arch,
-            opts.interpreter.clone(),
+            requested_interpreter(opts)?,
         ));
     }
     if runtime.is_some()
@@ -1145,6 +1166,33 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+    #[test]
+    fn default_dynamic_linker_follows_target_os() {
+        let with_target = |os: Option<&str>| LinkOptions {
+            target_os: os.map(String::from),
+            ..LinkOptions::default()
+        };
+        assert_eq!(requested_interpreter(&with_target(None)), Ok(None));
+        assert_eq!(requested_interpreter(&with_target(Some("linux"))), Ok(None));
+        assert_eq!(
+            requested_interpreter(&with_target(Some("freebsd"))),
+            Ok(Some("/libexec/ld-elf.so.1".to_string()))
+        );
+        for os in ["orbis", "ps4", "prospero", "ps5", "none"] {
+            let error = requested_interpreter(&with_target(Some(os))).expect_err("must refuse");
+            assert!(error.contains(os), "{error}");
+        }
+        let explicit = LinkOptions {
+            interpreter: Some("/opt/ld.so".to_string()),
+            target_os: Some("orbis".to_string()),
+            ..LinkOptions::default()
+        };
+        assert_eq!(
+            requested_interpreter(&explicit),
+            Ok(Some("/opt/ld.so".to_string()))
+        );
+    }
 
     #[test]
     fn test_align_up() {

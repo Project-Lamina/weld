@@ -55,6 +55,7 @@ fn link_options(args: &ParsedArgs) -> LinkOptions {
         gc_sections: args.gc_sections,
         gc_roots: entry_seeds(args),
         object_positions: Vec::new(),
+        target_os: args.target_os.clone(),
     }
 }
 
@@ -107,26 +108,24 @@ fn ad_hoc_codesign(_path: &Path) -> Result<()> {
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn select_entry(args: &ParsedArgs, result: &LinkResult) -> Option<u64> {
-    if let Some(s) = args.entry.as_ref()
-        && let Some(&addr) = result.symbol_addrs.get(s)
-    {
-        return Some(addr);
+fn fail(message: impl std::fmt::Display) -> Option<i32> {
+    eprintln!("weld: {message}");
+    Some(1)
+}
+
+/// The address of the `-e` symbol, or of the default entry `_start`, `main` or `_main`.
+fn entry_address(args: &ParsedArgs, result: &LinkResult) -> std::result::Result<u64, String> {
+    if let Some(name) = args.entry.as_deref() {
+        return result
+            .symbol_addrs
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("entry symbol {name} is not defined"));
     }
-    result
-        .symbol_addrs
-        .get("_start")
-        .copied()
-        .or_else(|| result.symbol_addrs.get("main").copied())
-        .or_else(|| result.symbol_addrs.get("_main").copied())
-        .or_else(|| {
-            result
-                .layout
-                .sections
-                .first()
-                .filter(|s| s.name == ".text")
-                .map(|s| s.vaddr)
-        })
+    ["_start", "main", "_main"]
+        .iter()
+        .find_map(|name| result.symbol_addrs.get(*name).copied())
+        .ok_or_else(|| "no entry point: define _start, main or _main, or pass -e SYMBOL".into())
 }
 
 /// True when no real `_start` is defined, so weld must supply startup itself:
@@ -137,19 +136,17 @@ fn needs_synthetic_start(result: &LinkResult) -> bool {
 }
 
 /// Append a freestanding `_start` to a static x86_64 ELF layout and return its
-/// entry address. The stub calls `main`, then issues the `exit` syscall with
-/// `main`'s return value. `freebsd_abi` selects SYS_exit=1 (FreeBSD/Orbis/Prospero)
+/// entry address. The stub calls `main_addr`, then issues the `exit` syscall with
+/// its return value. `freebsd_abi` selects SYS_exit=1 (FreeBSD/Orbis/Prospero)
 /// vs SYS_exit=60 (Linux).
-fn synthesize_elf_start_x86_64(result: &mut LinkResult, freebsd_abi: bool) -> Option<u64> {
+fn synthesize_elf_start_x86_64(
+    result: &mut LinkResult,
+    main_addr: u64,
+    freebsd_abi: bool,
+) -> Option<u64> {
     if TargetArch::from_elf_machine(result.e_machine) != Some(TargetArch::X86_64) {
         return None;
     }
-
-    let main_addr = result
-        .symbol_addrs
-        .get("main")
-        .or_else(|| result.symbol_addrs.get("_main"))
-        .copied()?;
 
     let reserved = result
         .layout
@@ -217,14 +214,9 @@ fn synthesize_elf_start_x86_64(result: &mut LinkResult, freebsd_abi: bool) -> Op
 }
 
 /// Write a freestanding `_start` for AArch64 into the reserved section: load
-/// argc and argv, call `main`, then `bl exit` if libc provides it, else the
-/// `exit` syscall with `main`'s return value still in x0.
-fn synthesize_elf_start_aarch64(result: &mut LinkResult) -> Option<u64> {
-    let main_addr = result
-        .symbol_addrs
-        .get("main")
-        .or_else(|| result.symbol_addrs.get("_main"))
-        .copied()?;
+/// argc and argv, call `main_addr`, then `bl exit` if libc provides it, else the
+/// `exit` syscall with the result still in x0.
+fn synthesize_elf_start_aarch64(result: &mut LinkResult, main_addr: u64) -> Option<u64> {
     let index = result
         .layout
         .section_by_name
@@ -252,14 +244,9 @@ fn synthesize_elf_start_aarch64(result: &mut LinkResult) -> Option<u64> {
 }
 
 /// Write a freestanding `_start` for PowerPC64 ELFv2 into the reserved section:
-/// set r2 to `.TOC.`, load main's global entry into r12, call it, then call
-/// `exit` (r3 still holds main's result) or issue the exit syscall.
-fn synthesize_elf_start_ppc64(result: &mut LinkResult) -> Option<u64> {
-    let main_addr = result
-        .symbol_addrs
-        .get("main")
-        .or_else(|| result.symbol_addrs.get("_main"))
-        .copied()?;
+/// set r2 to `.TOC.`, load the target's global entry into r12, call it, then call
+/// `exit` (r3 still holds the result) or issue the exit syscall.
+fn synthesize_elf_start_ppc64(result: &mut LinkResult, main_addr: u64) -> Option<u64> {
     let toc = result.symbol_addrs.get(".TOC.").copied()?;
     let index = result
         .layout
@@ -303,13 +290,68 @@ fn synthesize_elf_start_ppc64(result: &mut LinkResult) -> Option<u64> {
     Some(start)
 }
 
-fn synthesize_elf_start(result: &mut LinkResult, freebsd_abi: bool) -> Option<u64> {
-    match TargetArch::from_elf_machine(result.e_machine)? {
-        TargetArch::X86_64 => synthesize_elf_start_x86_64(result, freebsd_abi),
-        TargetArch::AArch64 => synthesize_elf_start_aarch64(result),
-        TargetArch::PowerPc64 => synthesize_elf_start_ppc64(result),
-        TargetArch::RiscV => None,
+/// Write a freestanding RV64 `_start` into the reserved section: load argc and
+/// argv from the initial stack, `jal` to `main_addr`, then `jal exit` if libc
+/// provides it, else the `exit` syscall with the result still in a0.
+fn synthesize_elf_start_riscv64(result: &mut LinkResult, main_addr: u64) -> Option<u64> {
+    let index = result
+        .layout
+        .section_by_name
+        .get(".text.__weld_start")
+        .copied()?;
+    let start = result.layout.sections[index].vaddr;
+    let exit_addr = result.symbol_addrs.get("exit").copied();
+
+    let jal = |at: u64, target: u64| -> Option<u32> {
+        let disp = target as i64 - at as i64;
+        if disp & 1 != 0 || !(-(1 << 20)..(1 << 20)).contains(&disp) {
+            return None;
+        }
+        let imm = disp as u32;
+        Some(
+            (((imm >> 20) & 1) << 31)
+                | (((imm >> 1) & 0x3FF) << 21)
+                | (((imm >> 11) & 1) << 20)
+                | (((imm >> 12) & 0xFF) << 12)
+                | (1 << 7)
+                | 0x6F,
+        )
+    };
+
+    let mut words = vec![0x0001_3503, 0x0081_0593];
+    words.push(jal(start + 4 * words.len() as u64, main_addr)?);
+    match exit_addr {
+        Some(addr) => words.push(jal(start + 4 * words.len() as u64, addr)?),
+        None => words.extend([0x05D0_0893, 0x0000_0073]),
     }
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let data = &mut result.layout.sections[index].data;
+    data.get_mut(..code.len())?.copy_from_slice(&code);
+    Some(start)
+}
+
+fn synthesize_elf_start(result: &mut LinkResult, main_addr: u64, freebsd_abi: bool) -> Option<u64> {
+    match TargetArch::from_elf_machine(result.e_machine)? {
+        TargetArch::X86_64 => synthesize_elf_start_x86_64(result, main_addr, freebsd_abi),
+        TargetArch::AArch64 => synthesize_elf_start_aarch64(result, main_addr),
+        TargetArch::PowerPc64 => synthesize_elf_start_ppc64(result, main_addr),
+        TargetArch::RiscV => synthesize_elf_start_riscv64(result, main_addr),
+    }
+}
+
+/// The ELF entry address: the named or default entry, or a synthesized `_start`
+/// that calls it when the objects define no `_start`.
+fn elf_entry(
+    args: &ParsedArgs,
+    result: &mut LinkResult,
+    freebsd_abi: bool,
+) -> std::result::Result<u64, String> {
+    let target = entry_address(args, result)?;
+    if !needs_synthetic_start(result) {
+        return Ok(target);
+    }
+    synthesize_elf_start(result, target, freebsd_abi)
+        .ok_or_else(|| "cannot synthesize a _start for this target".to_string())
 }
 
 fn host_arch() -> TargetArch {
@@ -447,10 +489,11 @@ fn try_weld_link_elf(
     }
     let entry = if opts.shared {
         0
-    } else if needs_synthetic_start(&result) {
-        synthesize_elf_start(&mut result, freebsd_abi).or_else(|| select_entry(args, &result))?
     } else {
-        select_entry(args, &result)?
+        match elf_entry(args, &mut result, freebsd_abi) {
+            Ok(entry) => entry,
+            Err(message) => return fail(message),
+        }
     };
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
     if let Some(path) = args.map_file.as_deref() {
@@ -500,7 +543,10 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
     };
     let result = link_macho_multi_object(&obj_refs, libs, &dylib_paths, &args.input_files).ok()?;
     let arch = TargetArch::from_elf_machine(result.e_machine)?;
-    let entry = select_entry(args, &result)?;
+    let entry = match entry_address(args, &result) {
+        Ok(entry) => entry,
+        Err(message) => return fail(message),
+    };
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
     let out_file = create_output(out_path).ok()?;
     let mut out = std::io::BufWriter::new(out_file);
@@ -525,10 +571,15 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
 }
 
 fn try_weld_link_coff(args: &ParsedArgs, objects: Vec<Vec<u8>>) -> Option<i32> {
+    if args.shared {
+        return fail("-shared is not supported for PE output");
+    }
     let refs: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
     let mut image = Vec::new();
-    if let Err(error) = emit::pe::link_and_emit_pe_from_coffs(&refs, &mut image) {
+    if let Err(error) =
+        emit::pe::link_and_emit_pe_from_coffs(&refs, args.entry.as_deref(), &mut image)
+    {
         eprintln!("weld: {error}");
         return Some(1);
     }
@@ -544,7 +595,7 @@ fn try_weld_link_coff(args: &ParsedArgs, objects: Vec<Vec<u8>>) -> Option<i32> {
     Some(0)
 }
 
-/// COFF inputs take the direct COFF to PE path. ELF inputs fall through to the legacy path.
+/// PE output is written from COFF objects only.
 fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
     let (libraries, library_positions): (Vec<_>, Vec<_>) =
         static_library_inputs(args).into_iter().unzip();
@@ -556,27 +607,13 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
         &library_positions,
         &args.groups,
     )?;
-    if loaded.format == ObjectFormat::Coff {
-        return try_weld_link_coff(args, loaded.objects);
+    match loaded.format {
+        ObjectFormat::Coff => try_weld_link_coff(args, loaded.objects),
+        ObjectFormat::Elf => {
+            fail("PE output cannot be built from ELF inputs: the PE writer only takes COFF objects")
+        }
+        ObjectFormat::MachO => fail("PE output cannot be built from Mach-O inputs"),
     }
-    if loaded.format != ObjectFormat::Elf {
-        return None;
-    }
-    let obj_data_list = loaded.objects;
-    let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
-    let libs = if args.libraries.is_empty() {
-        None
-    } else {
-        Some(args.libraries.as_slice())
-    };
-    let result = link_multi_object_with_options(&obj_refs, libs, &link_options(args)).ok()?;
-    let entry = select_entry(args, &result)?;
-    let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
-    let out_file = create_output(out_path).ok()?;
-    let mut out = std::io::BufWriter::new(out_file);
-    emit::pe::emit_pe_executable(&result.layout, entry, result.dynamic.as_ref(), &mut out).ok()?;
-    out.flush().ok()?;
-    Some(0)
 }
 
 fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
@@ -730,9 +767,13 @@ fn main() {
                                 .err(),
                                 ObjectFormat::Coff => {
                                     let mut image: Vec<u8> = Vec::new();
-                                    emit::pe::link_and_emit_pe_from_coffs(&refs, &mut image)
-                                        .err()
-                                        .map(|error| error.to_string())
+                                    emit::pe::link_and_emit_pe_from_coffs(
+                                        &refs,
+                                        args.entry.as_deref(),
+                                        &mut image,
+                                    )
+                                    .err()
+                                    .map(|error| error.to_string())
                                 }
                             };
                             if let Some(e) = err {
@@ -798,7 +839,8 @@ mod tests {
         let mut result = static_main_result();
         assert!(needs_synthetic_start(&result));
 
-        let entry = synthesize_elf_start_x86_64(&mut result, false).expect("start synthesized");
+        let entry =
+            synthesize_elf_start_x86_64(&mut result, 0x400000, false).expect("start synthesized");
         assert!(entry >= 0x400000);
         assert!(
             result
@@ -816,7 +858,8 @@ mod tests {
     fn synthetic_start_calls_libc_exit_when_available() {
         let mut result = static_main_result();
         result.symbol_addrs.insert("exit".to_string(), 0x401200);
-        let entry = synthesize_elf_start_x86_64(&mut result, false).expect("start synthesized");
+        let entry =
+            synthesize_elf_start_x86_64(&mut result, 0x400000, false).expect("start synthesized");
 
         let start = result.layout.sections.last().expect("start section");
         assert_eq!(start.data[7], 0xe8);
@@ -846,5 +889,122 @@ mod tests {
         result.dynamic = Some(DynamicLinkInfo::default());
         result.symbol_addrs.insert("_start".to_string(), 0x401000);
         assert!(!needs_synthetic_start(&result));
+    }
+
+    fn decode_jal(word: u32) -> i64 {
+        let imm = ((word >> 31) & 1) << 20
+            | ((word >> 21) & 0x3FF) << 1
+            | ((word >> 20) & 1) << 11
+            | ((word >> 12) & 0xFF) << 12;
+        let imm = i64::from(imm);
+        if imm & (1 << 20) != 0 {
+            imm - (1 << 21)
+        } else {
+            imm
+        }
+    }
+
+    fn riscv_main_result() -> LinkResult {
+        let mut result = static_main_result();
+        result.e_machine = 243;
+        result
+            .layout
+            .section_by_name
+            .insert(".text.__weld_start".to_string(), 1);
+        result.layout.sections.push(MergedSection {
+            entsize: 0,
+            sh_type: 1,
+            name: ".text.__weld_start".to_string(),
+            data: vec![0; 64],
+            vaddr: 0x400010,
+            flags: 6,
+            align: 16,
+        });
+        result
+    }
+
+    fn riscv_words(result: &LinkResult, start: u64) -> Vec<u32> {
+        let section = result.layout.sections.last().expect("start section");
+        assert_eq!(section.vaddr, start);
+        section
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect()
+    }
+
+    #[test]
+    fn riscv_start_loads_argc_and_calls_main() {
+        let mut result = riscv_main_result();
+        let entry = elf_entry(&ParsedArgs::default(), &mut result, false).expect("entry");
+        assert_eq!(entry, 0x400010);
+
+        let words = riscv_words(&result, entry);
+        assert_eq!(words[0], 0x0001_3503, "ld a0, 0(sp)");
+        assert_eq!(words[1], 0x0081_0593, "addi a1, sp, 8");
+        assert_eq!(entry as i64 + 8 + decode_jal(words[2]), 0x400000);
+        assert_eq!(words[3], 0x05D0_0893, "addi a7, zero, 93");
+        assert_eq!(words[4], 0x0000_0073, "ecall");
+    }
+
+    #[test]
+    fn riscv_start_calls_libc_exit_when_available() {
+        let mut result = riscv_main_result();
+        result.symbol_addrs.insert("exit".to_string(), 0x400100);
+        let entry = elf_entry(&ParsedArgs::default(), &mut result, false).expect("entry");
+
+        let words = riscv_words(&result, entry);
+        assert_eq!(entry as i64 + 12 + decode_jal(words[3]), 0x400100);
+    }
+
+    #[test]
+    fn synthetic_start_calls_the_named_entry() {
+        let mut result = static_main_result();
+        result
+            .symbol_addrs
+            .insert("entry_point".to_string(), 0x400100);
+        let args = ParsedArgs {
+            entry: Some("entry_point".to_string()),
+            ..ParsedArgs::default()
+        };
+        let entry = elf_entry(&args, &mut result, false).expect("entry");
+
+        let start = result.layout.sections.last().expect("start section");
+        assert_eq!(start.vaddr, entry);
+        assert_eq!(start.data[0], 0xe8);
+        let rel = i32::from_le_bytes(start.data[1..5].try_into().unwrap());
+        assert_eq!(entry as i64 + 5 + i64::from(rel), 0x400100);
+    }
+
+    #[test]
+    fn undefined_entry_symbol_is_an_error() {
+        let mut result = static_main_result();
+        let args = ParsedArgs {
+            entry: Some("missing".to_string()),
+            ..ParsedArgs::default()
+        };
+        let error = elf_entry(&args, &mut result, false).expect_err("must fail");
+        assert!(error.contains("missing"), "{error}");
+    }
+
+    #[test]
+    fn missing_entry_point_is_an_error() {
+        let mut result = static_main_result();
+        result.symbol_addrs.remove("main");
+        let error = entry_address(&ParsedArgs::default(), &result).expect_err("must fail");
+        assert!(error.contains("no entry point"), "{error}");
+    }
+
+    #[test]
+    fn shared_pe_output_is_refused_before_writing() {
+        let args = ParsedArgs {
+            shared: true,
+            output_file: Some(PathBuf::from("target/scratch-cli/never.dll")),
+            ..ParsedArgs::default()
+        };
+        assert_eq!(try_weld_link_coff(&args, Vec::new()), Some(1));
+        assert!(!Path::new("target/scratch-cli/never.dll").exists());
     }
 }

@@ -53,7 +53,8 @@ pub fn print_usage() {
         TARGET_OSES.join(", ")
     );
     eprintln!("  -v, --verbose               Verbose output");
-    eprintln!("  -h, --help                  This help");
+    eprintln!("  -h <name>                   Set the shared object name (soname)");
+    eprintln!("  --help                      This help");
     eprintln!("  --version                   Print version");
     eprintln!();
     eprintln!(
@@ -216,7 +217,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
                 args.target_os = Some(next);
             }
             "-v" | "--verbose" => args.verbose = true,
-            "-h" | "--help" => return Ok(ParseAction::Help),
+            "--help" => return Ok(ParseAction::Help),
             "--version" => return Ok(ParseAction::Version),
             s if s.starts_with("-mmacosx-version-min") || s.starts_with("-mios") => {}
             "-nodefaultlibs" | "-nostdlib" => {}
@@ -286,7 +287,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             s if s.starts_with("-F") && s.len() > 2 => {}
             "-r" | "--relocatable" => args.relocatable = true,
             "-shared" | "--shared" => args.shared = true,
-            "-soname" | "--soname" => {
+            "-soname" | "--soname" | "-h" => {
                 args.soname = Some(take_required_arg(argv, &mut i, "-soname")?);
             }
             s if s.starts_with("--soname=") => {
@@ -397,6 +398,28 @@ mod tests {
                 .any(|p| p.to_string_lossy() == "26.2")
         );
         assert!(parsed.libraries.iter().any(|l| l == "System"));
+    }
+
+    #[test]
+    fn dash_h_sets_the_soname_as_ld_does() {
+        let argv: Vec<String> = ["-h", "libfoo.so.1", "a.o"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ParseAction::Run(parsed) = parse_args(&argv).unwrap() else {
+            panic!("expected a link action");
+        };
+        assert_eq!(parsed.soname.as_deref(), Some("libfoo.so.1"));
+        assert_eq!(parsed.input_files, vec![PathBuf::from("a.o")]);
+
+        let argv: Vec<String> = ["-h"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(&argv).is_err());
+    }
+
+    #[test]
+    fn long_help_prints_usage_without_linking() {
+        let argv = vec!["--help".to_string()];
+        assert!(matches!(parse_args(&argv), Ok(ParseAction::Help)));
     }
 
     #[test]

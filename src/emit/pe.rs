@@ -6,7 +6,6 @@ use crate::coff::{
     MACHINE_AMD64,
 };
 use crate::collections::{HashMap, HashSet};
-use crate::link::{DynamicLinkInfo, MergedLayout};
 use std::io::{Result, Write};
 
 const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
@@ -177,269 +176,9 @@ impl PeSection {
         }
     }
 
-    fn virtual_size(&self) -> u32 {
-        self.data.len() as u32
-    }
-
     fn raw_size(&self) -> u32 {
         align_up(self.data.len() as u64, FILE_ALIGN) as u32
     }
-}
-
-/// Emit a PE32+ (AMD64) console executable.
-///
-/// `layout`     — merged section layout from the linker.
-/// `entry`      — virtual address of the entry point.
-/// `dyn_info`   — optional dynamic link info; if provided the `plt_symbols`
-///               are added as imports from `kernel32.dll` / stdlib.
-pub fn emit_pe_executable(
-    layout: &MergedLayout,
-    entry: u64,
-    dyn_info: Option<&DynamicLinkInfo>,
-    out: &mut impl Write,
-) -> Result<()> {
-    let text_data = layout
-        .sections
-        .iter()
-        .find(|s| s.name == ".text")
-        .map(|s| s.data.clone())
-        .unwrap_or_default();
-
-    let data_data = layout
-        .sections
-        .iter()
-        .find(|s| s.name == ".data")
-        .map(|s| s.data.clone())
-        .unwrap_or_default();
-
-    let mut import_symbols: Vec<(u16, String)> = vec![(0, "ExitProcess".to_string())];
-    if let Some(dyn_info) = dyn_info {
-        for sym in &dyn_info.plt_symbols {
-            if sym != "ExitProcess" {
-                import_symbols.push((0, sym.clone()));
-            }
-        }
-    }
-
-    let has_data = !data_data.is_empty();
-    let num_sections: u16 = if has_data { 3 } else { 2 };
-
-    let headers_raw_size = SIZEOF_DOS_STUB
-        + SIZEOF_PE_SIGNATURE
-        + SIZEOF_COFF_HEADER
-        + SIZEOF_OPTIONAL_HEADER as usize
-        + (num_sections as usize) * SIZEOF_SECTION_HEADER;
-    let size_of_headers = align_up(headers_raw_size as u64, FILE_ALIGN) as u32;
-
-    // RVAs are relative to IMAGE_BASE.
-    let text_rva = align_up(size_of_headers as u64, SECTION_ALIGN) as u32;
-    let text_vsize = text_data.len() as u32;
-    let text_raw_size = align_up(text_vsize as u64, FILE_ALIGN) as u32;
-
-    let data_rva = if has_data {
-        align_up(
-            text_rva as u64 + align_up(text_vsize as u64, SECTION_ALIGN),
-            SECTION_ALIGN,
-        ) as u32
-    } else {
-        0
-    };
-    let data_vsize = data_data.len() as u32;
-    let data_raw_size = if has_data {
-        align_up(data_vsize as u64, FILE_ALIGN) as u32
-    } else {
-        0
-    };
-
-    let rdata_rva = if has_data {
-        align_up(
-            data_rva as u64 + align_up(data_vsize as u64, SECTION_ALIGN),
-            SECTION_ALIGN,
-        ) as u32
-    } else {
-        align_up(
-            text_rva as u64 + align_up(text_vsize as u64, SECTION_ALIGN),
-            SECTION_ALIGN,
-        ) as u32
-    };
-
-    let sym_refs: Vec<(u16, &str)> = import_symbols
-        .iter()
-        .map(|(h, n)| (*h, n.as_str()))
-        .collect();
-    let entries = [ImportEntry {
-        dll_name: "KERNEL32.DLL",
-        symbols: sym_refs,
-    }];
-    let (rdata_bytes, idt_rel_off, iat_rel_off, idt_size_bytes, iat_size_bytes) =
-        build_import_section(rdata_rva as u64, &entries);
-
-    let import_dir_rva = rdata_rva + idt_rel_off;
-    let iat_rva = rdata_rva + iat_rel_off;
-    let rdata_vsize = rdata_bytes.len() as u32;
-    let rdata_raw_size = align_up(rdata_vsize as u64, FILE_ALIGN) as u32;
-
-    let last_section_end = rdata_rva as u64 + align_up(rdata_vsize as u64, SECTION_ALIGN);
-    let size_of_image = align_up(last_section_end, SECTION_ALIGN) as u32;
-
-    let text_file_off = size_of_headers;
-    let data_file_off = text_file_off + text_raw_size;
-    let rdata_file_off = if has_data {
-        data_file_off + data_raw_size
-    } else {
-        text_file_off + text_raw_size
-    };
-
-    let entry_rva = entry.saturating_sub(IMAGE_BASE) as u32;
-
-    let mut dos = [0u8; SIZEOF_DOS_STUB];
-    dos[0] = 0x4D;
-    dos[1] = 0x5A;
-    let e_lfanew = SIZEOF_DOS_STUB as u32;
-    dos[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
-    out.write_all(&dos)?;
-
-    out.write_all(b"PE\0\0")?;
-
-    let mut coff = [0u8; SIZEOF_COFF_HEADER];
-    write_u16(&mut coff, 0, MACHINE_AMD64);
-    write_u16(&mut coff, 2, num_sections);
-    write_u16(&mut coff, 16, SIZEOF_OPTIONAL_HEADER);
-    write_u16(
-        &mut coff,
-        18,
-        IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE,
-    );
-    out.write_all(&coff)?;
-
-    let mut opt = [0u8; SIZEOF_OPTIONAL_HEADER as usize];
-    let mut o = 0usize;
-
-    write_u16_at(&mut opt, &mut o, IMAGE_OPTIONAL_HDR64_MAGIC);
-    opt[o] = 14;
-    o += 1;
-    opt[o] = 0;
-    o += 1;
-    write_u32_at(&mut opt, &mut o, text_raw_size);
-    write_u32_at(&mut opt, &mut o, rdata_raw_size + data_raw_size);
-    write_u32_at(&mut opt, &mut o, 0);
-    write_u32_at(&mut opt, &mut o, entry_rva);
-    write_u32_at(&mut opt, &mut o, text_rva);
-
-    write_u64_at(&mut opt, &mut o, IMAGE_BASE);
-    write_u32_at(&mut opt, &mut o, SECTION_ALIGN as u32);
-    write_u32_at(&mut opt, &mut o, FILE_ALIGN as u32);
-    write_u16_at(&mut opt, &mut o, 6);
-    write_u16_at(&mut opt, &mut o, 0);
-    write_u16_at(&mut opt, &mut o, 0);
-    write_u16_at(&mut opt, &mut o, 0);
-    write_u16_at(&mut opt, &mut o, 6);
-    write_u16_at(&mut opt, &mut o, 0);
-    write_u32_at(&mut opt, &mut o, 0);
-    write_u32_at(&mut opt, &mut o, size_of_image);
-    write_u32_at(&mut opt, &mut o, size_of_headers);
-    write_u32_at(&mut opt, &mut o, 0);
-    write_u16_at(&mut opt, &mut o, IMAGE_SUBSYSTEM_WINDOWS_CUI);
-    write_u16_at(
-        &mut opt,
-        &mut o,
-        IMAGE_DLLCHARACTERISTICS_NX_COMPAT
-            | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE
-            | IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE,
-    );
-    write_u64_at(&mut opt, &mut o, 0x10_0000);
-    write_u64_at(&mut opt, &mut o, 0x1000);
-    write_u64_at(&mut opt, &mut o, 0x10_0000);
-    write_u64_at(&mut opt, &mut o, 0x1000);
-    write_u32_at(&mut opt, &mut o, 0);
-    write_u32_at(&mut opt, &mut o, NUM_DATA_DIRS);
-
-    // Index 0: Export table — unused
-    write_u32_at(&mut opt, &mut o, 0);
-    write_u32_at(&mut opt, &mut o, 0);
-    // Index 1: Import table
-    write_u32_at(&mut opt, &mut o, import_dir_rva);
-    write_u32_at(&mut opt, &mut o, idt_size_bytes);
-    // Index 2–11: unused
-    for _ in 2..12 {
-        write_u32_at(&mut opt, &mut o, 0);
-        write_u32_at(&mut opt, &mut o, 0);
-    }
-    // Index 12: IAT
-    write_u32_at(&mut opt, &mut o, iat_rva);
-    write_u32_at(&mut opt, &mut o, iat_size_bytes);
-    // Index 13–15: unused
-    for _ in 13..16 {
-        write_u32_at(&mut opt, &mut o, 0);
-        write_u32_at(&mut opt, &mut o, 0);
-    }
-
-    assert_eq!(
-        o, SIZEOF_OPTIONAL_HEADER as usize,
-        "optional header size mismatch"
-    );
-    out.write_all(&opt)?;
-
-    let sections: Vec<PeSection> = {
-        let mut v = vec![PeSection::new(
-            ".text",
-            text_data.clone(),
-            IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
-        )];
-        if has_data {
-            v.push(PeSection::new(
-                ".data",
-                data_data.clone(),
-                IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
-            ));
-        }
-        v.push(PeSection::new(
-            ".rdata",
-            rdata_bytes.clone(),
-            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
-        ));
-        v
-    };
-
-    let sec_rvas = {
-        let mut rvas = vec![text_rva];
-        if has_data {
-            rvas.push(data_rva);
-        }
-        rvas.push(rdata_rva);
-        rvas
-    };
-    let sec_file_offs = {
-        let mut offs = vec![text_file_off];
-        if has_data {
-            offs.push(data_file_off);
-        }
-        offs.push(rdata_file_off);
-        offs
-    };
-
-    for (i, sec) in sections.iter().enumerate() {
-        let mut sh = [0u8; SIZEOF_SECTION_HEADER];
-        sh[0..8].copy_from_slice(&sec.name);
-        sh[8..12].copy_from_slice(&sec.virtual_size().to_le_bytes());
-        sh[12..16].copy_from_slice(&sec_rvas[i].to_le_bytes());
-        sh[16..20].copy_from_slice(&sec.raw_size().to_le_bytes());
-        sh[20..24].copy_from_slice(&sec_file_offs[i].to_le_bytes());
-        sh[36..40].copy_from_slice(&sec.characteristics.to_le_bytes());
-        out.write_all(&sh)?;
-    }
-
-    let header_written = headers_raw_size;
-    let padding = size_of_headers as usize - header_written;
-    out.write_all(&vec![0u8; padding])?;
-
-    for sec in &sections {
-        out.write_all(&sec.data)?;
-        let pad = sec.raw_size() as usize - sec.data.len();
-        out.write_all(&vec![0u8; pad])?;
-    }
-
-    Ok(())
 }
 
 const IMAGE_REL_AMD64_ABSOLUTE: u16 = 0x0000;
@@ -2117,7 +1856,12 @@ fn parse_coff_object(object: usize, coff_data: &[u8]) -> Result<ParsedCoff<'_>> 
 ///
 /// Code sections go to `.text`, read-only data to `.rdata`, writable and
 /// uninitialized data to `.data`. Undefined externals get `jmp [iat]` thunks.
-pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> Result<()> {
+/// `entry` names the entry symbol; without it the entry is `main` or `_main`.
+pub fn link_and_emit_pe_from_coffs(
+    objects: &[&[u8]],
+    entry: Option<&str>,
+    out: &mut impl Write,
+) -> Result<()> {
     let mut syms_of: Vec<Vec<coff::Symbol>> = Vec::with_capacity(objects.len());
     let mut slot_of: Vec<Vec<Option<usize>>> = Vec::with_capacity(objects.len());
     let mut sections: Vec<CoffSection> = Vec::new();
@@ -2793,15 +2537,24 @@ pub fn link_and_emit_pe_from_coffs(objects: &[&[u8]], out: &mut impl Write) -> R
         }
     }
 
-    let entry_sym = syms_of.iter().enumerate().find_map(|(oi, syms)| {
-        syms.iter()
-            .position(|s| s.section > 0 && (s.name == "main" || s.name == "_main"))
-            .map(|i| (oi, i))
-    });
-    let entry_va = match entry_sym {
-        Some((oi, i)) => resolve(oi, i, false, "entry point")?.0 as u64,
-        None => IMAGE_BASE + text_rva as u64,
+    let find_defined = |wanted: &str| {
+        syms_of.iter().enumerate().find_map(|(oi, syms)| {
+            syms.iter()
+                .position(|s| s.section > 0 && s.name == wanted)
+                .map(|i| (oi, i))
+        })
     };
+    let entry_sym = match entry {
+        Some(name) => find_defined(name)
+            .ok_or_else(|| coff_error(format!("entry symbol {name} is not defined")))?,
+        None => ["main", "_main"]
+            .iter()
+            .find_map(|name| find_defined(name))
+            .ok_or_else(|| {
+                coff_error("no entry point: define main or _main, or pass -e SYMBOL".into())
+            })?,
+    };
+    let entry_va = resolve(entry_sym.0, entry_sym.1, false, "entry point")?.0 as u64;
 
     let mut pe_sections = vec![
         PeSection::new(
@@ -3032,21 +2785,6 @@ fn write_u16(buf: &mut [u8], off: usize, v: u16) {
     buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
 }
 
-fn write_u16_at(buf: &mut [u8], cursor: &mut usize, v: u16) {
-    buf[*cursor..*cursor + 2].copy_from_slice(&v.to_le_bytes());
-    *cursor += 2;
-}
-
-fn write_u32_at(buf: &mut [u8], cursor: &mut usize, v: u32) {
-    buf[*cursor..*cursor + 4].copy_from_slice(&v.to_le_bytes());
-    *cursor += 4;
-}
-
-fn write_u64_at(buf: &mut [u8], cursor: &mut usize, v: u64) {
-    buf[*cursor..*cursor + 8].copy_from_slice(&v.to_le_bytes());
-    *cursor += 8;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3054,75 +2792,66 @@ mod tests {
         IMAGE_SYM_CLASS_STATIC, RELOC_SIZE as SIZEOF_COFF_RELOC,
         SECTION_HEADER_SIZE as SIZEOF_COFF_SECTION_HEADER,
     };
-    use crate::link::MergedSection;
 
-    fn minimal_layout() -> (MergedLayout, u64) {
-        let text_rva = align_up(512, SECTION_ALIGN) as u32;
-        let entry = IMAGE_BASE + text_rva as u64;
+    fn entry_rva(out: &[u8]) -> u32 {
+        let e_lfanew = le_u32(out, 0x3C) as usize;
+        le_u32(out, e_lfanew + 4 + 20 + 16)
+    }
 
-        let layout = MergedLayout {
-            sections: vec![MergedSection {
-                entsize: 0,
-                sh_type: 1,
-                name: ".text".to_string(),
-                data: vec![0xC3],
-                vaddr: entry,
-                flags: 0,
-                align: 16,
+    fn two_function_object() -> Vec<u8> {
+        let body = [0xC3, 0xC3];
+        coff_object(
+            &[TestSection {
+                name: ".text",
+                flags: IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
+                data: &body,
+                relocs: &[],
+                selection: 0,
+                assoc: 0,
             }],
-            section_by_name: {
-                let mut m = HashMap::default();
-                m.insert(".text".to_string(), 0);
-                m
-            },
-        };
-        (layout, entry)
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("alt", 1, IMAGE_SYM_CLASS_EXTERNAL, 1),
+            ],
+        )
     }
 
     #[test]
-    fn test_emit_pe_produces_mz_magic() {
-        let (layout, entry) = minimal_layout();
-        let mut buf = Vec::new();
-        emit_pe_executable(&layout, entry, None, &mut buf).unwrap();
-        assert_eq!(&buf[0..2], b"MZ", "DOS MZ magic missing");
+    fn test_coff_entry_defaults_to_main() {
+        let obj = two_function_object();
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
+        let main_rva = entry_rva(&out);
+        assert_eq!(main_rva as u64 % SECTION_ALIGN, 0);
+
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], Some("alt"), &mut out).expect("links");
+        assert_eq!(entry_rva(&out), main_rva + 1, "-e alt must enter at alt");
     }
 
     #[test]
-    fn test_emit_pe_has_pe_signature() {
-        let (layout, entry) = minimal_layout();
-        let mut buf = Vec::new();
-        emit_pe_executable(&layout, entry, None, &mut buf).unwrap();
-        let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().unwrap()) as usize;
-        assert_eq!(
-            &buf[e_lfanew..e_lfanew + 4],
-            b"PE\0\0",
-            "PE signature missing"
+    fn test_coff_entry_missing_symbol_is_an_error() {
+        let obj = two_function_object();
+        let mut out = Vec::new();
+        let error = link_and_emit_pe_from_coffs(&[obj.as_slice()], Some("nope"), &mut out)
+            .expect_err("undefined -e symbol must fail");
+        assert!(error.to_string().contains("nope"), "{error}");
+
+        let no_main = coff_object(
+            &[TestSection {
+                name: ".text",
+                flags: IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
+                data: &[0xC3],
+                relocs: &[],
+                selection: 0,
+                assoc: 0,
+            }],
+            &[("helper", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
-    }
-
-    #[test]
-    fn test_emit_pe_machine_type() {
-        let (layout, entry) = minimal_layout();
-        let mut buf = Vec::new();
-        emit_pe_executable(&layout, entry, None, &mut buf).unwrap();
-        let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().unwrap()) as usize;
-        let machine = u16::from_le_bytes(buf[e_lfanew + 4..e_lfanew + 6].try_into().unwrap());
-        assert_eq!(machine, MACHINE_AMD64, "machine type should be AMD64");
-    }
-
-    #[test]
-    fn test_emit_pe_optional_magic() {
-        let (layout, entry) = minimal_layout();
-        let mut buf = Vec::new();
-        emit_pe_executable(&layout, entry, None, &mut buf).unwrap();
-        let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().unwrap()) as usize;
-        // Optional header starts at e_lfanew + 4 (PE sig) + 20 (COFF)
-        let opt_off = e_lfanew + 4 + 20;
-        let magic = u16::from_le_bytes(buf[opt_off..opt_off + 2].try_into().unwrap());
-        assert_eq!(
-            magic, IMAGE_OPTIONAL_HDR64_MAGIC,
-            "optional header magic should be PE32+"
-        );
+        let mut out = Vec::new();
+        let error = link_and_emit_pe_from_coffs(&[no_main.as_slice()], None, &mut out)
+            .expect_err("no main must fail, not fall back to .text");
+        assert!(error.to_string().contains("no entry point"), "{error}");
     }
 
     struct TestSection<'a> {
@@ -3300,7 +3029,7 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[coff.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[coff.as_slice()], None, &mut out).expect("links");
         let disp_at = 512 + 3;
         let disp = i32::from_le_bytes(out[disp_at..disp_at + 4].try_into().unwrap());
         assert_eq!(disp, 0x2000 - 0x1007);
@@ -3330,7 +3059,7 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], &mut out)
+        link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], None, &mut out)
             .expect("links");
         let disp = i32::from_le_bytes(out[512 + 1..512 + 5].try_into().unwrap());
         assert_eq!(disp, 3);
@@ -3344,7 +3073,7 @@ mod tests {
             &[("dup", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
         let mut out = Vec::new();
-        let result = link_and_emit_pe_from_coffs(&[obj.as_slice(), obj.as_slice()], &mut out);
+        let result = link_and_emit_pe_from_coffs(&[obj.as_slice(), obj.as_slice()], None, &mut out);
         assert!(result.is_err());
     }
 
@@ -3415,12 +3144,17 @@ mod tests {
 
         let mut out = Vec::new();
         assert!(
-            link_and_emit_pe_from_coffs(&[calls_x.as_slice(), calls_y.as_slice()], &mut out)
-                .is_err()
+            link_and_emit_pe_from_coffs(
+                &[calls_x.as_slice(), calls_y.as_slice()],
+                Some("inl"),
+                &mut out
+            )
+            .is_err()
         );
         let mut out = Vec::new();
         link_and_emit_pe_from_coffs(
             &[calls_x.as_slice(), calls_x_at_other_index.as_slice()],
+            Some("inl"),
             &mut out,
         )
         .expect("links");
@@ -3431,13 +3165,13 @@ mod tests {
         let small = comdat_object(&[0xC3; 4], IMAGE_COMDAT_SELECT_LARGEST);
         let large = comdat_object(&[0x90; 8], IMAGE_COMDAT_SELECT_LARGEST);
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[small.as_slice(), large.as_slice()], &mut out)
+        link_and_emit_pe_from_coffs(&[small.as_slice(), large.as_slice()], Some("inl"), &mut out)
             .expect("links");
         assert_eq!(pe_section_vsize(&out, 0), 8);
         assert_eq!(&out[512..520], &[0x90; 8]);
 
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[large.as_slice(), small.as_slice()], &mut out)
+        link_and_emit_pe_from_coffs(&[large.as_slice(), small.as_slice()], Some("inl"), &mut out)
             .expect("links");
         assert_eq!(pe_section_vsize(&out, 0), 8);
     }
@@ -3447,7 +3181,9 @@ mod tests {
         let a = comdat_object(&[0xC3; 4], IMAGE_COMDAT_SELECT_SAME_SIZE);
         let b = comdat_object(&[0xC3; 8], IMAGE_COMDAT_SELECT_SAME_SIZE);
         let mut out = Vec::new();
-        assert!(link_and_emit_pe_from_coffs(&[a.as_slice(), b.as_slice()], &mut out).is_err());
+        assert!(
+            link_and_emit_pe_from_coffs(&[a.as_slice(), b.as_slice()], None, &mut out).is_err()
+        );
     }
 
     #[test]
@@ -3455,10 +3191,14 @@ mod tests {
         let a = comdat_object(&[0xC3; 4], IMAGE_COMDAT_SELECT_EXACT_MATCH);
         let b = comdat_object(&[0x90; 4], IMAGE_COMDAT_SELECT_EXACT_MATCH);
         let mut out = Vec::new();
-        assert!(link_and_emit_pe_from_coffs(&[a.as_slice(), b.as_slice()], &mut out).is_err());
+        assert!(
+            link_and_emit_pe_from_coffs(&[a.as_slice(), b.as_slice()], Some("inl"), &mut out)
+                .is_err()
+        );
         let same = comdat_object(&[0xC3; 4], IMAGE_COMDAT_SELECT_EXACT_MATCH);
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[a.as_slice(), same.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[a.as_slice(), same.as_slice()], Some("inl"), &mut out)
+            .expect("links");
     }
 
     #[test]
@@ -3476,7 +3216,8 @@ mod tests {
             &[("inl", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice(), obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice(), obj.as_slice()], Some("inl"), &mut out)
+            .expect("links");
         assert_eq!(pe_section_vsize(&out, 0), 4);
     }
 
@@ -3561,7 +3302,7 @@ mod tests {
             &[("foo", 1, IMAGE_SYM_CLASS_EXTERNAL, 2)],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], &mut out)
+        link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], None, &mut out)
             .expect("links");
         let disp = i32::from_le_bytes(out[512 + 1..512 + 5].try_into().unwrap());
         assert_eq!(disp, 3);
@@ -3576,7 +3317,7 @@ mod tests {
             &[("dflt", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], &mut out)
+        link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], None, &mut out)
             .expect("links");
         let disp = i32::from_le_bytes(out[512 + 1..512 + 5].try_into().unwrap());
         assert_eq!(disp, 1);
@@ -3616,7 +3357,7 @@ mod tests {
             ],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
         let data = pe_section_header(&out, 2);
         let data_ptr = le_u32(data, 20) as usize;
         let stored = u64::from_le_bytes(out[data_ptr..data_ptr + 8].try_into().unwrap());
@@ -3652,7 +3393,7 @@ mod tests {
             ],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
         let data = pe_section_header(&out, 2);
         let data_ptr = le_u32(data, 20) as usize;
         let stored = u64::from_le_bytes(out[data_ptr..data_ptr + 8].try_into().unwrap());
@@ -3664,7 +3405,7 @@ mod tests {
     fn test_coff_addr64_emits_base_reloc() {
         let obj = absolute_pointer_object(IMAGE_REL_AMD64_ADDR64);
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
 
         let data = pe_section_header(&out, 2);
         let data_rva = le_u32(data, 12);
@@ -3691,7 +3432,7 @@ mod tests {
         let mut obj = absolute_pointer_object(IMAGE_REL_AMD64_ADDR32NB);
         obj[0..2].copy_from_slice(&0xAA64u16.to_le_bytes());
         let mut out = Vec::new();
-        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
             .expect_err("arm64 must be rejected");
         assert!(err.to_string().contains("0xaa64"), "{err}");
     }
@@ -3700,7 +3441,7 @@ mod tests {
     fn test_coff_addr32_is_rejected() {
         let obj = absolute_pointer_object(IMAGE_REL_AMD64_ADDR32);
         let mut out = Vec::new();
-        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
             .expect_err("ADDR32 must be rejected");
         assert!(err.to_string().contains("ADDR32"), "{err}");
     }
@@ -3713,7 +3454,7 @@ mod tests {
             &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
         assert_eq!(pe_base_reloc_dir(&out), (0, 0));
     }
 
@@ -3738,7 +3479,7 @@ mod tests {
         let relocs = [(2, 3, IMAGE_REL_AMD64_REL32)];
         let obj = undefined_import_object(&call, &relocs, "__imp_printf");
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
 
         let disp = i32::from_le_bytes(out[512 + 2..512 + 6].try_into().unwrap());
         let slot_rva = (0x1000 + 2 + 4 + disp) as u32;
@@ -3760,7 +3501,7 @@ mod tests {
         let relocs = [(1, 3, IMAGE_REL_AMD64_REL32)];
         let obj = undefined_import_object(&call, &relocs, "printf");
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
 
         let disp = i32::from_le_bytes(out[512 + 1..512 + 5].try_into().unwrap());
         let target = (0x1000 + 1 + 4 + disp) as u32;
@@ -3774,7 +3515,7 @@ mod tests {
         let relocs = [(1, 3, IMAGE_REL_AMD64_REL32)];
         let obj = undefined_import_object(&call, &relocs, "fmt_g");
         let mut out = Vec::new();
-        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
             .expect_err("an unresolved non-CRT symbol must not become an import");
         assert!(err.to_string().contains("undefined symbol fmt_g"), "{err}");
     }
@@ -3785,7 +3526,7 @@ mod tests {
         let relocs = [(2, 3, IMAGE_REL_AMD64_REL32)];
         let obj = undefined_import_object(&call, &relocs, "__imp_fmt_g");
         let mut out = Vec::new();
-        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
             .expect_err("an unresolved pointer slot must not become an import");
         assert!(err.to_string().contains("undefined symbol fmt_g"), "{err}");
     }
@@ -3861,7 +3602,7 @@ mod tests {
             ],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
 
         let imports = pe_imports(&out);
         assert_eq!(imports.len(), 2, "{imports:?}");
@@ -3879,7 +3620,7 @@ mod tests {
         let relocs = [(3, 3, IMAGE_REL_AMD64_REL32)];
         let obj = undefined_import_object(&lea, &relocs, "plain");
         let mut out = Vec::new();
-        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).is_err());
     }
 
     #[test]
@@ -3910,7 +3651,7 @@ mod tests {
             ],
         );
         let mut out = Vec::new();
-        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).is_err());
     }
 
     fn pdata_object(
@@ -3954,7 +3695,7 @@ mod tests {
             b".pdata$longname\0",
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
         assert_eq!(pe_data_dir(&out, DATA_DIR_EXCEPTION), (0x3000, 12));
     }
 
@@ -3980,7 +3721,8 @@ mod tests {
             ],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj0.as_slice(), obj1.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj0.as_slice(), obj1.as_slice()], Some("f1"), &mut out)
+            .expect("links");
 
         let pdata = pe_section_header(&out, 2);
         let pdata_rva = le_u32(pdata, 12);
@@ -3998,7 +3740,7 @@ mod tests {
             &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
         assert_eq!(pe_data_dir(&out, DATA_DIR_EXCEPTION), (0, 0));
     }
 
@@ -4011,7 +3753,7 @@ mod tests {
             &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
         let mut out = Vec::new();
-        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).is_err());
     }
 
     #[test]
@@ -4023,7 +3765,7 @@ mod tests {
         );
         obj[12..16].copy_from_slice(&1000u32.to_le_bytes());
         let mut out = Vec::new();
-        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).is_err());
     }
 
     #[test]
@@ -4035,7 +3777,7 @@ mod tests {
         );
         obj[12..16].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
         let mut out = Vec::new();
-        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).is_err());
     }
 
     #[test]
@@ -4047,7 +3789,7 @@ mod tests {
         );
         obj[8..12].copy_from_slice(&0u32.to_le_bytes());
         let mut out = Vec::new();
-        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).is_err());
+        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).is_err());
     }
 
     #[test]
@@ -4072,7 +3814,7 @@ mod tests {
             ],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
         assert!(!out.windows(5).any(|w| w == b"dflt\0"));
     }
 
@@ -4089,7 +3831,8 @@ mod tests {
         );
         let mut out = Vec::new();
         assert!(
-            link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], &mut out).is_err()
+            link_and_emit_pe_from_coffs(&[caller.as_slice(), callee.as_slice()], None, &mut out)
+                .is_err()
         );
     }
 
@@ -4103,7 +3846,7 @@ mod tests {
         obj[20 + 16..20 + 20].copy_from_slice(&1000u32.to_le_bytes());
         obj[12..16].copy_from_slice(&1000u32.to_le_bytes());
         let mut out = Vec::new();
-        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
             .unwrap_err()
             .to_string();
         assert!(message.contains("data lies outside"), "{message}");
@@ -4246,7 +3989,7 @@ mod tests {
         obj[bss_size_at..bss_size_at + 4].copy_from_slice(&16u32.to_le_bytes());
 
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
 
         let sections = pe_section_table(&out);
         let text_sec = pe_section(&sections, ".text");
@@ -4306,7 +4049,7 @@ mod tests {
             ],
         );
         let mut out = Vec::new();
-        link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out).expect("links");
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
 
         let sections = pe_section_table(&out);
         assert!(sections.iter().all(|s| s.name != ".tls"));
@@ -4326,7 +4069,7 @@ mod tests {
             &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
         let mut out = Vec::new();
-        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
             .unwrap_err()
             .to_string();
         assert!(message.contains("outside .tls"), "{message}");
@@ -4343,7 +4086,7 @@ mod tests {
             ],
         );
         let mut out = Vec::new();
-        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], &mut out)
+        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
             .unwrap_err()
             .to_string();
         assert!(message.contains("_tls_used"), "{message}");
