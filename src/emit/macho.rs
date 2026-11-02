@@ -29,6 +29,9 @@ const LC_DYLD_INFO_ONLY: u32 = 0x80000022;
 const LC_DYLD_EXPORTS_TRIE: u32 = 0x80000033;
 const LC_DYLD_CHAINED_FIXUPS: u32 = 0x80000034;
 const LC_BUILD_VERSION: u32 = 0x32;
+const LC_RPATH: u32 = 0x8000001C;
+const MACOS_DEFAULT_MIN_OS: u32 = 0x000B_0000;
+const MACOSX_DEPLOYMENT_TARGET_ENV: &str = "MACOSX_DEPLOYMENT_TARGET";
 const LC_SYMTAB: u32 = 0x2;
 const LC_DYSYMTAB: u32 = 0xb;
 const N_SECT_EXT: u8 = 0x0f;
@@ -99,6 +102,52 @@ fn is_data_section(name: &str) -> bool {
         return seg.starts_with("__DATA") || seg.starts_with("__AUTH");
     }
     false
+}
+
+pub(crate) fn parse_macos_version(text: &str) -> Option<u32> {
+    let mut parts = text.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().map_or(Some(0), |p| p.parse().ok())?;
+    let patch: u32 = parts.next().map_or(Some(0), |p| p.parse().ok())?;
+    if parts.next().is_some() || !(10..=0xffff).contains(&major) || minor > 0xff || patch > 0xff {
+        return None;
+    }
+    Some((major << 16) | (minor << 8) | patch)
+}
+
+fn macos_min_version() -> Result<u32> {
+    match std::env::var(MACOSX_DEPLOYMENT_TARGET_ENV) {
+        Ok(text) => parse_macos_version(&text).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid {MACOSX_DEPLOYMENT_TARGET_ENV} {text:?}"),
+            )
+        }),
+        Err(_) => Ok(MACOS_DEFAULT_MIN_OS),
+    }
+}
+
+fn lc_build_version(min_os: u32) -> [u8; 32] {
+    let mut lc = [0u8; 32];
+    lc[0..4].copy_from_slice(&LC_BUILD_VERSION.to_le_bytes());
+    lc[4..8].copy_from_slice(&32u32.to_le_bytes());
+    lc[8..12].copy_from_slice(&1u32.to_le_bytes());
+    lc[12..16].copy_from_slice(&min_os.to_le_bytes());
+    lc[16..20].copy_from_slice(&min_os.to_le_bytes());
+    lc[20..24].copy_from_slice(&1u32.to_le_bytes());
+    lc[24..28].copy_from_slice(&3u32.to_le_bytes());
+    lc[28..32].copy_from_slice(&0x04CE0100u32.to_le_bytes());
+    lc
+}
+
+fn lc_rpath(path: &str) -> Vec<u8> {
+    let cmdsize = align_up_usize(12 + path.len() + 1, 8);
+    let mut lc = vec![0u8; cmdsize];
+    lc[0..4].copy_from_slice(&LC_RPATH.to_le_bytes());
+    lc[4..8].copy_from_slice(&(cmdsize as u32).to_le_bytes());
+    lc[8..12].copy_from_slice(&12u32.to_le_bytes());
+    lc[12..12 + path.len()].copy_from_slice(path.as_bytes());
+    lc
 }
 
 fn default_uuid() -> [u8; 16] {
@@ -239,16 +288,7 @@ pub fn emit_macho_executable(
     total_cmds += 1;
     sizeofcmds += lib_cmd_size as u32;
 
-    let mut lc_build = [0u8; 32];
-    lc_build[0..4].copy_from_slice(&LC_BUILD_VERSION.to_le_bytes());
-    lc_build[4..8].copy_from_slice(&32u32.to_le_bytes());
-    lc_build[8..12].copy_from_slice(&1u32.to_le_bytes());
-    lc_build[12..16].copy_from_slice(&0x001A0000u32.to_le_bytes());
-    lc_build[16..20].copy_from_slice(&0x001A0200u32.to_le_bytes());
-    lc_build[20..24].copy_from_slice(&1u32.to_le_bytes());
-    lc_build[24..28].copy_from_slice(&3u32.to_le_bytes());
-    lc_build[28..32].copy_from_slice(&0x04CE0100u32.to_le_bytes());
-    lc_buf.extend_from_slice(&lc_build);
+    lc_buf.extend_from_slice(&lc_build_version(macos_min_version()?));
     total_cmds += 1;
     sizeofcmds += 32;
 
@@ -690,6 +730,26 @@ pub fn emit_macho_executable_dynamic(
     dyn_info: &DynamicLinkInfo,
     out: &mut impl Write,
 ) -> Result<()> {
+    emit_macho_executable_dynamic_with(
+        layout,
+        arch,
+        entry,
+        dyn_info,
+        &[],
+        macos_min_version()?,
+        out,
+    )
+}
+
+pub fn emit_macho_executable_dynamic_with(
+    layout: &MergedLayout,
+    arch: TargetArch,
+    entry: u64,
+    dyn_info: &DynamicLinkInfo,
+    rpaths: &[String],
+    min_os: u32,
+    out: &mut impl Write,
+) -> Result<()> {
     let text_sections_owned: Vec<MergedSection> = layout
         .sections
         .iter()
@@ -1005,18 +1065,22 @@ pub fn emit_macho_executable_dynamic(
     total_cmds += 1;
     sizeofcmds += 24;
 
-    let mut lc_build = [0u8; 32];
-    lc_build[0..4].copy_from_slice(&LC_BUILD_VERSION.to_le_bytes());
-    lc_build[4..8].copy_from_slice(&32u32.to_le_bytes());
-    lc_build[8..12].copy_from_slice(&1u32.to_le_bytes());
-    lc_build[12..16].copy_from_slice(&0x001A0000u32.to_le_bytes());
-    lc_build[16..20].copy_from_slice(&0x001A0200u32.to_le_bytes());
-    lc_build[20..24].copy_from_slice(&1u32.to_le_bytes());
-    lc_build[24..28].copy_from_slice(&3u32.to_le_bytes());
-    lc_build[28..32].copy_from_slice(&0x04CE0100u32.to_le_bytes());
-    lc_buf.extend_from_slice(&lc_build);
+    lc_buf.extend_from_slice(&lc_build_version(min_os));
     total_cmds += 1;
     sizeofcmds += 32;
+
+    for path in rpaths {
+        if path.is_empty() || path.contains('\0') {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid rpath {path:?}"),
+            ));
+        }
+        let lc_rpath = lc_rpath(path);
+        sizeofcmds += lc_rpath.len() as u32;
+        lc_buf.extend_from_slice(&lc_rpath);
+        total_cmds += 1;
+    }
 
     let entry_offset = (entry + PAGE_SIZE as u64).saturating_sub(text_vmaddr);
     let mut lc_main = vec![0u8; 24];
@@ -1376,6 +1440,188 @@ mod macho_layout_tests {
                 next.name,
                 next.vmaddr
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod linker_option_tests {
+    use super::*;
+    use crate::link::macho::link_macho_single_object;
+    use crate::link::macho::tests::{
+        X86_64_CPU, defined, link_pair, macho_object, reloc, text, undefined,
+    };
+
+    const LC_RPATH_CMD: u32 = 0x8000001C;
+
+    fn load_commands(image: &[u8]) -> Vec<(u32, usize)> {
+        let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap()) as usize;
+        let mut off = 32usize;
+        let mut out = Vec::new();
+        for _ in 0..ncmds {
+            let cmd = u32::from_le_bytes(image[off..off + 4].try_into().unwrap());
+            let size = u32::from_le_bytes(image[off + 4..off + 8].try_into().unwrap()) as usize;
+            out.push((cmd, off));
+            off += size;
+        }
+        out
+    }
+
+    fn u32_at(image: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(image[off..off + 4].try_into().unwrap())
+    }
+
+    fn rpaths(image: &[u8]) -> Vec<String> {
+        load_commands(image)
+            .into_iter()
+            .filter(|(cmd, _)| *cmd == LC_RPATH_CMD)
+            .map(|(_, off)| {
+                let start = off + u32_at(image, off + 8) as usize;
+                let end = image[start..].iter().position(|&b| b == 0).unwrap() + start;
+                String::from_utf8(image[start..end].to_vec()).unwrap()
+            })
+            .collect()
+    }
+
+    fn build_version(image: &[u8]) -> (u32, u32) {
+        let (_, off) = load_commands(image)
+            .into_iter()
+            .find(|(cmd, _)| *cmd == LC_BUILD_VERSION)
+            .expect("LC_BUILD_VERSION");
+        (u32_at(image, off + 12), u32_at(image, off + 16))
+    }
+
+    fn section_file_bytes<'a>(image: &'a [u8], name: &str) -> (u64, &'a [u8]) {
+        for (cmd, off) in load_commands(image) {
+            if cmd != LC_SEGMENT_64 {
+                continue;
+            }
+            let nsects = u32_at(image, off + 64) as usize;
+            for i in 0..nsects {
+                let sh = off + 72 + i * 80;
+                let sectname = std::str::from_utf8(&image[sh..sh + 16])
+                    .unwrap()
+                    .trim_end_matches('\0');
+                if sectname == name {
+                    let addr = u64::from_le_bytes(image[sh + 32..sh + 40].try_into().unwrap());
+                    let size = u64::from_le_bytes(image[sh + 40..sh + 48].try_into().unwrap());
+                    let file_off = u32_at(image, sh + 48) as usize;
+                    return (addr, &image[file_off..file_off + size as usize]);
+                }
+            }
+        }
+        panic!("section {name} not in image");
+    }
+
+    fn dylib_info() -> DynamicLinkInfo {
+        DynamicLinkInfo {
+            pie: false,
+            shared: false,
+            needed: vec!["/usr/lib/libSystem.B.dylib".to_string()],
+            plt_symbols: Vec::new(),
+            weak_plt_symbols: Vec::new(),
+            interpreter: None,
+            macho_rebase_addrs: Vec::new(),
+            macho_direct_binds: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn version_strings_encode_as_xyz_nibbles() {
+        assert_eq!(parse_macos_version("11"), Some(0x000B_0000));
+        assert_eq!(parse_macos_version("11.0"), Some(0x000B_0000));
+        assert_eq!(parse_macos_version("14.2.1"), Some(0x000E_0201));
+        assert_eq!(parse_macos_version("9.0"), None);
+        assert_eq!(parse_macos_version("11.0.0.1"), None);
+        assert_eq!(parse_macos_version("11.256"), None);
+        assert_eq!(parse_macos_version("eleven"), None);
+        assert_eq!(parse_macos_version(""), None);
+        assert_eq!(MACOS_DEFAULT_MIN_OS, 0x000B_0000);
+    }
+
+    #[test]
+    fn dynamic_image_carries_rpaths_min_version_and_relocated_call() {
+        let caller = macho_object(
+            X86_64_CPU,
+            &[text(
+                vec![0x90, 0xE8, 0, 0, 0, 0, 0xC3],
+                vec![reloc(2, 0, true, 2, true, 2)],
+            )],
+            &[undefined("_callee")],
+        );
+        let callee = macho_object(
+            X86_64_CPU,
+            &[text(vec![0xC3], Vec::new())],
+            &[defined("_callee", 1, 0)],
+        );
+        let linked = link_pair(caller, callee).expect("links");
+        let rpath_list = vec!["@executable_path/../lib".to_string(), "/opt/x".to_string()];
+        let mut image = Vec::new();
+        emit_macho_executable_dynamic_with(
+            &linked.layout,
+            TargetArch::X86_64,
+            0x100000000,
+            &dylib_info(),
+            &rpath_list,
+            0x000E_0201,
+            &mut image,
+        )
+        .expect("emit");
+
+        assert_eq!(rpaths(&image), rpath_list);
+        assert_eq!(build_version(&image), (0x000E_0201, 0x000E_0201));
+
+        let (text_addr, text_bytes) = section_file_bytes(&image, "__text");
+        let layout_text = &linked.layout.sections[linked.layout.section_by_name[".text"]];
+        let callee_addr = text_addr + (linked.symbol_addrs["_callee"] - layout_text.vaddr);
+        let disp = i32::from_le_bytes(text_bytes[2..6].try_into().unwrap()) as i64;
+        assert_eq!(disp, callee_addr as i64 - (text_addr as i64 + 2 + 4));
+    }
+
+    #[test]
+    fn default_image_has_no_rpath_and_targets_macos_11() {
+        let obj = macho_object(
+            X86_64_CPU,
+            &[text(vec![0xC3], Vec::new())],
+            &[defined("_main", 1, 0)],
+        );
+        let linked = link_macho_single_object(&obj).expect("links");
+        let mut image = Vec::new();
+        emit_macho_executable_dynamic_with(
+            &linked.layout,
+            TargetArch::X86_64,
+            0x100000000,
+            &dylib_info(),
+            &[],
+            MACOS_DEFAULT_MIN_OS,
+            &mut image,
+        )
+        .expect("emit");
+        assert!(rpaths(&image).is_empty());
+        assert_eq!(build_version(&image), (0x000B_0000, 0x000B_0000));
+    }
+
+    #[test]
+    fn empty_or_nul_rpath_is_rejected() {
+        let linked = link_macho_single_object(&macho_object(
+            X86_64_CPU,
+            &[text(vec![0xC3], Vec::new())],
+            &[defined("_main", 1, 0)],
+        ))
+        .expect("links");
+        for bad in ["", "a\0b"] {
+            let mut out = Vec::new();
+            let err = emit_macho_executable_dynamic_with(
+                &linked.layout,
+                TargetArch::X86_64,
+                0x100000000,
+                &dylib_info(),
+                &[bad.to_string()],
+                MACOS_DEFAULT_MIN_OS,
+                &mut out,
+            )
+            .expect_err("bad rpath");
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
         }
     }
 }
