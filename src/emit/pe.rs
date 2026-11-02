@@ -284,6 +284,10 @@ fn is_kernel32_symbol(name: &str) -> bool {
             | "HeapAlloc"
             | "HeapFree"
             | "GetProcessHeap"
+            | "CreateThread"
+            | "WaitForSingleObject"
+            | "GetCurrentThreadId"
+            | "Sleep"
     )
 }
 
