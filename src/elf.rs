@@ -61,6 +61,16 @@ pub mod reloc_type {
     pub const R_AARCH64_LDST32_ABS_LO12_NC: u32 = 285;
     pub const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
     pub const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
+    pub const R_AARCH64_ADR_GOT_PAGE: u32 = 311;
+    pub const R_AARCH64_LD64_GOT_LO12_NC: u32 = 312;
+    pub const R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21: u32 = 541;
+    pub const R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC: u32 = 542;
+    pub const R_AARCH64_TLSLE_ADD_TPREL_HI12: u32 = 549;
+    pub const R_AARCH64_TLSLE_ADD_TPREL_LO12: u32 = 550;
+    pub const R_AARCH64_TLSLE_ADD_TPREL_LO12_NC: u32 = 551;
+    pub const R_AARCH64_COPY: u32 = 1024;
+    pub const R_AARCH64_GLOB_DAT: u32 = 1025;
+    pub const R_AARCH64_JUMP_SLOT: u32 = 1026;
     pub const R_AARCH64_RELATIVE: u32 = 1027;
 
     pub const R_RISCV_NONE: u32 = 0;

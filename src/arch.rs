@@ -65,6 +65,54 @@ impl TargetArch {
         0x1000
     }
 
+    /// Dynamic relocation type numbers this architecture's loader understands:
+    /// `(copy, glob_dat, jump_slot)`. `None` where weld has no dynamic path.
+    pub fn dynamic_reloc_types(self) -> Option<(u32, u32, u32)> {
+        match self {
+            Self::X86_64 => Some((5, 6, 7)),
+            Self::AArch64 => Some((
+                crate::elf::reloc_type::R_AARCH64_COPY,
+                crate::elf::reloc_type::R_AARCH64_GLOB_DAT,
+                crate::elf::reloc_type::R_AARCH64_JUMP_SLOT,
+            )),
+            Self::RiscV | Self::PowerPc64 => None,
+        }
+    }
+
+    /// Input relocation types that are copied straight into `.rela.dyn`:
+    /// the absolute 64-bit form, `GLOB_DAT` and `RELATIVE`.
+    pub fn passthrough_dynamic_relocs(self) -> &'static [u32] {
+        match self {
+            Self::X86_64 => &[1, 6, 8],
+            Self::AArch64 => &[
+                crate::elf::reloc_type::R_AARCH64_ABS64,
+                crate::elf::reloc_type::R_AARCH64_GLOB_DAT,
+                crate::elf::reloc_type::R_AARCH64_RELATIVE,
+            ],
+            Self::RiscV | Self::PowerPc64 => &[],
+        }
+    }
+
+    /// The architecture's `RELATIVE` dynamic relocation type number.
+    pub fn relative_reloc(self) -> u32 {
+        match self {
+            Self::X86_64 => 8,
+            Self::AArch64 => crate::elf::reloc_type::R_AARCH64_RELATIVE,
+            Self::RiscV => 3,
+            Self::PowerPc64 => 22,
+        }
+    }
+
+    /// Path of the system dynamic loader for this architecture on Linux.
+    pub fn default_interpreter(self) -> &'static str {
+        match self {
+            Self::X86_64 => "/lib64/ld-linux-x86-64.so.2",
+            Self::AArch64 => "/lib/ld-linux-aarch64.so.1",
+            Self::RiscV => "/lib/ld-linux-riscv64-lp64d.so.1",
+            Self::PowerPc64 => "/lib64/ld64.so.2",
+        }
+    }
+
     /// Return the Mach-O `cpu_type_t` value, or 0 for unsupported architectures.
     pub fn to_macho_cputype(self) -> u32 {
         match self {
