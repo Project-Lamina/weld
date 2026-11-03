@@ -726,12 +726,40 @@ fn init_logging() {
     let _ = log::set_logger(&StderrLogger);
 }
 
+fn write_archive_mode(args: &ParsedArgs) -> std::result::Result<(), String> {
+    if !args.libraries.is_empty()
+        || args.shared
+        || args.relocatable
+        || args.static_link
+        || args.entry.is_some()
+    {
+        return Err("--archive cannot be combined with -l, -shared, -r, -static or -e".into());
+    }
+    let output = args
+        .output_file
+        .as_deref()
+        .ok_or("--archive requires -o <file>")?;
+    archive::create_archive(output, &args.input_files)
+}
+
 fn main() {
     init_logging();
     let argv: Vec<String> = env::args().collect();
     let link_args: Vec<String> = argv.get(1..).unwrap_or(&[]).to_vec();
 
     match parse_args(&link_args) {
+        Ok(ParseAction::Run(args)) if args.archive => match write_archive_mode(&args) {
+            Ok(()) => {
+                if args.verbose {
+                    log::info!("archived");
+                }
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("weld: {e}");
+                std::process::exit(1);
+            }
+        },
         Ok(ParseAction::Run(args)) => {
             // Output format is chosen from the input objects, not the host OS, so
             // ELF/Mach-O linking works even when cross-linking from another host.

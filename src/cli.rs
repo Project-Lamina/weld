@@ -25,6 +25,7 @@ pub struct ParsedArgs {
     pub soname: Option<String>,
     pub static_link: bool,
     pub relocatable: bool,
+    pub archive: bool,
     pub map_file: Option<PathBuf>,
     pub input_files: Vec<PathBuf>,
     pub input_positions: Vec<usize>,
@@ -54,6 +55,7 @@ pub fn print_usage() {
     );
     eprintln!("  -v, --verbose               Verbose output");
     eprintln!("  -h <name>                   Set the shared object name (soname)");
+    eprintln!("  --archive                   Write a static archive (.a) of the inputs to -o");
     eprintln!("  --help                      This help");
     eprintln!("  --version                   Print version");
     eprintln!();
@@ -286,6 +288,7 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             s if s.starts_with("-B") && s.len() > 2 => {}
             s if s.starts_with("-F") && s.len() > 2 => {}
             "-r" | "--relocatable" => args.relocatable = true,
+            "--archive" => args.archive = true,
             "-shared" | "--shared" => args.shared = true,
             "-soname" | "--soname" | "-h" => {
                 args.soname = Some(take_required_arg(argv, &mut i, "-soname")?);
