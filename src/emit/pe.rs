@@ -3,7 +3,7 @@
 use crate::coff::{
     self, IMAGE_SCN_LNK_COMDAT, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SYM_ABSOLUTE_SECTION,
     IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_WEAK_EXTERNAL, IMAGE_SYM_UNDEFINED_SECTION,
-    MACHINE_AMD64,
+    MACHINE_AMD64, MACHINE_ARM64,
 };
 use crate::collections::{HashMap, HashSet};
 use std::io::{Result, Write};
@@ -74,14 +74,17 @@ fn build_import_section(
     let num_dlls = entries.len();
     let idt_size = (num_dlls + 1) * 20;
 
+    // The ILT and IAT hold 8-byte thunks, and an aarch64 thunk reaches its slot
+    // with a scaled `ldr`, so both tables start on an 8-byte boundary.
+    let tables_base = align_up_usize(idt_size, 8);
     let mut ilt_offsets: Vec<usize> = Vec::with_capacity(num_dlls);
     let mut ilt_total_size = 0usize;
     for e in entries {
-        ilt_offsets.push(idt_size + ilt_total_size);
+        ilt_offsets.push(tables_base + ilt_total_size);
         ilt_total_size += (e.symbols.len() + 1) * 8;
     }
 
-    let iat_base_off = idt_size + ilt_total_size;
+    let iat_base_off = tables_base + ilt_total_size;
     let mut iat_offsets: Vec<usize> = Vec::with_capacity(num_dlls);
     let mut iat_total_size = 0usize;
     for e in entries {
@@ -186,6 +189,18 @@ const IMAGE_REL_AMD64_ADDR32NB: u16 = 0x0003;
 const IMAGE_REL_AMD64_ADDR64: u16 = 0x0001;
 const IMAGE_REL_AMD64_ADDR32: u16 = 0x0002;
 const IMAGE_REL_AMD64_REL32: u16 = 0x0004;
+const IMAGE_REL_ARM64_ADDR32: u16 = 0x0001;
+const IMAGE_REL_ARM64_BRANCH26: u16 = 0x0003;
+const IMAGE_REL_ARM64_PAGEBASE_REL21: u16 = 0x0004;
+const IMAGE_REL_ARM64_PAGEOFFSET_12A: u16 = 0x0006;
+const IMAGE_REL_ARM64_PAGEOFFSET_12L: u16 = 0x0007;
+const IMAGE_REL_ARM64_ADDR64: u16 = 0x000E;
+const IMAGE_REL_ARM64_BRANCH19: u16 = 0x000F;
+const IMAGE_REL_ARM64_BRANCH14: u16 = 0x0010;
+/// adrp x16 / ldr x16, [x16, #off] / br x16.
+const ARM64_THUNK_SIZE: usize = 12;
+const X86_THUNK_SIZE: usize = 6;
+
 const OPCODE_CALL_REL32: u8 = 0xE8;
 const OPCODE_JMP_REL32: u8 = 0xE9;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
@@ -1781,20 +1796,201 @@ fn coff_problem(problem: coff::Problem, object: usize) -> std::io::Error {
     })
 }
 
+/// `adrp x16, page(iat)` / `ldr x16, [x16, #iat & 0xfff]` / `br x16`.
+fn arm64_import_thunk(iat_va: u64, thunk_va: u64, name: &str) -> Result<[u32; 3]> {
+    let adrp = arm64_apply_instruction(
+        0x9000_0010,
+        IMAGE_REL_ARM64_PAGEBASE_REL21,
+        iat_va as i64,
+        thunk_va as i64,
+        name,
+        ".text",
+    )?;
+    let ldr = arm64_apply_instruction(
+        0xF940_0210,
+        IMAGE_REL_ARM64_PAGEOFFSET_12L,
+        iat_va as i64,
+        thunk_va as i64 + 4,
+        name,
+        ".text",
+    )?;
+    Ok([adrp, ldr, 0xD61F_0200])
+}
+
+fn arm64_reloc_name(rel_type: u16) -> &'static str {
+    match rel_type {
+        IMAGE_REL_ARM64_ADDR32 => "IMAGE_REL_ARM64_ADDR32",
+        0x0002 => "IMAGE_REL_ARM64_ADDR32NB",
+        IMAGE_REL_ARM64_BRANCH26 => "IMAGE_REL_ARM64_BRANCH26",
+        IMAGE_REL_ARM64_PAGEBASE_REL21 => "IMAGE_REL_ARM64_PAGEBASE_REL21",
+        0x0005 => "IMAGE_REL_ARM64_REL21",
+        IMAGE_REL_ARM64_PAGEOFFSET_12A => "IMAGE_REL_ARM64_PAGEOFFSET_12A",
+        IMAGE_REL_ARM64_PAGEOFFSET_12L => "IMAGE_REL_ARM64_PAGEOFFSET_12L",
+        0x0008 => "IMAGE_REL_ARM64_SECREL",
+        IMAGE_REL_ARM64_ADDR64 => "IMAGE_REL_ARM64_ADDR64",
+        IMAGE_REL_ARM64_BRANCH19 => "IMAGE_REL_ARM64_BRANCH19",
+        IMAGE_REL_ARM64_BRANCH14 => "IMAGE_REL_ARM64_BRANCH14",
+        0x0011 => "IMAGE_REL_ARM64_REL32",
+        _ => "unknown ARM64 relocation",
+    }
+}
+
+/// Scale of the immediate in a load or store: the size field, plus the 128-bit
+/// SIMD form which sets both bit 26 and bit 23.
+fn arm64_ldst_scale(word: u32) -> u32 {
+    let size = word >> 30;
+    if word & 0x0480_0000 == 0x0480_0000 {
+        size + 4
+    } else {
+        size
+    }
+}
+
+/// One ARM64 immediate field: the bits it occupies, how the value is split
+/// across them, and the signed range it holds.
+struct Arm64Field {
+    mask: u32,
+    /// `(width, bit in the value, bit in the instruction)` for each run.
+    parts: [(u32, u32, u32); 2],
+    span: i64,
+}
+
+const ARM64_BRANCH26: Arm64Field = Arm64Field {
+    mask: 0x03FF_FFFF,
+    parts: [(26, 0, 0), (0, 0, 0)],
+    span: 1 << 25,
+};
+const ARM64_BRANCH19: Arm64Field = Arm64Field {
+    mask: 0x00FF_FFE0,
+    parts: [(19, 0, 5), (0, 0, 0)],
+    span: 1 << 18,
+};
+const ARM64_BRANCH14: Arm64Field = Arm64Field {
+    mask: 0x0007_FFE0,
+    parts: [(14, 0, 5), (0, 0, 0)],
+    span: 1 << 13,
+};
+const ARM64_ADR_PAGE: Arm64Field = Arm64Field {
+    mask: 0x60FF_FFE0,
+    parts: [(2, 0, 29), (19, 2, 5)],
+    span: 1 << 20,
+};
+const ARM64_IMM12: Arm64Field = Arm64Field {
+    mask: 0x003F_FC00,
+    parts: [(12, 0, 10), (0, 0, 0)],
+    span: 1 << 12,
+};
+
+/// Place `value` in `field` of `word`. The field must already be zero: a
+/// non-zero field is an in-instruction addend, which this linker does not
+/// decode, so it refuses rather than resolve it wrongly.
+fn arm64_put_imm(
+    word: u32,
+    field: &Arm64Field,
+    value: i64,
+    rel_type: u16,
+    (symbol, section): (&str, &str),
+) -> Result<u32> {
+    if word & field.mask != 0 {
+        return Err(coff_error(format!(
+            "{} against {symbol} in section {section} has a non-zero immediate field; \
+             weld does not decode in-instruction addends",
+            arm64_reloc_name(rel_type)
+        )));
+    }
+    if !(-field.span..field.span).contains(&value) {
+        return Err(coff_error(format!(
+            "{} against {symbol} in section {section} is out of range",
+            arm64_reloc_name(rel_type)
+        )));
+    }
+    let value = value as u64;
+    let mut word = word;
+    for (width, from, to) in field.parts {
+        if width == 0 {
+            continue;
+        }
+        let part = ((value >> from) & ((1u64 << width) - 1)) as u32;
+        word |= part << to;
+    }
+    Ok(word)
+}
+
+/// Resolve one ARM64 relocation that lives inside an instruction word.
+/// `s` is the target virtual address and `p` the address of the instruction.
+fn arm64_apply_instruction(
+    word: u32,
+    rel_type: u16,
+    s: i64,
+    p: i64,
+    symbol: &str,
+    section: &str,
+) -> Result<u32> {
+    let owner = (symbol, section);
+    let branch = || -> Result<i64> {
+        let delta = s - p;
+        if delta % 4 != 0 {
+            return Err(coff_error(format!(
+                "{} against {symbol} in section {section} is not 4-byte aligned",
+                arm64_reloc_name(rel_type)
+            )));
+        }
+        Ok(delta / 4)
+    };
+    match rel_type {
+        IMAGE_REL_ARM64_BRANCH26 => {
+            arm64_put_imm(word, &ARM64_BRANCH26, branch()?, rel_type, owner)
+        }
+        IMAGE_REL_ARM64_BRANCH19 => {
+            arm64_put_imm(word, &ARM64_BRANCH19, branch()?, rel_type, owner)
+        }
+        IMAGE_REL_ARM64_BRANCH14 => {
+            arm64_put_imm(word, &ARM64_BRANCH14, branch()?, rel_type, owner)
+        }
+        IMAGE_REL_ARM64_PAGEBASE_REL21 => arm64_put_imm(
+            word,
+            &ARM64_ADR_PAGE,
+            (s >> 12) - (p >> 12),
+            rel_type,
+            owner,
+        ),
+        IMAGE_REL_ARM64_PAGEOFFSET_12A => {
+            arm64_put_imm(word, &ARM64_IMM12, s & 0xFFF, rel_type, owner)
+        }
+        IMAGE_REL_ARM64_PAGEOFFSET_12L => {
+            let scale = arm64_ldst_scale(word);
+            let offset = s & 0xFFF;
+            if offset & ((1i64 << scale) - 1) != 0 {
+                return Err(coff_error(format!(
+                    "{} against {symbol} in section {section} is not aligned to the access size",
+                    arm64_reloc_name(rel_type)
+                )));
+            }
+            arm64_put_imm(word, &ARM64_IMM12, offset >> scale, rel_type, owner)
+        }
+        other => Err(coff_error(format!(
+            "{} against {symbol} in section {section} is not implemented by weld",
+            arm64_reloc_name(other)
+        ))),
+    }
+}
+
 /// Parse one COFF object. Sections that are not linked are `None`, so the
 /// index of an entry is its section number minus one.
 struct ParsedCoff<'a> {
     symbols: Vec<coff::Symbol>,
     sections: Vec<Option<CoffSection<'a>>>,
     deferred_error: Option<std::io::Error>,
+    machine: u16,
 }
 
 fn parse_coff_object(object: usize, coff_data: &[u8]) -> Result<ParsedCoff<'_>> {
     let machine = coff::read_u16(coff_data, 0)
         .ok_or_else(|| coff_problem(coff::Problem::Truncated, object))?;
-    if machine != MACHINE_AMD64 {
+    if machine != MACHINE_AMD64 && machine != MACHINE_ARM64 {
         return Err(coff_error(format!(
-            "object {object} has machine type {machine:#06x}; only x86-64 objects can be linked"
+            "object {object} has machine type {machine:#06x}; \
+             only x86-64 and aarch64 objects can be linked"
         )));
     }
     let parsed = coff::parse(coff_data);
@@ -1853,6 +2049,7 @@ fn parse_coff_object(object: usize, coff_data: &[u8]) -> Result<ParsedCoff<'_>> 
         symbols: parsed.symbols,
         sections,
         deferred_error: deferred,
+        machine,
     })
 }
 
@@ -1870,12 +2067,23 @@ pub fn link_and_emit_pe_from_coffs(
     let mut slot_of: Vec<Vec<Option<usize>>> = Vec::with_capacity(objects.len());
     let mut sections: Vec<CoffSection> = Vec::new();
     let mut deferred_error: Option<std::io::Error> = None;
+    let mut machine: Option<u16> = None;
     for (oi, coff) in objects.iter().enumerate() {
         let ParsedCoff {
             symbols: syms,
             sections: parsed,
             deferred_error: deferred,
+            machine: object_machine,
         } = parse_coff_object(oi, coff)?;
+        match machine {
+            Some(first) if first != object_machine => {
+                return Err(coff_error(format!(
+                    "object {oi} has machine type {object_machine:#06x}, \
+                     but an earlier object has {first:#06x}"
+                )));
+            }
+            _ => machine = Some(object_machine),
+        }
         deferred_error = deferred_error.or(deferred);
         let mut slots = Vec::with_capacity(parsed.len());
         for sec in parsed {
@@ -2160,9 +2368,21 @@ pub fn link_and_emit_pe_from_coffs(
         None
     };
 
+    let machine = machine.unwrap_or(MACHINE_AMD64);
+    let arm64 = machine == MACHINE_ARM64;
+    let thunk_size = if arm64 {
+        ARM64_THUNK_SIZE
+    } else {
+        X86_THUNK_SIZE
+    };
+
     let needs_main_stub = false;
-    let thunks_off = region_len[CoffRegion::Text as usize];
-    let stub_off = thunks_off + undefined.len() * 6;
+    let thunks_off = if arm64 {
+        align_up_usize(region_len[CoffRegion::Text as usize], 4)
+    } else {
+        region_len[CoffRegion::Text as usize]
+    };
+    let stub_off = thunks_off + undefined.len() * thunk_size;
     let text_size = stub_off + usize::from(needs_main_stub);
 
     let has_data = region_len[CoffRegion::Writable as usize] > 0;
@@ -2170,10 +2390,13 @@ pub fn link_and_emit_pe_from_coffs(
     let has_base_relocs = has_tls
         || sections.iter().any(|sec| {
             sec.keep
-                && sec
-                    .relocs
-                    .iter()
-                    .any(|&(_, _, t)| t == IMAGE_REL_AMD64_ADDR64 || t == IMAGE_REL_AMD64_ADDR32)
+                && sec.relocs.iter().any(|&(_, _, t)| {
+                    if arm64 {
+                        t == IMAGE_REL_ARM64_ADDR64
+                    } else {
+                        t == IMAGE_REL_AMD64_ADDR64 || t == IMAGE_REL_AMD64_ADDR32
+                    }
+                })
         });
     let n_regions = 2 + usize::from(has_data) + usize::from(has_pdata) + usize::from(tls_len > 0);
     let n_out_sections = n_regions + usize::from(has_base_relocs);
@@ -2308,15 +2531,22 @@ pub fn link_and_emit_pe_from_coffs(
     let import_at = region_base[1] + rdata_import_off;
     blob[import_at..import_at + import_bytes.len()].copy_from_slice(&import_bytes);
 
-    let thunk_va = |i: usize| IMAGE_BASE + text_rva as u64 + (thunks_off + i * 6) as u64;
+    let thunk_va = |i: usize| IMAGE_BASE + text_rva as u64 + (thunks_off + i * thunk_size) as u64;
     for (i, name) in undefined.iter().enumerate() {
-        let at = thunks_off + i * 6;
-        let end_va = thunk_va(i) + 6;
+        let at = thunks_off + i * thunk_size;
         let iat_va = *sym_iat_va
             .get(name)
             .ok_or_else(|| coff_error(format!("no import slot for {name}")))?;
-        blob[at..at + 2].copy_from_slice(&[0xFF, 0x25]);
-        blob[at + 2..at + 6].copy_from_slice(&rel32(iat_va, end_va)?.to_le_bytes());
+        if arm64 {
+            let words = arm64_import_thunk(iat_va, thunk_va(i), name)?;
+            for (w, word) in words.iter().enumerate() {
+                blob[at + w * 4..at + w * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        } else {
+            let end_va = thunk_va(i) + X86_THUNK_SIZE as u64;
+            blob[at..at + 2].copy_from_slice(&[0xFF, 0x25]);
+            blob[at + 2..at + 6].copy_from_slice(&rel32(iat_va, end_va)?.to_le_bytes());
+        }
     }
     if needs_main_stub {
         blob[stub_off] = COFF_RET;
@@ -2431,11 +2661,12 @@ pub fn link_and_emit_pe_from_coffs(
             if rel_type == IMAGE_REL_AMD64_ABSOLUTE {
                 continue;
             }
-            let width = if rel_type == IMAGE_REL_AMD64_ADDR64 {
-                8
+            let wide = if arm64 {
+                rel_type == IMAGE_REL_ARM64_ADDR64
             } else {
-                4
+                rel_type == IMAGE_REL_AMD64_ADDR64
             };
+            let width = if wide { 8 } else { 4 };
             let field = vaddr as usize;
             if field + width > sec.size {
                 return Err(coff_error(format!(
@@ -2452,15 +2683,52 @@ pub fn link_and_emit_pe_from_coffs(
                 i64::from(i32::from_le_bytes(blob[at..at + 4].try_into().unwrap()))
             };
             let object = sec.object;
-            let call_site = matches!(rel_type, IMAGE_REL_AMD64_REL32..=IMAGE_REL_AMD64_REL32_5)
-                && matches!(
-                    field.checked_sub(1).and_then(|p| sec.raw.get(p)),
-                    Some(&(OPCODE_CALL_REL32 | OPCODE_JMP_REL32))
-                );
+            let call_site = if arm64 {
+                rel_type == IMAGE_REL_ARM64_BRANCH26
+            } else {
+                matches!(rel_type, IMAGE_REL_AMD64_REL32..=IMAGE_REL_AMD64_REL32_5)
+                    && matches!(
+                        field.checked_sub(1).and_then(|p| sec.raw.get(p)),
+                        Some(&(OPCODE_CALL_REL32 | OPCODE_JMP_REL32))
+                    )
+            };
             let function_sym = syms_of[object]
                 .get(sym_idx as usize)
                 .is_some_and(|s| s.typ & 0xF0 == IMAGE_SYM_DTYPE_FUNCTION);
             let allow_thunk = call_site || function_sym;
+            if arm64 {
+                let symbol = syms_of[object]
+                    .get(sym_idx as usize)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                match rel_type {
+                    IMAGE_REL_ARM64_ADDR64 => {
+                        let (target, image_addr) =
+                            resolve(object, sym_idx as usize, allow_thunk, &sec.name)?;
+                        let v = (target + addend) as u64;
+                        blob[at..at + 8].copy_from_slice(&v.to_le_bytes());
+                        if image_addr {
+                            base_relocs.push((site_rva, IMAGE_REL_BASED_DIR64));
+                        }
+                    }
+                    IMAGE_REL_ARM64_ADDR32 => {
+                        return Err(coff_error(format!(
+                            "ADDR32 relocation in {}: use ADDR32NB or ADDR64",
+                            sec.name
+                        )));
+                    }
+                    _ => {
+                        let (target, _) =
+                            resolve(object, sym_idx as usize, allow_thunk, &sec.name)?;
+                        let word = u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
+                        let word = arm64_apply_instruction(
+                            word, rel_type, target, p_va, &symbol, &sec.name,
+                        )?;
+                        blob[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+                continue;
+            }
             match rel_type {
                 IMAGE_REL_AMD64_REL32..=IMAGE_REL_AMD64_REL32_5 => {
                     let (target, _) = resolve(object, sym_idx as usize, allow_thunk, &sec.name)?;
@@ -2637,6 +2905,7 @@ pub fn link_and_emit_pe_from_coffs(
 
     emit_pe_raw(
         out,
+        machine,
         &pe_sections,
         &sec_rvas,
         &sec_file_offs,
@@ -2656,6 +2925,7 @@ pub fn link_and_emit_pe_from_coffs(
 #[allow(clippy::too_many_arguments)]
 fn emit_pe_raw(
     out: &mut impl Write,
+    machine: u16,
     sections: &[PeSection],
     sec_rvas: &[u32],
     sec_file_offs: &[u32],
@@ -2681,7 +2951,7 @@ fn emit_pe_raw(
 
     let n_sec = sections.len() as u16;
     let mut coff_hdr = [0u8; SIZEOF_COFF_HEADER];
-    coff_hdr[0..2].copy_from_slice(&MACHINE_AMD64.to_le_bytes());
+    coff_hdr[0..2].copy_from_slice(&machine.to_le_bytes());
     coff_hdr[2..4].copy_from_slice(&n_sec.to_le_bytes());
     coff_hdr[16..18].copy_from_slice(&SIZEOF_OPTIONAL_HEADER.to_le_bytes());
     let characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE;
@@ -3432,13 +3702,13 @@ mod tests {
     }
 
     #[test]
-    fn test_coff_non_amd64_object_is_rejected() {
+    fn test_coff_unknown_machine_object_is_rejected() {
         let mut obj = absolute_pointer_object(IMAGE_REL_AMD64_ADDR32NB);
-        obj[0..2].copy_from_slice(&0xAA64u16.to_le_bytes());
+        obj[0..2].copy_from_slice(&0x01C0u16.to_le_bytes());
         let mut out = Vec::new();
         let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
-            .expect_err("arm64 must be rejected");
-        assert!(err.to_string().contains("0xaa64"), "{err}");
+            .expect_err("arm32 must be rejected");
+        assert!(err.to_string().contains("0x01c0"), "{err}");
     }
 
     #[test]
@@ -4094,5 +4364,257 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("_tls_used"), "{message}");
+    }
+
+    const ARM64_RET: u32 = 0xD65F_03C0;
+    const ARM64_ADRP_X0: u32 = 0x9000_0000;
+    const ARM64_ADD_X0_X0: u32 = 0x9100_0000;
+    const ARM64_LDR_X1_X0: u32 = 0xF940_0001;
+    const ARM64_BL: u32 = 0x9400_0000;
+    const ARM64_BR_X16: u32 = 0xD61F_0200;
+
+    fn arm64_object(sections: &[TestSection], symbols: &[(&str, i16, u8, u32)]) -> Vec<u8> {
+        let mut o = coff_object(sections, symbols);
+        o[0..2].copy_from_slice(&MACHINE_ARM64.to_le_bytes());
+        o
+    }
+
+    fn words(ws: &[u32]) -> Vec<u8> {
+        ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    fn pe_machine(out: &[u8]) -> u16 {
+        let e_lfanew = le_u32(out, 0x3C) as usize;
+        u16::from_le_bytes(out[e_lfanew + 4..e_lfanew + 6].try_into().unwrap())
+    }
+
+    fn pe_word_at_rva(out: &[u8], rva: u32) -> u32 {
+        le_u32(out, pe_rva_to_offset(out, rva))
+    }
+
+    fn sign_extend(value: u64, bits: u32) -> i64 {
+        let shift = 64 - bits;
+        ((value << shift) as i64) >> shift
+    }
+
+    fn decode_adrp_page(word: u32) -> i64 {
+        let imm = u64::from(((word >> 29) & 0x3) | (((word >> 5) & 0x7FFFF) << 2));
+        sign_extend(imm, 21)
+    }
+
+    fn decode_imm12(word: u32) -> u32 {
+        (word >> 10) & 0xFFF
+    }
+
+    /// Two text words that take the address of a symbol in .rdata.
+    fn arm64_page_pair_object() -> Vec<u8> {
+        arm64_object(
+            &[
+                TestSection {
+                    name: ".text",
+                    flags: TEXT_FLAGS,
+                    data: &words(&[ARM64_ADRP_X0, ARM64_ADD_X0_X0, ARM64_RET]),
+                    relocs: &[
+                        (0, 5, IMAGE_REL_ARM64_PAGEBASE_REL21),
+                        (4, 5, IMAGE_REL_ARM64_PAGEOFFSET_12A),
+                    ],
+                    selection: 0,
+                    assoc: 0,
+                },
+                TestSection {
+                    name: ".rdata",
+                    flags: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+                    data: &[0u8; 16],
+                    relocs: &[],
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("msg", 2, IMAGE_SYM_CLASS_STATIC, 8),
+            ],
+        )
+    }
+
+    #[test]
+    fn test_arm64_image_carries_the_arm64_machine() {
+        let obj = arm64_page_pair_object();
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
+        assert_eq!(pe_machine(&out), MACHINE_ARM64);
+    }
+
+    #[test]
+    fn test_arm64_page_pair_addresses_its_symbol() {
+        let obj = arm64_page_pair_object();
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
+        let text_rva = entry_rva(&out);
+        let adrp = pe_word_at_rva(&out, text_rva);
+        let add = pe_word_at_rva(&out, text_rva + 4);
+        let p = IMAGE_BASE + u64::from(text_rva);
+        let page = ((p as i64) >> 12) + decode_adrp_page(adrp);
+        let target = ((page << 12) as u64) + u64::from(decode_imm12(add));
+        let rdata_rva = (target - IMAGE_BASE) as u32;
+        // `msg` sits 8 bytes into .rdata, which follows .text.
+        assert_eq!(
+            pe_rva_to_offset(&out, rdata_rva),
+            pe_rva_to_offset(&out, rdata_rva - 8) + 8
+        );
+        assert!(rdata_rva > text_rva, "{rdata_rva:#x} vs {text_rva:#x}");
+    }
+
+    #[test]
+    fn test_arm64_call_to_an_import_goes_through_a_three_word_thunk() {
+        let obj = arm64_object(
+            &[TestSection {
+                name: ".text",
+                flags: TEXT_FLAGS,
+                data: &words(&[ARM64_BL, ARM64_RET]),
+                relocs: &[(0, 3, IMAGE_REL_ARM64_BRANCH26)],
+                selection: 0,
+                assoc: 0,
+            }],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("printf", 0, IMAGE_SYM_CLASS_EXTERNAL, 0),
+            ],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
+        let text_rva = entry_rva(&out);
+        let bl = pe_word_at_rva(&out, text_rva);
+        let delta = sign_extend(u64::from(bl & 0x03FF_FFFF), 26) * 4;
+        let thunk_rva = (i64::from(text_rva) + delta) as u32;
+
+        let adrp = pe_word_at_rva(&out, thunk_rva);
+        let ldr = pe_word_at_rva(&out, thunk_rva + 4);
+        assert_eq!(pe_word_at_rva(&out, thunk_rva + 8), ARM64_BR_X16);
+
+        let p = IMAGE_BASE + u64::from(thunk_rva);
+        let page = ((p as i64) >> 12) + decode_adrp_page(adrp);
+        let slot = ((page << 12) as u64) + u64::from(decode_imm12(ldr)) * 8;
+        let (iat_rva, iat_size) = pe_data_dir(&out, 12);
+        let slot_rva = (slot - IMAGE_BASE) as u32;
+        assert!(
+            slot_rva >= iat_rva && slot_rva < iat_rva + iat_size,
+            "{slot_rva:#x} outside IAT {iat_rva:#x}+{iat_size:#x}"
+        );
+    }
+
+    #[test]
+    fn test_arm64_absolute_pointer_gets_a_base_relocation() {
+        let obj = arm64_object(
+            &[
+                TestSection {
+                    name: ".text",
+                    flags: TEXT_FLAGS,
+                    data: &words(&[ARM64_RET]),
+                    relocs: &[],
+                    selection: 0,
+                    assoc: 0,
+                },
+                TestSection {
+                    name: ".data",
+                    flags: IMAGE_SCN_CNT_INITIALIZED_DATA
+                        | IMAGE_SCN_MEM_READ
+                        | IMAGE_SCN_MEM_WRITE,
+                    data: &[0u8; 8],
+                    relocs: &[(0, 4, IMAGE_REL_ARM64_ADDR64)],
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
+        let (reloc_rva, reloc_size) = pe_base_reloc_dir(&out);
+        assert!(reloc_rva != 0 && reloc_size >= 12);
+    }
+
+    #[test]
+    fn test_arm64_unimplemented_relocation_is_refused_by_name() {
+        let obj = arm64_object(
+            &[TestSection {
+                name: ".text",
+                flags: TEXT_FLAGS,
+                data: &words(&[ARM64_LDR_X1_X0, ARM64_RET]),
+                relocs: &[(0, 3, 0x0008)],
+                selection: 0,
+                assoc: 0,
+            }],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("tvar", 1, IMAGE_SYM_CLASS_EXTERNAL, 4),
+            ],
+        );
+        let mut out = Vec::new();
+        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("IMAGE_REL_ARM64_SECREL"), "{message}");
+        assert!(message.contains("tvar"), "{message}");
+    }
+
+    #[test]
+    fn test_arm64_in_instruction_addend_is_refused() {
+        let obj = arm64_object(
+            &[
+                TestSection {
+                    name: ".text",
+                    flags: TEXT_FLAGS,
+                    data: &words(&[ARM64_ADRP_X0 | (1 << 29), ARM64_RET]),
+                    relocs: &[(0, 5, IMAGE_REL_ARM64_PAGEBASE_REL21)],
+                    selection: 0,
+                    assoc: 0,
+                },
+                TestSection {
+                    name: ".rdata",
+                    flags: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+                    data: &[0u8; 16],
+                    relocs: &[],
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[
+                ("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0),
+                ("msg", 2, IMAGE_SYM_CLASS_STATIC, 0),
+            ],
+        );
+        let mut out = Vec::new();
+        let message = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("non-zero immediate field"), "{message}");
+        assert!(message.contains("msg"), "{message}");
+    }
+
+    #[test]
+    fn test_mixed_machine_objects_are_refused() {
+        let x86 = coff_object(
+            &[text_section(&[0xC3], &[])],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let arm = arm64_object(
+            &[TestSection {
+                name: ".text",
+                flags: TEXT_FLAGS,
+                data: &words(&[ARM64_RET]),
+                relocs: &[],
+                selection: 0,
+                assoc: 0,
+            }],
+            &[("other", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        let message =
+            link_and_emit_pe_from_coffs(&[x86.as_slice(), arm.as_slice()], None, &mut out)
+                .unwrap_err()
+                .to_string();
+        assert!(message.contains("0xaa64"), "{message}");
+        assert!(message.contains("0x8664"), "{message}");
     }
 }
