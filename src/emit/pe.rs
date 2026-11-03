@@ -211,11 +211,12 @@ const DATA_DIR_TLS: usize = 9;
 const TLS_DIRECTORY_SIZE: usize = 40;
 const TLS_INDEX_SYMBOL: &str = "_tls_index";
 const TLS_USED_SYMBOL: &str = "_tls_used";
-const IMAGE_REL_AMD64_SECREL: u16 = 0x000E;
+const IMAGE_REL_AMD64_SECREL: u16 = 0x000B;
 const PDATA_RECORD_SIZE: usize = 12;
 const IMAGE_REL_AMD64_REL32_5: u16 = 0x0009;
 const IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
 const IMPORT_SYMBOL_PREFIX: &str = "__imp_";
+
 const IMAGE_COMDAT_SELECT_NODUPLICATES: u8 = 1;
 const IMAGE_COMDAT_SELECT_ANY: u8 = 2;
 const IMAGE_COMDAT_SELECT_SAME_SIZE: u8 = 3;
@@ -4333,6 +4334,11 @@ mod tests {
         let data_sec = pe_section(&sections, ".data");
         let index_rva = (index - IMAGE_BASE) as u32;
         assert!(index_rva >= data_sec.rva && index_rva + 4 <= data_sec.rva + data_sec.vsize);
+    }
+
+    #[test]
+    fn test_amd64_secrel_is_the_value_the_pe_spec_gives_it() {
+        assert_eq!(IMAGE_REL_AMD64_SECREL, 0x000B);
     }
 
     #[test]
