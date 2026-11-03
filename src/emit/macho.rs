@@ -814,21 +814,18 @@ pub fn emit_macho_executable_dynamic_with(
     let got_offset_in_segment = got_section.map(|s| s.vaddr - data_base).unwrap_or(0);
 
     const DATA_SEGMENT_INDEX: u32 = 2;
-    let mut rebase_offsets: Vec<u64> = dyn_info
-        .macho_rebase_addrs
-        .iter()
-        .filter_map(|&addr| {
-            if addr < data_base {
-                return None;
+    let mut rebase_offsets: Vec<u64> = Vec::with_capacity(dyn_info.macho_rebase_addrs.len());
+    for &addr in &dyn_info.macho_rebase_addrs {
+        match addr.checked_sub(data_base) {
+            Some(off) if off + 8 <= data_size as u64 => rebase_offsets.push(off),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("rebase slot 0x{addr:x} is outside the __DATA segment"),
+                ));
             }
-            let off = addr - data_base;
-            if off + 8 <= data_size as u64 {
-                Some(off)
-            } else {
-                None
-            }
-        })
-        .collect();
+        }
+    }
     rebase_offsets.sort_unstable();
     rebase_offsets.dedup();
 
@@ -1216,6 +1213,100 @@ mod tests {
         ];
         let ops = build_bind_opcodes(&[], &[], 2, 0, &binds);
         assert!(ops.ends_with(&[0x60, 0x00, 0x90, 0x00]));
+    }
+
+    fn decode_rebase_offsets(stream: &[u8]) -> Vec<u64> {
+        fn uleb(bytes: &[u8], at: &mut usize) -> u64 {
+            let (mut value, mut shift) = (0u64, 0);
+            loop {
+                let byte = bytes[*at];
+                *at += 1;
+                value |= ((byte & 0x7f) as u64) << shift;
+                shift += 7;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+            }
+        }
+        let mut slots = Vec::new();
+        let mut at = 0usize;
+        let mut offset = 0u64;
+        loop {
+            let op = stream[at];
+            at += 1;
+            match op & 0xf0 {
+                0x00 if op == 0 => return slots,
+                0x10 => assert_eq!(op & 0x0f, 1, "only pointer rebases"),
+                0x20 => offset = uleb(stream, &mut at),
+                0x30 => offset += uleb(stream, &mut at),
+                0x50 => {
+                    for _ in 0..(op & 0x0f) {
+                        slots.push(offset);
+                        offset += 8;
+                    }
+                }
+                0x60 => {
+                    for _ in 0..uleb(stream, &mut at) {
+                        slots.push(offset);
+                        offset += 8;
+                    }
+                }
+                other => panic!("unexpected rebase opcode {other:#x}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rebase_stream_names_exactly_the_recorded_slots() {
+        assert!(build_rebase_opcodes(2, &[]).is_empty());
+        assert_eq!(
+            build_rebase_opcodes(2, &[16, 8]),
+            vec![0x11, 0x22, 0x08, 0x52, 0x00],
+            "two adjacent slots share one run"
+        );
+        let gapped = [0u64, 8, 40, 48, 56, 200];
+        assert_eq!(
+            decode_rebase_offsets(&build_rebase_opcodes(2, &gapped)),
+            gapped
+        );
+        let long: Vec<u64> = (0..40).map(|i| 0x100 + i * 8).collect();
+        assert_eq!(decode_rebase_offsets(&build_rebase_opcodes(2, &long)), long);
+    }
+
+    #[test]
+    fn rebase_slot_outside_data_segment_is_refused() {
+        let dyn_info = DynamicLinkInfo {
+            pie: true,
+            shared: false,
+            needed: Vec::new(),
+            plt_symbols: Vec::new(),
+            weak_plt_symbols: Vec::new(),
+            interpreter: None,
+            macho_rebase_addrs: vec![0x100000008],
+            macho_direct_binds: Vec::new(),
+        };
+        let layout = MergedLayout {
+            sections: vec![MergedSection {
+                entsize: 0,
+                sh_type: 1,
+                name: "__data".to_string(),
+                data: vec![0u8; 16],
+                vaddr: 0x100008000,
+                flags: 2,
+                align: 3,
+            }],
+            section_by_name: HashMap::default(),
+        };
+        let mut image = Vec::new();
+        let err = emit_macho_executable_dynamic(
+            &layout,
+            TargetArch::AArch64,
+            0x100004000,
+            &dyn_info,
+            &mut image,
+        )
+        .expect_err("rebase slot before __DATA");
+        assert!(err.to_string().contains("0x100000008"));
     }
 
     #[test]

@@ -708,7 +708,8 @@ fn apply_macho_relocations(
             };
             let place_runtime = place_addr.wrapping_add(place_shift);
             let extra_addend = addend_by_address.remove(&r.r_address).unwrap_or(0);
-            if direct_bind_symbol.is_some() {
+            let is_direct_bind = direct_bind_symbol.is_some();
+            if is_direct_bind {
                 should_record_rebase = false;
             }
             if let Some((sym_name, weak, bind_addend)) = direct_bind_symbol
@@ -859,6 +860,24 @@ fn apply_macho_relocations(
                     }
                     3 => {
                         let addend = read_addend(&merged.data, off, r.r_length);
+                        if !r.r_pcrel
+                            && !is_direct_bind
+                            && !is_data_layout_section(&merged.name)
+                            && !merged.name.starts_with("__DWARF.")
+                        {
+                            let target = if r.r_extern {
+                                obj.symbols
+                                    .get(r.r_symbolnum as usize)
+                                    .map(|s| s.name.as_str())
+                                    .unwrap_or("?")
+                            } else {
+                                "<section>"
+                            };
+                            return Err(format!(
+                                "absolute pointer to {target} at 0x{:x} in {} cannot be rebased: section is not writable data",
+                                place_addr, merged.name
+                            ));
+                        }
                         let is_tls_target = is_thread_vars_section(&merged.name)
                             && !r.r_pcrel
                             && tls_ranges
@@ -999,6 +1018,7 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
     let mut layout = merge_macho_sections(&obj);
     let symbol_addrs = resolve_macho_symbols(&obj, &layout);
     let symbol_addr_by_idx = symbol_addr_by_index(&obj, &layout, &symbol_addrs);
+    let mut rebase_addrs: HashSet<u64> = HashSet::default();
     apply_macho_relocations(
         &obj,
         arch,
@@ -1010,18 +1030,32 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
         &[],
         VM_ADDR_BIAS,
         VM_ADDR_BIAS,
-        None,
+        Some(&mut rebase_addrs),
         None,
     )?;
 
     let e_machine = arch.to_elf_machine();
+    let dynamic = (!rebase_addrs.is_empty()).then(|| {
+        let mut macho_rebase_addrs: Vec<u64> = rebase_addrs.into_iter().collect();
+        macho_rebase_addrs.sort_unstable();
+        DynamicLinkInfo {
+            pie: false,
+            shared: false,
+            needed: vec!["libSystem.B.dylib".into()],
+            plt_symbols: Vec::new(),
+            weak_plt_symbols: Vec::new(),
+            interpreter: None,
+            macho_rebase_addrs,
+            macho_direct_binds: Vec::new(),
+        }
+    });
 
     Ok(LinkResult {
         symbols: Vec::new(),
         layout,
         e_machine,
         symbol_addrs,
-        dynamic: None,
+        dynamic,
     })
 }
 
@@ -1332,9 +1366,6 @@ pub fn link_macho_multi_object(
         let trace_relocs = std::env::var("WELD_TRACE_RELOCS").ok().as_deref() == Some("1");
         let undefined_set: HashSet<&str> = undefined.iter().map(|s| s.as_str()).collect();
         let got_base = layout.sections[got_idx].vaddr;
-        for i in 0..got_symbols.len() {
-            rebase_addrs.insert(got_base + (i as u64) * 8);
-        }
         let got_data = &mut layout.sections[got_idx].data;
         for (i, sym) in got_symbols.iter().enumerate() {
             if undefined_set.contains(sym.as_str()) {
@@ -1345,6 +1376,7 @@ pub fn link_macho_multi_object(
                 let slot_off = i * 8;
                 if slot_off + 8 <= got_data.len() {
                     got_data[slot_off..slot_off + 8].copy_from_slice(&runtime_addr.to_le_bytes());
+                    rebase_addrs.insert(got_base + slot_off as u64);
                     if trace_relocs && sym.contains("thread7current2id2ID") {
                         log::debug!(
                             "got prefill: sym={} layout_addr=0x{:x} runtime_addr=0x{:x} slot=0x{:x}",
@@ -1391,7 +1423,10 @@ pub fn link_macho_multi_object(
         )?;
     }
 
-    let dynamic = if layout.section_by_name.contains_key("__got") || !direct_binds.is_empty() {
+    let dynamic = if layout.section_by_name.contains_key("__got")
+        || !direct_binds.is_empty()
+        || !rebase_addrs.is_empty()
+    {
         let plt_symbols = undefined;
         if std::env::var("WELD_TRACE_UNDEF").ok().as_deref() == Some("1") {
             let tlv_bootstrap_count = plt_symbols
@@ -2153,6 +2188,44 @@ pub(crate) mod tests {
         assert_eq!(i32_at(bytes, 3), slot_runtime as i64 - (place as i64 + 4));
         let dynamic = result.dynamic.expect("got needs dynamic info");
         assert!(dynamic.macho_rebase_addrs.contains(&slot));
+    }
+
+    #[test]
+    fn absolute_data_pointer_is_recorded_for_rebase() {
+        let obj = macho_object(
+            X86_64_CPU,
+            &[
+                text(vec![0xC3], Vec::new()),
+                TestSection {
+                    segname: "__DATA",
+                    sectname: "__data",
+                    data: vec![0; 16],
+                    relocs: vec![reloc(8, 0, false, 3, true, 0)],
+                },
+            ],
+            &[defined("_target", 1, 0)],
+        );
+        let result = link_macho_single_object(&obj).expect("links");
+        let data = result
+            .layout
+            .sections
+            .iter()
+            .find(|s| s.data.len() == 16)
+            .expect("data section");
+        let dynamic = result.dynamic.expect("a pointer needs rebase info");
+        assert_eq!(dynamic.macho_rebase_addrs, vec![data.vaddr + 8]);
+    }
+
+    #[test]
+    fn absolute_pointer_in_text_is_refused_naming_symbol() {
+        let obj = macho_object(
+            X86_64_CPU,
+            &[text(vec![0; 16], vec![reloc(8, 0, false, 3, true, 0)])],
+            &[defined("_here", 1, 0)],
+        );
+        let err = link_macho_single_object(&obj).expect_err("text cannot be rebased");
+        assert!(err.contains("_here"), "{err}");
+        assert!(err.contains("cannot be rebased"), "{err}");
     }
 
     #[test]
