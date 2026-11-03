@@ -226,6 +226,19 @@ const IMAGE_COMDAT_SELECT_LARGEST: u8 = 6;
 const CRT_MAIN_SYMBOL: &str = "__main";
 const COFF_RET: u8 = 0xC3;
 
+/// Whether a COFF section holds `RUNTIME_FUNCTION` records.
+fn is_exception_table(name: &str) -> bool {
+    name == ".pdata" || name.starts_with(".pdata$")
+}
+
+/// Store an image-relative address in a four-byte field.
+fn write_rva(field: &mut [u8], target: i64, section: &str) -> Result<()> {
+    let rva = u32::try_from(target - IMAGE_BASE as i64)
+        .map_err(|_| coff_error(format!("image-relative address out of range in {section}")))?;
+    field.copy_from_slice(&rva.to_le_bytes());
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum CoffRegion {
     Text = 0,
@@ -2013,7 +2026,7 @@ fn parse_coff_object(object: usize, coff_data: &[u8]) -> Result<ParsedCoff<'_>> 
             }
             let region = if sec.name == ".tls" || sec.name.starts_with(".tls$") {
                 CoffRegion::Tls
-            } else if sec.name == ".pdata" || sec.name.starts_with(".pdata$") {
+            } else if is_exception_table(&sec.name) {
                 CoffRegion::Pdata
             } else if sec.flags & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 {
                 CoffRegion::Text
@@ -2321,12 +2334,18 @@ pub fn link_and_emit_pe_from_coffs(
         let r = sec.region as usize;
         let align = match sec.region {
             CoffRegion::Pdata => {
-                if sec.size % PDATA_RECORD_SIZE != 0 {
+                // An assembler pads a section's raw data to its own alignment, so a
+                // whole number of records can be followed by zeroes. Those are dropped,
+                // which also keeps the next object's records on the record grid.
+                let whole = sec.size - sec.size % PDATA_RECORD_SIZE;
+                if sec.raw[whole..].iter().any(|&byte| byte != 0) {
                     return Err(coff_error(format!(
                         "{} in object {} is not a whole number of exception records",
                         sec.name, sec.object
                     )));
                 }
+                sec.size = whole;
+                sec.raw = &sec.raw[..whole];
                 1
             }
             _ => sec.align,
@@ -2759,6 +2778,17 @@ pub fn link_and_emit_pe_from_coffs(
                     }
                     blob[at..at + 4].copy_from_slice(&(offset as u32).to_le_bytes());
                 }
+                IMAGE_REL_AMD64_ADDR32 if is_exception_table(&sec.name) => {
+                    // Every field of a RUNTIME_FUNCTION is an image-relative address, so
+                    // an absolute 32-bit one would name nothing the unwinder can use. An
+                    // assembler without ADDR32NB is taken at its intent here.
+                    log::debug!(
+                        "reading ADDR32 at {site_rva:#x} in {} as image-relative",
+                        sec.name
+                    );
+                    let (target, _) = resolve(object, sym_idx as usize, false, &sec.name)?;
+                    write_rva(&mut blob[at..at + 4], target + addend, &sec.name)?;
+                }
                 IMAGE_REL_AMD64_ADDR32 => {
                     // The loader adds its base delta to these 32 bits only, so the stored
                     // value is a usable pointer only while the image stays below 4 GiB.
@@ -2770,11 +2800,7 @@ pub fn link_and_emit_pe_from_coffs(
                 }
                 IMAGE_REL_AMD64_ADDR32NB => {
                     let (target, _) = resolve(object, sym_idx as usize, false, &sec.name)?;
-                    let v = target - IMAGE_BASE as i64 + addend;
-                    let v = u32::try_from(v).map_err(|_| {
-                        coff_error(format!("ADDR32NB out of range in {}", sec.name))
-                    })?;
-                    blob[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                    write_rva(&mut blob[at..at + 4], target + addend, &sec.name)?;
                 }
                 other => {
                     return Err(coff_error(format!(
@@ -2786,11 +2812,23 @@ pub fn link_and_emit_pe_from_coffs(
         }
     }
 
+    let mut pdata_used = region_size[3];
     if has_pdata {
         let at = region_base[3];
         let (chunks, _) = blob[at..at + region_size[3]].as_chunks::<PDATA_RECORD_SIZE>();
         let mut records: Vec<[u8; PDATA_RECORD_SIZE]> = chunks.to_vec();
-        records.sort_by_key(|rec| u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]));
+        // An object pads its section to a raw alignment, so the tail can hold records
+        // that name nothing. Those sort last and stay outside the directory, because
+        // Windows binary-searches the table and reads a record for every byte it covers.
+        records.sort_by_key(|rec| {
+            let start = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+            (rec.iter().all(|&byte| byte == 0), start)
+        });
+        pdata_used = records
+            .iter()
+            .filter(|rec| rec.iter().any(|&byte| byte != 0))
+            .count()
+            * PDATA_RECORD_SIZE;
         for (i, rec) in records.iter().enumerate() {
             let off = at + i * PDATA_RECORD_SIZE;
             blob[off..off + PDATA_RECORD_SIZE].copy_from_slice(rec);
@@ -2862,9 +2900,14 @@ pub fn link_and_emit_pe_from_coffs(
     }
     if has_pdata {
         let at = region_base[3];
+        let kept = if pdata_used > 0 {
+            pdata_used
+        } else {
+            region_size[3]
+        };
         pe_sections.push(PeSection::new(
             ".pdata",
-            blob[at..at + region_size[3]].to_vec(),
+            blob[at..at + kept].to_vec(),
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
         ));
         sec_rvas.push(pdata_rva);
@@ -2874,8 +2917,8 @@ pub fn link_and_emit_pe_from_coffs(
     } else {
         (0, 0)
     };
-    let pdata_dir = if has_pdata {
-        (pdata_rva, region_size[3] as u32)
+    let pdata_dir = if has_pdata && pdata_used > 0 {
+        (pdata_rva, pdata_used as u32)
     } else {
         (0, 0)
     };
@@ -3953,7 +3996,8 @@ mod tests {
 
     #[test]
     fn test_coff_long_section_name_is_read_from_string_table() {
-        let record = [0u8; 12];
+        let mut record = [0u8; 12];
+        record[0] = 1;
         let obj = coff_object_with_strtab(
             &[
                 text_section(&[0x90; 8], &[]),
@@ -4023,12 +4067,65 @@ mod tests {
     fn test_coff_pdata_size_not_multiple_of_record_is_error() {
         let obj = pdata_object(
             &[0xC3],
-            &[0u8; 4],
+            &[1u8; 4],
             &[],
             &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
         );
         let mut out = Vec::new();
-        assert!(link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).is_err());
+        let err = link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out)
+            .expect_err("a truncated record must be refused");
+        assert!(err.to_string().contains("exception records"), "{err}");
+    }
+
+    #[test]
+    fn test_coff_pdata_padding_after_the_last_record_is_dropped() {
+        // An assembler pads a section's raw data, so a record can be followed by zeroes.
+        let mut pdata = [0u8; 16];
+        pdata[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let obj = pdata_object(
+            &[0xC3],
+            &pdata,
+            &[],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
+        let (_, size) = pe_data_dir(&out, DATA_DIR_EXCEPTION);
+        assert_eq!(size, PDATA_RECORD_SIZE as u32);
+    }
+
+    #[test]
+    fn test_coff_pdata_record_of_zeroes_stays_out_of_the_directory() {
+        let mut pdata = [0u8; 24];
+        pdata[12..16].copy_from_slice(&1u32.to_le_bytes());
+        let obj = pdata_object(
+            &[0xC3],
+            &pdata,
+            &[],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
+        let (_, size) = pe_data_dir(&out, DATA_DIR_EXCEPTION);
+        assert_eq!(size, PDATA_RECORD_SIZE as u32);
+    }
+
+    #[test]
+    fn test_coff_pdata_addr32_is_read_as_image_relative() {
+        // ras has no ADDR32NB, and a RUNTIME_FUNCTION field is an RVA either way.
+        let obj = pdata_object(
+            &[0xC3],
+            &[0u8; 12],
+            &[(0, 4, IMAGE_REL_AMD64_ADDR32)],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
+        let (_, size) = pe_data_dir(&out, DATA_DIR_EXCEPTION);
+        assert_eq!(size, PDATA_RECORD_SIZE as u32);
+        let pdata = pe_section_header(&out, 2);
+        let at = le_u32(pdata, 20) as usize;
+        assert_eq!(le_u32(&out, at), 0x1000, "the field must hold main's RVA");
     }
 
     #[test]
