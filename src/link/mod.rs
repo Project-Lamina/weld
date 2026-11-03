@@ -25,7 +25,8 @@ mod x86_64;
 use crate::collections::{HashMap, HashSet};
 pub use dynamic::DynamicLinkInfo;
 use dynamic::{
-    DynamicAddrs, build_dynamic_section_content, build_dynamic_sections, build_plt_got_x86_64,
+    DynamicAddrs, build_dynamic_section_content, build_dynamic_sections, build_plt_got_aarch64,
+    build_plt_got_x86_64,
 };
 pub(crate) use merge::segment_class;
 pub use merge::{
@@ -333,7 +334,8 @@ fn link_multi_object_parsed(
             })
             .unwrap_or(false);
 
-    if (has_shared_lib || opts.shared) && arch == TargetArch::X86_64 && e_machine == 62 {
+    let dynamic_arch = matches!(arch, TargetArch::X86_64 | TargetArch::AArch64);
+    if (has_shared_lib || opts.shared) && dynamic_arch {
         let mut undefined: Vec<String> = Vec::new();
         let mut undefined_seen = HashSet::default();
         for obj in parsed.iter() {
@@ -386,7 +388,10 @@ fn link_multi_object_parsed(
             shared_imports = undefined.clone();
         }
         if !needed.is_empty() || opts.shared {
-            let (plt_data, got_plt_data) = build_plt_got_x86_64(&undefined, &layout)?;
+            let (plt_data, got_plt_data) = match arch {
+                TargetArch::AArch64 => build_plt_got_aarch64(&undefined),
+                _ => build_plt_got_x86_64(&undefined, &layout)?,
+            };
             let mut vaddr = align_up(image_end(&layout).ok_or("no sections")?, 16);
 
             let plt_vaddr = vaddr;
@@ -423,6 +428,10 @@ fn link_multi_object_parsed(
             let got_plt_size = 24 + (undefined.len() as u64) * 8;
             vaddr = align_up(got_plt_vaddr + got_plt_size, 8);
 
+            let jump_slot = arch
+                .dynamic_reloc_types()
+                .ok_or_else(|| format!("weld has no dynamic linking path for {arch:?}"))?
+                .2;
             let (
                 dynsym_data,
                 dynstr_data,
@@ -438,6 +447,7 @@ fn link_multi_object_parsed(
                 &opts.rpaths,
                 &exports,
                 opts.soname.as_deref(),
+                jump_slot,
             )?;
             let dynsym_vaddr = vaddr;
             let dynsym_size = dynsym_data.len() as u64;
@@ -538,14 +548,14 @@ fn link_multi_object_parsed(
                 global_symbols.insert(sym.clone(), plt_entry_addr);
             }
 
-            // ld's --dynamic-linker when given. The default is glibc's on x86-64, which
-            // is the only arch this branch runs for; it is wrong under musl.
+            // ld's --dynamic-linker when given, else glibc's path for the
+            // architecture. The default is wrong under musl.
             let interpreter = if opts.shared {
                 None
             } else {
                 Some(
                     requested_interpreter(opts)?
-                        .unwrap_or_else(|| "/lib64/ld-linux-x86-64.so.2".to_string()),
+                        .unwrap_or_else(|| arch.default_interpreter().to_string()),
                 )
             };
             dynamic_info = Some(DynamicLinkInfo {
@@ -564,18 +574,44 @@ fn link_multi_object_parsed(
     timer.mark("dynamic sections");
     let mut got_symbol_map: HashMap<String, u64> = HashMap::default();
     let mut tls_got_names: HashSet<String> = HashSet::default();
-    if arch == TargetArch::X86_64 {
+    if dynamic_arch {
+        let (got_kinds, ie_kinds, offset_kinds): (&[u32], &[u32], &[u32]) = match arch {
+            TargetArch::AArch64 => (
+                &[
+                    reloc_type::R_AARCH64_ADR_GOT_PAGE,
+                    reloc_type::R_AARCH64_LD64_GOT_LO12_NC,
+                ],
+                &[
+                    reloc_type::R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21,
+                    reloc_type::R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC,
+                ],
+                &[
+                    reloc_type::R_AARCH64_TLSLE_ADD_TPREL_HI12,
+                    reloc_type::R_AARCH64_TLSLE_ADD_TPREL_LO12,
+                    reloc_type::R_AARCH64_TLSLE_ADD_TPREL_LO12_NC,
+                ],
+            ),
+            _ => (
+                &[
+                    reloc_type::R_X86_64_GOTPCREL,
+                    reloc_type::R_X86_64_GOTPCRELX,
+                    reloc_type::R_X86_64_REX_GOTPCRELX,
+                ],
+                &[reloc_type::R_X86_64_GOTTPOFF],
+                &[
+                    reloc_type::R_X86_64_TLSGD,
+                    reloc_type::R_X86_64_TPOFF32,
+                    reloc_type::R_X86_64_TPOFF64,
+                ],
+            ),
+        };
         let mut unique_syms: Vec<String> = Vec::new();
         let mut got_seen: HashSet<String> = HashSet::default();
         for obj in parsed.iter() {
             collect_got_symbol_names(
                 &obj.data,
                 &obj.sections,
-                &[
-                    reloc_type::R_X86_64_GOTPCREL,
-                    reloc_type::R_X86_64_GOTPCRELX,
-                    reloc_type::R_X86_64_REX_GOTPCRELX,
-                ],
+                got_kinds,
                 &mut unique_syms,
                 &mut got_seen,
             );
@@ -586,7 +622,7 @@ fn link_multi_object_parsed(
             collect_got_symbol_names(
                 &obj.data,
                 &obj.sections,
-                &[reloc_type::R_X86_64_GOTTPOFF],
+                ie_kinds,
                 &mut tls_names,
                 &mut tls_seen,
             );
@@ -607,11 +643,7 @@ fn link_multi_object_parsed(
             collect_got_symbol_names(
                 &obj.data,
                 &obj.sections,
-                &[
-                    reloc_type::R_X86_64_TLSGD,
-                    reloc_type::R_X86_64_TPOFF32,
-                    reloc_type::R_X86_64_TPOFF64,
-                ],
+                offset_kinds,
                 &mut offset_names,
                 &mut offset_seen,
             );
@@ -660,6 +692,7 @@ fn link_multi_object_parsed(
     };
     let mut runtime = if let Some(dynamic) = dynamic_info.as_ref().filter(|d| !d.shared) {
         Some(runtime::prepare(
+            arch,
             &mut layout,
             parsed,
             dynamic,
@@ -739,7 +772,7 @@ fn link_multi_object_parsed(
     if let Some(pending) = &mut pie_relocations {
         pending.remap(remap);
     }
-    runtime::remap_generated(&mut layout, remap);
+    runtime::remap_generated(arch, &mut layout, remap);
     if arch == TargetArch::PowerPc64 {
         let end = image_end(&layout).unwrap_or(0);
         global_symbols
@@ -792,10 +825,12 @@ fn link_multi_object_parsed(
         let got_base = layout.sections[got_idx].vaddr;
         for (name, &got_entry_vaddr) in &got_symbol_map {
             if let Some(&sym_addr) = global_symbols.get(name) {
-                let value = if tls_got_names.contains(name) {
-                    x86_64::local_exec_offset(tls.as_ref(), sym_addr, 0)? as u64
-                } else {
+                let value = if !tls_got_names.contains(name) {
                     sym_addr
+                } else if arch == TargetArch::AArch64 {
+                    aarch64::thread_pointer_offset(tls.as_ref(), sym_addr, 0)? as u64
+                } else {
+                    x86_64::local_exec_offset(tls.as_ref(), sym_addr, 0)? as u64
                 };
                 let off = (got_entry_vaddr - got_base) as usize;
                 if off + 8 <= layout.sections[got_idx].data.len() {
@@ -876,7 +911,7 @@ fn link_multi_object_parsed(
     }
 
     if let Some(runtime) = runtime {
-        runtime::finish(&mut layout, &section_contribs, &runtime)?;
+        runtime::finish(arch, &mut layout, &section_contribs, &runtime)?;
     }
     runtime::finish_eh_frame_hdr(&mut layout)?;
     if let Some(pending) = pie_relocations {
@@ -1151,9 +1186,15 @@ pub fn apply_relocations(
             got_entries,
             section_offset,
         ),
-        TargetArch::AArch64 => {
-            aarch64::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset)
-        }
+        TargetArch::AArch64 => aarch64::apply_relocations(
+            layout,
+            data,
+            sections,
+            names,
+            symbol_addrs,
+            got_entries,
+            section_offset,
+        ),
         TargetArch::RiscV => {
             riscv::apply_relocations(layout, data, sections, names, symbol_addrs, section_offset)
         }

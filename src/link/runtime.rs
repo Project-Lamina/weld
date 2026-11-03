@@ -251,7 +251,9 @@ fn rela(bytes: &mut Vec<u8>, offset: u64, index: u32, kind: u32, addend: i64) {
     bytes.extend_from_slice(&addend.to_le_bytes());
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare(
+    arch: TargetArch,
     layout: &mut MergedLayout,
     parsed: &[ParsedObject],
     dynamic: &DynamicLinkInfo,
@@ -308,14 +310,15 @@ pub(super) fn prepare(
                 .0
             {
                 let kind = word(record, 8)?;
-                if !matches!(kind, 1 | 6 | 8) {
+                if !arch.passthrough_dynamic_relocs().contains(&kind) {
                     continue;
                 }
+                let relative = arch.relative_reloc();
                 let index = word(record, 12)? as usize;
                 let symbol = *indices
                     .get(index)
                     .ok_or("invalid dynamic relocation symbol")?;
-                if (kind == 8 && dynamic.pie) || (kind != 8 && symbol == 0) {
+                if (kind == relative && dynamic.pie) || (kind != relative && symbol == 0) {
                     continue;
                 }
                 let relocation = crate::elf::parse_rela_entry(record, 0)?;
@@ -608,19 +611,21 @@ pub(super) fn prepare(
     layout.sections[dynidx].data = content;
     let gotplt = layout.sections[layout.section_by_name[".got.plt"]].vaddr;
     globals.insert("_GLOBAL_OFFSET_TABLE_".into(), gotplt);
-    let pltidx = layout.section_by_name[".plt"];
-    let plt = &mut layout.sections[pltidx];
-    for (off, target) in [(2, gotplt + 8), (8, gotplt + 16)] {
-        plt.data[off..off + 4].copy_from_slice(
-            &((target as i64 - (plt.vaddr + off as u64 + 4) as i64) as i32).to_le_bytes(),
-        );
-    }
-    for i in 0..imports.len() {
-        let off = 16 + i * 16 + 2;
-        plt.data[off..off + 4].copy_from_slice(
-            &((gotplt as i64 + 24 + i as i64 * 8 - (plt.vaddr + off as u64 + 4) as i64) as i32)
-                .to_le_bytes(),
-        );
+    if arch == TargetArch::X86_64 {
+        let pltidx = layout.section_by_name[".plt"];
+        let plt = &mut layout.sections[pltidx];
+        for (off, target) in [(2, gotplt + 8), (8, gotplt + 16)] {
+            plt.data[off..off + 4].copy_from_slice(
+                &((target as i64 - (plt.vaddr + off as u64 + 4) as i64) as i32).to_le_bytes(),
+            );
+        }
+        for i in 0..imports.len() {
+            let off = 16 + i * 16 + 2;
+            plt.data[off..off + 4].copy_from_slice(
+                &((gotplt as i64 + 24 + i as i64 * 8 - (plt.vaddr + off as u64 + 4) as i64) as i32)
+                    .to_le_bytes(),
+            );
+        }
     }
     let idx = layout.section_by_name[".rela.plt"];
     for i in 0..imports.len() {
@@ -693,16 +698,20 @@ pub(super) fn relro(name: &str) -> bool {
 }
 
 pub(super) fn finish(
+    arch: TargetArch,
     layout: &mut MergedLayout,
     contributions: &[HashMap<String, ObjectSectionContrib>],
     runtime: &Runtime,
 ) -> Result<(), String> {
+    let (copy_kind, glob_dat, _) = arch
+        .dynamic_reloc_types()
+        .ok_or_else(|| format!("weld has no dynamic linking path for {arch:?}"))?;
     let mut bytes = Vec::new();
     for &(address, index) in &runtime.copies {
-        rela(&mut bytes, address, index, 5, 0);
+        rela(&mut bytes, address, index, copy_kind, 0);
     }
     for &(address, index) in &runtime.got {
-        rela(&mut bytes, address, index, 6, 0);
+        rela(&mut bytes, address, index, glob_dat, 0);
     }
     for relocation in &runtime.relocations {
         let section = &layout.sections[relocation.section];
@@ -727,6 +736,30 @@ pub(super) fn finish(
         }
     }
     Ok(())
+}
+
+/// Write each AArch64 PLT entry's `adrp`/`ldr`/`add` immediates now that the
+/// `.got.plt` address is final. A page delta only holds still once sections
+/// have stopped moving, so this runs after layout.
+fn patch_aarch64_plt(plt: &mut MergedSection, gotplt: u64) {
+    let entries = plt.data.len() / 16;
+    for i in 1..entries {
+        let slot = gotplt + 24 + (i as u64 - 1) * 8;
+        let entry = plt.vaddr + i as u64 * 16;
+        let pages = (((slot & !0xFFF) as i64 - (entry & !0xFFF) as i64) >> 12) as u32 & 0x1FFFFF;
+        let lo12 = (slot & 0xFFF) as u32;
+        let [adrp, ldr, add, br] = super::dynamic::AARCH64_PLT_ENTRY;
+        let patched = [
+            adrp | ((pages & 3) << 29) | (((pages >> 2) & 0x7FFFF) << 5),
+            ldr | ((lo12 >> 3) << 10),
+            add | (lo12 << 10),
+            br,
+        ];
+        for (word, insn) in patched.into_iter().enumerate() {
+            let off = i * 16 + word * 4;
+            plt.data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+        }
+    }
 }
 
 pub(super) fn reserve_eh_frame_hdr(layout: &mut MergedLayout) -> Result<(), String> {
@@ -877,7 +910,11 @@ fn frame_entries(section: &MergedSection) -> Result<Vec<(u64, u64)>, String> {
     Ok(entries)
 }
 
-pub(super) fn remap_generated(layout: &mut MergedLayout, remap: impl Fn(u64) -> u64) {
+pub(super) fn remap_generated(
+    arch: TargetArch,
+    layout: &mut MergedLayout,
+    remap: impl Fn(u64) -> u64,
+) {
     for section in &mut layout.sections {
         match section.name.as_str() {
             ".dynamic" => {
@@ -934,6 +971,10 @@ pub(super) fn remap_generated(layout: &mut MergedLayout, remap: impl Fn(u64) -> 
         layout.section_by_name.get(".got.plt"),
     ) {
         let got = layout.sections[got].vaddr;
+        if arch == TargetArch::AArch64 {
+            patch_aarch64_plt(&mut layout.sections[plt], got);
+            return;
+        }
         let plt = &mut layout.sections[plt];
         for (off, target) in [(2, got + 8), (8, got + 16)]
             .into_iter()

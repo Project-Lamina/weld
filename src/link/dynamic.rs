@@ -69,7 +69,8 @@ pub struct DynamicLinkInfo {
 /// (SysV `DT_HASH`) from the list of symbols that require PLT entries.
 ///
 /// `got_plt_vaddr` is the virtual address of `.got.plt`; it is used to compute
-/// each `R_X86_64_JUMP_SLOT` relocation's `r_offset` (GOT slot address).
+/// each `JUMP_SLOT` relocation's `r_offset` (GOT slot address). `jump_slot` is
+/// the architecture's `JUMP_SLOT` relocation type number.
 pub(super) fn build_dynamic_sections(
     plt_symbols: &[String],
     got_plt_vaddr: u64,
@@ -77,6 +78,7 @@ pub(super) fn build_dynamic_sections(
     rpaths: &[String],
     exports: &[String],
     soname: Option<&str>,
+    jump_slot: u32,
 ) -> Result<DynSections, String> {
     let mut dynstr = vec![0u8];
     let mut needed_offsets: Vec<u32> = Vec::with_capacity(needed.len());
@@ -135,7 +137,7 @@ pub(super) fn build_dynamic_sections(
     for (i, _) in plt_symbols.iter().enumerate() {
         let r_offset = got_plt_vaddr + 24 + (i as u64) * 8;
         // r_sym = i + 1 because dynsym index 0 is the reserved null entry.
-        let r_info = (((i + 1) as u64) << 32) | 7u64;
+        let r_info = (((i + 1) as u64) << 32) | u64::from(jump_slot);
         rela_plt.extend_from_slice(&r_offset.to_le_bytes());
         rela_plt.extend_from_slice(&r_info.to_le_bytes());
         rela_plt.extend_from_slice(&0i64.to_le_bytes());
@@ -281,6 +283,30 @@ pub(super) fn build_plt_got_x86_64(
 
     Ok((plt, got))
 }
+
+/// Build the `.plt` and `.got.plt` byte vectors for AArch64 dynamic linking.
+///
+/// Each entry is the four-instruction `adrp`/`ldr`/`add`/`br` sequence through
+/// its `.got.plt` slot. The immediates are left at zero here and written by
+/// `runtime::finish` once the GOT's final address is known. PLT0 is the lazy
+/// resolver stub on other linkers; weld binds eagerly (`DT_BIND_NOW`), so it
+/// holds `brk #0` and traps rather than jumping somewhere unprepared.
+pub(super) fn build_plt_got_aarch64(plt_symbols: &[String]) -> (Vec<u8>, Vec<u8>) {
+    const BRK: u32 = 0xd420_0000;
+    let mut plt = Vec::with_capacity((plt_symbols.len() + 1) * 16);
+    for _ in 0..4 {
+        plt.extend_from_slice(&BRK.to_le_bytes());
+    }
+    for _ in plt_symbols {
+        for insn in AARCH64_PLT_ENTRY {
+            plt.extend_from_slice(&insn.to_le_bytes());
+        }
+    }
+    (plt, vec![0u8; 24 + plt_symbols.len() * 8])
+}
+
+/// `adrp x16, 0` / `ldr x17, [x16, #0]` / `add x16, x16, #0` / `br x17`.
+pub(super) const AARCH64_PLT_ENTRY: [u32; 4] = [0x9000_0010, 0xf940_0211, 0x9100_0210, 0xd61f_0220];
 
 pub(super) fn set_relative_tags(layout: &mut MergedLayout, count: u64) {
     let relaidx = layout.section_by_name[".rela.dyn"];

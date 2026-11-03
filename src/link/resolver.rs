@@ -271,6 +271,16 @@ fn linux_search_paths(arch: TargetArch) -> Vec<PathBuf> {
         paths.push(PathBuf::from(p));
     }
 
+    // A cross toolchain keeps the target's libraries in its own sysroot rather
+    // than in the host's multilib directories, which hold only linker scripts.
+    let sysroot = match arch {
+        TargetArch::X86_64 => "/usr/x86_64-linux-gnu/lib",
+        TargetArch::AArch64 => "/usr/aarch64-linux-gnu/lib",
+        TargetArch::RiscV => "/usr/riscv64-linux-gnu/lib",
+        TargetArch::PowerPc64 => "/usr/powerpc64le-linux-gnu/lib",
+    };
+    paths.push(PathBuf::from(sysroot));
+
     for p in ["/lib", "/usr/lib", "/usr/local/lib"] {
         paths.push(PathBuf::from(p));
     }
