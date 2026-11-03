@@ -1,6 +1,8 @@
 use crate::collections::HashMap;
+use crate::object;
 
 use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"!<arch>\n";
 const HEADER_LEN: usize = 60;
@@ -202,6 +204,163 @@ pub fn parse_members(data: &[u8]) -> Result<Archive, String> {
     Ok(Archive { members, index })
 }
 
+pub struct NewMember<'a> {
+    pub name: &'a str,
+    pub data: &'a [u8],
+    pub symbols: &'a [String],
+}
+
+const NAME_FIELD_LEN: usize = 16;
+const MAX_MEMBER_SIZE: usize = 9_999_999_999;
+
+fn check_member_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("empty member name".to_string());
+    }
+    if name.ends_with(' ') {
+        return Err(
+            "member name ends with a space, which an archive header cannot keep".to_string(),
+        );
+    }
+    if name.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'/') {
+        return Err(
+            "member name contains a control character or '/', which cannot be stored".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn padded(len: usize) -> usize {
+    len + (len & 1)
+}
+
+fn push_header(out: &mut Vec<u8>, name_field: &str, size: usize) {
+    out.extend_from_slice(
+        format!(
+            "{name_field:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n",
+            0, 0, 0, 644
+        )
+        .as_bytes(),
+    );
+}
+
+/// Writes a GNU-flavour archive: a `/` symbol index, a `//` long-name table, then the members.
+/// Every header has zeroed mtime, uid and gid, so the same inputs give the same bytes.
+pub fn write_archive(members: &[NewMember]) -> Result<Vec<u8>, String> {
+    let mut long_names = Vec::new();
+    let mut name_fields = Vec::with_capacity(members.len());
+    let mut symbol_count = 0usize;
+    let mut symbol_bytes = 0usize;
+    for member in members {
+        check_member_name(member.name).map_err(|e| format!("{}: {e}", member.name))?;
+        if member.data.len() > MAX_MEMBER_SIZE {
+            return Err(format!(
+                "{}: member is too large for an archive header",
+                member.name
+            ));
+        }
+        if member.name.len() < NAME_FIELD_LEN {
+            name_fields.push(format!("{}/", member.name));
+        } else {
+            name_fields.push(format!("/{}", long_names.len()));
+            long_names.extend_from_slice(member.name.as_bytes());
+            long_names.extend_from_slice(b"/\n");
+        }
+        for symbol in member.symbols {
+            if symbol.is_empty() || symbol.contains('\0') {
+                return Err(format!(
+                    "{}: symbol name {symbol:?} cannot be indexed",
+                    member.name
+                ));
+            }
+            symbol_count += 1;
+            symbol_bytes += symbol.len() + 1;
+        }
+    }
+    let index_len = 4 + 4 * symbol_count + symbol_bytes;
+    if index_len > MAX_MEMBER_SIZE {
+        return Err("symbol index is too large for an archive header".to_string());
+    }
+    let mut offset = MAGIC.len() + HEADER_LEN + padded(index_len);
+    if !long_names.is_empty() {
+        offset += HEADER_LEN + padded(long_names.len());
+    }
+    let mut member_offsets = Vec::with_capacity(members.len());
+    for member in members {
+        member_offsets.push(offset);
+        offset += HEADER_LEN + padded(member.data.len());
+    }
+    if offset > u32::MAX as usize {
+        return Err("archive is larger than the 32-bit symbol index can address".to_string());
+    }
+
+    let mut index = Vec::with_capacity(index_len);
+    index.extend_from_slice(&(symbol_count as u32).to_be_bytes());
+    for (member, at) in members.iter().zip(&member_offsets) {
+        for _ in member.symbols {
+            index.extend_from_slice(&(*at as u32).to_be_bytes());
+        }
+    }
+    for member in members {
+        for symbol in member.symbols {
+            index.extend_from_slice(symbol.as_bytes());
+            index.push(0);
+        }
+    }
+
+    let mut out = Vec::with_capacity(offset);
+    out.extend_from_slice(MAGIC);
+    push_header(&mut out, "/", index.len());
+    out.extend_from_slice(&index);
+    if index.len() & 1 == 1 {
+        out.push(b'\n');
+    }
+    if !long_names.is_empty() {
+        push_header(&mut out, "//", long_names.len());
+        out.extend_from_slice(&long_names);
+        if long_names.len() & 1 == 1 {
+            out.push(b'\n');
+        }
+    }
+    for (member, name_field) in members.iter().zip(&name_fields) {
+        push_header(&mut out, name_field, member.data.len());
+        out.extend_from_slice(member.data);
+        if member.data.len() & 1 == 1 {
+            out.push(b'\n');
+        }
+    }
+    debug_assert_eq!(out.len(), offset);
+    Ok(out)
+}
+
+/// Archives relocatable objects into `output`, naming each member after its file name.
+pub fn create_archive(output: &Path, inputs: &[PathBuf]) -> Result<(), String> {
+    let mut loaded = Vec::with_capacity(inputs.len());
+    for path in inputs {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("{}: file name is not valid UTF-8", path.display()))?
+            .to_string();
+        let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        object::reject_lto_objects(std::slice::from_ref(&data))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let symbols =
+            object::object_symbols(&data).map_err(|e| format!("{}: {e}", path.display()))?;
+        loaded.push((name, data, symbols));
+    }
+    let members: Vec<NewMember> = loaded
+        .iter()
+        .map(|(name, data, symbols)| NewMember {
+            name,
+            data,
+            symbols,
+        })
+        .collect();
+    let archive = write_archive(&members)?;
+    std::fs::write(output, archive).map_err(|e| format!("{}: {e}", output.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +452,170 @@ mod tests {
         let mut ar = MAGIC.to_vec();
         ar.extend_from_slice(&[b' '; 60]);
         assert!(parse_members(&ar).is_err());
+    }
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn written_archive_round_trips_through_reader() {
+        let long = "a_member_with_a_name_longer_than_sixteen.o";
+        let symbols_a = owned(&["alpha", "alpha_twice"]);
+        let symbols_b = owned(&["beta"]);
+        let symbols_c = owned(&[]);
+        let ar = write_archive(&[
+            NewMember {
+                name: "a.o",
+                data: b"object-a!",
+                symbols: &symbols_a,
+            },
+            NewMember {
+                name: long,
+                data: b"object-b",
+                symbols: &symbols_b,
+            },
+            NewMember {
+                name: "c.o",
+                data: b"c",
+                symbols: &symbols_c,
+            },
+        ])
+        .unwrap();
+
+        let archive = parse_members(&ar).unwrap();
+        let names: Vec<&str> = archive.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["a.o", long, "c.o"]);
+        let bodies: Vec<&[u8]> = archive.members.iter().map(|m| m.data(&ar)).collect();
+        assert_eq!(bodies, [&b"object-a!"[..], &b"object-b"[..], &b"c"[..]]);
+
+        let scan = scan_headers(&mut std::io::Cursor::new(&ar), ar.len() as u64).unwrap();
+        let spans = |members: &[Member]| -> Vec<(usize, usize, usize)> {
+            members.iter().map(|m| (m.offset, m.start, m.len)).collect()
+        };
+        assert_eq!(spans(&scan.members), spans(&archive.members));
+    }
+
+    #[test]
+    fn symbol_index_names_each_defining_member() {
+        let symbols_a = owned(&["alpha", "alpha_twice"]);
+        let symbols_b = owned(&["beta", "alpha_twice"]);
+        let ar = write_archive(&[
+            NewMember {
+                name: "a.o",
+                data: b"aa",
+                symbols: &symbols_a,
+            },
+            NewMember {
+                name: "b.o",
+                data: b"bb",
+                symbols: &symbols_b,
+            },
+        ])
+        .unwrap();
+        let archive = parse_members(&ar).unwrap();
+        let index = archive.index.expect("index written");
+        assert_eq!(index["alpha"], [archive.members[0].offset]);
+        assert_eq!(index["beta"], [archive.members[1].offset]);
+        assert_eq!(
+            index["alpha_twice"],
+            [archive.members[0].offset, archive.members[1].offset]
+        );
+        assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn names_at_the_16_byte_boundary_survive_round_trip() {
+        let fifteen = "fifteen_chars.o";
+        let sixteen = "sixteen_chars.oo";
+        assert_eq!((fifteen.len(), sixteen.len()), (15, 16));
+        let none: Vec<String> = Vec::new();
+        let ar = write_archive(&[
+            NewMember {
+                name: fifteen,
+                data: b"1",
+                symbols: &none,
+            },
+            NewMember {
+                name: sixteen,
+                data: b"2",
+                symbols: &none,
+            },
+        ])
+        .unwrap();
+        let names: Vec<String> = parse_members(&ar)
+            .unwrap()
+            .members
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, [fifteen, sixteen]);
+    }
+
+    #[test]
+    fn empty_archive_has_an_empty_index() {
+        let ar = write_archive(&[]).unwrap();
+        assert_eq!(ar.len(), MAGIC.len() + HEADER_LEN + 4);
+        let archive = parse_members(&ar).unwrap();
+        assert!(archive.members.is_empty());
+        assert!(archive.index.expect("index written").is_empty());
+        let scan = scan_headers(&mut std::io::Cursor::new(&ar), ar.len() as u64).unwrap();
+        assert!(scan.members.is_empty());
+        assert!(scan.index.is_some());
+    }
+
+    #[test]
+    fn system_ar_archive_parses_with_the_reader() {
+        let guard = crate::test_support::TempDir::new("archive-ar");
+        let dir = guard.path();
+        std::fs::write(dir.join("first.o"), b"first body!").unwrap();
+        std::fs::write(dir.join("a_longer_member_name.o"), b"second").unwrap();
+        let status = std::process::Command::new("ar")
+            .current_dir(dir)
+            .args(["rcs", "lib.a", "first.o", "a_longer_member_name.o"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let ar = std::fs::read(dir.join("lib.a")).unwrap();
+        let archive = parse_members(&ar).unwrap();
+        let names: Vec<&str> = archive.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["first.o", "a_longer_member_name.o"]);
+        assert_eq!(archive.members[0].data(&ar), b"first body!");
+        assert_eq!(archive.members[1].data(&ar), b"second");
+    }
+
+    #[test]
+    fn unrepresentable_members_are_refused_with_their_name() {
+        let none: Vec<String> = Vec::new();
+        for name in ["bad\nname.o", "trailing.o ", "slash/name.o", "nul\0.o", ""] {
+            let result = write_archive(&[NewMember {
+                name,
+                data: b"x",
+                symbols: &none,
+            }]);
+            assert!(result.is_err(), "{name:?} was accepted");
+        }
+        let err = write_archive(&[NewMember {
+            name: "slash/name.o",
+            data: b"x",
+            symbols: &none,
+        }])
+        .unwrap_err();
+        assert!(err.starts_with("slash/name.o: "), "{err}");
+
+        let bad_symbols = owned(&["fine", ""]);
+        let err = write_archive(&[NewMember {
+            name: "empty_sym.o",
+            data: b"x",
+            symbols: &bad_symbols,
+        }])
+        .unwrap_err();
+        assert!(err.starts_with("empty_sym.o: "), "{err}");
+    }
+
+    #[test]
+    fn non_object_inputs_are_refused_for_archiving() {
+        let err = crate::object::object_symbols(b"plain text, not an object").unwrap_err();
+        assert!(err.contains("not an ELF64 or COFF object"), "{err}");
     }
 }

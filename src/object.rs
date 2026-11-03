@@ -598,6 +598,29 @@ pub fn check_archive_indexes(paths: &[PathBuf], libs: &[PathBuf]) -> Result<(), 
     Ok(())
 }
 
+/// Global symbols an object defines, sorted, for an archive's symbol index.
+pub fn object_symbols(data: &[u8]) -> Result<Vec<String>, String> {
+    if is_macho64(data) {
+        return Err(
+            "Mach-O objects cannot be archived: the BSD symbol index is not written".into(),
+        );
+    }
+    if !is_elf(data) && !is_coff(data) {
+        return Err("not an ELF64 or COFF object".into());
+    }
+    if is_elf(data) {
+        let (header, _, _) = parse_elf64_slice(data)?;
+        if header.e_type != 1 {
+            return Err("ELF file is not a relocatable object".into());
+        }
+    }
+    let summary =
+        collect_object_symbol_summary(data).ok_or("could not read the object's symbol table")?;
+    let mut names: Vec<String> = summary.defined.into_iter().collect();
+    names.sort();
+    Ok(names)
+}
+
 /// Refuse GCC LTO objects: their real content lives in `.gnu.lto_*` sections that only
 /// the LTO plugin can expand, so linking them would silently drop every definition.
 pub fn reject_lto_objects(objects: &[Vec<u8>]) -> Result<(), String> {
