@@ -1130,6 +1130,7 @@ pub fn link_macho_multi_object(
     let mut weak_undefined: HashSet<String> = HashSet::default();
     let mut got_symbols: Vec<String> = Vec::new();
     let mut got_symbol_set: HashSet<String> = HashSet::default();
+    let mut got_import_weak: HashMap<String, bool> = HashMap::default();
     let mut rebase_addrs: HashSet<u64> = HashSet::default();
     let mut direct_binds: Vec<(u64, String, bool, i64)> = Vec::new();
     if arch == TargetArch::AArch64 {
@@ -1294,22 +1295,25 @@ pub fn link_macho_multi_object(
                     ) {
                         continue;
                     }
-                    let name = obj
+                    let sym = obj
                         .symbols
                         .get(r.r_symbolnum as usize)
                         .filter(|_| r.r_extern)
-                        .map(|s| s.name.clone())
                         .ok_or_else(|| {
                             format!(
                                 "x86_64 GOT reference at offset 0x{:x} has no external symbol",
                                 r.r_address
                             )
                         })?;
+                    let name = sym.name.clone();
                     if !global_symbols.contains_key(&name) {
-                        return Err(format!(
-                            "x86_64 GOT reference to undefined symbol {} is not supported",
-                            name
-                        ));
+                        if sym.is_defined {
+                            return Err(format!(
+                                "x86_64 GOT reference to {} is defined in an object but not exported, which is not supported",
+                                name
+                            ));
+                        }
+                        got_import_weak.insert(name.clone(), sym.is_weak_ref);
                     }
                     if got_symbol_set.insert(name.clone()) {
                         got_symbols.push(name);
@@ -1332,6 +1336,11 @@ pub fn link_macho_multi_object(
             layout
                 .section_by_name
                 .insert("__got".into(), layout.sections.len() - 1);
+            for (i, name) in got_symbols.iter().enumerate() {
+                if let Some(&weak) = got_import_weak.get(name) {
+                    direct_binds.push((got_vaddr + (i as u64) * 8, name.clone(), weak, 0));
+                }
+            }
         }
     }
 
@@ -2229,7 +2238,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn x86_got_to_undefined_symbol_is_error() {
+    fn x86_got_to_undefined_symbol_gets_a_bound_slot() {
         let user = macho_object(
             X86_64_CPU,
             &[text(
@@ -2243,10 +2252,46 @@ pub(crate) mod tests {
             &[text(vec![0xC3], Vec::new())],
             &[defined("_home", 1, 0)],
         );
+        let result = link_pair(user, home).expect("links");
+        let (bytes, text_vaddr) = text_bytes(&result.layout);
+        let got = &result.layout.sections[result.layout.section_by_name["__got"]];
+        assert_eq!(got.data, vec![0u8; 8]);
+        let (text_shift, data_shift) = compute_runtime_shifts(&result.layout);
+        let place = text_vaddr + text_shift + 3;
+        let slot_runtime = got.vaddr + data_shift;
+        assert_eq!(i32_at(bytes, 3), slot_runtime as i64 - (place as i64 + 4));
+        let dynamic = result.dynamic.expect("an import needs bind info");
+        assert_eq!(
+            dynamic.macho_direct_binds,
+            vec![(got.vaddr, "_ext".to_string(), false, 0)]
+        );
+        assert!(!dynamic.macho_rebase_addrs.contains(&got.vaddr));
+    }
+
+    #[test]
+    fn x86_got_to_defined_unexported_symbol_is_error_naming_symbol() {
+        let user = macho_object(
+            X86_64_CPU,
+            &[text(
+                vec![0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3],
+                vec![reloc(3, 0, true, 2, true, X86_64_RELOC_GOT_LOAD)],
+            )],
+            &[TestSymbol {
+                name: "_local",
+                sect: 1,
+                value: 0,
+                external: false,
+            }],
+        );
+        let home = macho_object(
+            X86_64_CPU,
+            &[text(vec![0xC3], Vec::new())],
+            &[defined("_home", 1, 0)],
+        );
         let Err(err) = link_pair(user, home) else {
             panic!("must fail")
         };
-        assert!(err.contains("undefined symbol _ext"), "{err}");
+        assert!(err.contains("_local"), "{err}");
     }
 
     #[test]
