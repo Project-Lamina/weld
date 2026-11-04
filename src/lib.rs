@@ -35,7 +35,7 @@ use crate::{
 };
 use std::{
     env,
-    io::{Result, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -105,7 +105,7 @@ fn ad_hoc_codesign(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn ad_hoc_codesign(_path: &Path) -> Result<()> {
+fn ad_hoc_codesign(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
