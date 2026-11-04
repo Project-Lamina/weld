@@ -86,6 +86,13 @@ pub fn scan_headers<R: Read + Seek>(reader: &mut R, len: u64) -> Result<HeaderSc
                     if name_len > size {
                         return Err("truncated BSD archive name".to_string());
                     }
+                    let mut name_bytes = vec![0u8; name_len];
+                    read_range(reader, payload_at, &mut name_bytes)?;
+                    let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_len);
+                    if is_bsd_symbol_table(&String::from_utf8_lossy(&name_bytes[..end])) {
+                        off = next;
+                        continue;
+                    }
                     (payload_at + name_len as u64, size - name_len)
                 } else {
                     if let Some(index) = raw_name.strip_prefix('/') {
@@ -106,6 +113,13 @@ pub fn scan_headers<R: Read + Seek>(reader: &mut R, len: u64) -> Result<HeaderSc
         off = next;
     }
     Ok(HeaderScan { members, index })
+}
+
+/// A BSD archive carries its symbol index as a member named `__.SYMDEF`, or
+/// `__.SYMDEF SORTED` when `ranlib` sorted it, reached through the `#1/` extended
+/// name. It is the index, not an object, and must not be handed back as a member.
+fn is_bsd_symbol_table(name: &str) -> bool {
+    matches!(name, "__.SYMDEF" | "__.SYMDEF SORTED")
 }
 
 fn parse_index(data: &[u8]) -> Option<HashMap<String, Vec<usize>>> {
@@ -173,6 +187,7 @@ pub fn parse_members(data: &[u8]) -> Result<Archive, String> {
         let (name, body_start, body_len) = if let Some(len) = raw_name.strip_prefix("#1/") {
             let len: usize = len.parse().map_err(|_| "bad BSD archive name length")?;
             let name_bytes = payload.get(..len).ok_or("truncated BSD archive name")?;
+            let name_bytes = name_bytes.split(|&b| b == 0).next().unwrap_or(name_bytes);
             (
                 String::from_utf8_lossy(name_bytes).into_owned(),
                 body_at + len,
@@ -193,6 +208,10 @@ pub fn parse_members(data: &[u8]) -> Result<Archive, String> {
         } else {
             (raw_name.trim_end_matches('/').to_string(), body_at, size)
         };
+
+        if is_bsd_symbol_table(&name) {
+            continue;
+        }
 
         members.push(Member {
             name,
@@ -562,6 +581,27 @@ mod tests {
         let scan = scan_headers(&mut std::io::Cursor::new(&ar), ar.len() as u64).unwrap();
         assert!(scan.members.is_empty());
         assert!(scan.index.is_some());
+    }
+
+    #[test]
+    fn bsd_symbol_table_is_the_index_not_a_member() {
+        // `ranlib` on Darwin names it `__.SYMDEF SORTED`, NUL-padded to the
+        // `#1/` name length. Linking it as an object is a wrong answer.
+        let mut ar = MAGIC.to_vec();
+        let mut symdef = b"__.SYMDEF SORTED\0\0\0\0".to_vec();
+        symdef.extend_from_slice(b"indexpayload");
+        ar.extend(member("#1/20", &symdef));
+        let mut obj = b"first.o\0".to_vec();
+        obj.extend_from_slice(b"first body!");
+        ar.extend(member("#1/8", &obj));
+
+        let archive = parse_members(&ar).unwrap();
+        let names: Vec<&str> = archive.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["first.o"]);
+        assert_eq!(archive.members[0].data(&ar), b"first body!");
+
+        let scan = scan_headers(&mut std::io::Cursor::new(&ar), ar.len() as u64).unwrap();
+        assert_eq!(scan.members.len(), 1);
     }
 
     #[test]
