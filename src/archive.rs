@@ -635,17 +635,42 @@ mod tests {
         out
     }
 
+    /// The target `ras` should assemble for so the host `ar` accepts the member.
+    fn host_target() -> (
+        lamina_platform::TargetArchitecture,
+        lamina_platform::TargetOperatingSystem,
+    ) {
+        use lamina_platform::{TargetArchitecture as A, TargetOperatingSystem as O};
+        let arch = if cfg!(target_arch = "aarch64") {
+            A::Aarch64
+        } else {
+            A::X86_64
+        };
+        let os = if cfg!(target_os = "macos") {
+            O::MacOS
+        } else if cfg!(target_os = "windows") {
+            O::Windows
+        } else {
+            O::Linux
+        };
+        (arch, os)
+    }
+
     #[test]
     fn system_ar_archive_parses_with_the_reader() {
         let guard = crate::test_support::TempDir::new("archive-ar");
         let dir = guard.path();
-        std::fs::write(dir.join("first.o"), b"first body!").unwrap();
-        std::fs::write(dir.join("a_longer_member_name.o"), b"second").unwrap();
+        // Real host objects, not byte blobs: Darwin's `ar` runs `ranlib` whatever
+        // flags it is given, and silently drops a member it cannot index.
+        let (arch, os) = host_target();
+        for (name, sym) in [("first.o", "first"), ("a_longer_member_name.o", "second")] {
+            let asm = format!(".text\n.globl {sym}\n{sym}:\n  ret\n");
+            let mut assembler = ras::Ras::new(arch, os).expect("ras");
+            assembler.assemble(&asm, &dir.join(name)).expect("assemble");
+        }
         let status = std::process::Command::new("ar")
             .current_dir(dir)
-            // No `s`: ranlib rejects a member that is not an object for the host,
-            // and on Darwin drops it, leaving an archive of nothing but the index.
-            .args(["rc", "lib.a", "first.o", "a_longer_member_name.o"])
+            .args(["rcs", "lib.a", "first.o", "a_longer_member_name.o"])
             .status()
             .unwrap();
         assert!(status.success());
@@ -658,9 +683,15 @@ mod tests {
             "{}",
             walk(&ar)
         );
-        // `ar` may pad a member's data; the content it was given comes first.
-        assert!(archive.members[0].data(&ar).starts_with(b"first body!"));
-        assert!(archive.members[1].data(&ar).starts_with(b"second"));
+        // `ar` may pad a member's data; what it was given comes first.
+        for member in &archive.members {
+            let on_disk = std::fs::read(dir.join(&member.name)).unwrap();
+            assert!(
+                member.data(&ar).starts_with(&on_disk),
+                "{} truncated",
+                member.name
+            );
+        }
     }
 
     #[test]
