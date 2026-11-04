@@ -36,6 +36,7 @@ const N_WEAK_DEF: u16 = 0x0080;
 const N_EXT: u8 = 0x01;
 const X86_64_RELOC_SIGNED: u32 = 1;
 const X86_64_RELOC_BRANCH: u32 = 2;
+const ARM64_RELOC_POINTER_TO_GOT: u32 = 7;
 const X86_64_RELOC_GOT_LOAD: u32 = 3;
 const X86_64_RELOC_GOT: u32 = 4;
 const X86_64_RELOC_SUBTRACTOR: u32 = 5;
@@ -569,6 +570,14 @@ fn decode_arm64_reloc_kind(r_type: u32) -> Result<RelocKind, String> {
         ARM64_RELOC_GOT_LOAD_PAGEOFF12 => RelocKind::Arm64GotLoadPageOff12,
         ARM64_RELOC_TLVP_LOAD_PAGE21 => RelocKind::Arm64TlvpPage21,
         ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => RelocKind::Arm64TlvpPageOff12,
+        ARM64_RELOC_POINTER_TO_GOT => {
+            // Linking this would still abort at the first throw: no __unwind_info is written.
+            return Err(
+                "C++ exception tables are not supported on Mach-O (ARM64_RELOC_POINTER_TO_GOT); \
+                 build with -fno-exceptions or link with ld"
+                    .to_string(),
+            );
+        }
         other => return Err(format!("unsupported Mach-O relocation type {}", other)),
     })
 }

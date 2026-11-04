@@ -134,3 +134,28 @@ fn strip_accepts_the_output_and_it_still_runs() {
     assert!(sign.success());
     assert_eq!(run(dir, "main"), "ok\n");
 }
+
+#[test]
+fn cpp_exceptions_are_refused_by_name() {
+    let guard = TempDir::new("weld-macho-eh");
+    let dir = guard.path();
+    fs::write(
+        dir.join("main.cpp"),
+        "#include <stdexcept>\nint main(){try{throw std::runtime_error(\"x\");}catch(const std::exception&){return 0;}}\n",
+    )
+    .unwrap();
+    let status = Command::new("clang++")
+        .current_dir(dir)
+        .args(["-c", "main.cpp", "-o", "main.o"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let output = Command::new(env!("CARGO_BIN_EXE_weld"))
+        .current_dir(dir)
+        .args(["main.o", "-lc++", "-lSystem", "-o", "main"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("C++ exception tables"), "{stderr}");
+}
