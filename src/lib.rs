@@ -533,12 +533,24 @@ fn try_weld_link_elf(
     Some(0)
 }
 
+/// `-lNAME` as a dylib in a `-L` directory. ld prefers it to an archive in the same place.
+fn macho_dylib_paths(args: &ParsedArgs) -> Vec<PathBuf> {
+    args.libraries
+        .iter()
+        .filter_map(|name| {
+            args.search_paths
+                .iter()
+                .map(|dir| dir.join(format!("lib{name}.dylib")))
+                .find(|path| path.is_file())
+        })
+        .collect()
+}
+
 fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
-    let (obj_data_list, dylib_paths) = object::load_macho_objects(
-        &args.input_files,
-        &static_library_paths(args),
-        &entry_seeds(args),
-    )?;
+    let mut inputs = args.input_files.clone();
+    inputs.extend(macho_dylib_paths(args));
+    let (obj_data_list, dylib_paths) =
+        object::load_macho_objects(&inputs, &static_library_paths(args), &entry_seeds(args))?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
         None
@@ -564,12 +576,20 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
         macho_rebase_addrs: Vec::new(),
         macho_direct_binds: Vec::new(),
     };
-    let dyn_info = result.dynamic.as_ref().unwrap_or(&fallback_dyn);
-    emit::macho::emit_macho_executable_dynamic(
+    let mut dyn_info = result.dynamic.unwrap_or(fallback_dyn);
+    // The system frameworks live in the dyld cache, this path is how dyld names them.
+    dyn_info.needed.extend(
+        args.frameworks
+            .iter()
+            .map(|name| format!("/System/Library/Frameworks/{name}.framework/{name}")),
+    );
+    emit::macho::emit_macho_executable_dynamic_with(
         &result.layout,
         arch,
         entry,
-        dyn_info,
+        &dyn_info,
+        &args.rpaths,
+        emit::macho::macos_min_version().ok()?,
         &result.debug_map,
         &mut out,
     )

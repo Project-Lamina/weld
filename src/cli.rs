@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const TARGET_OSES: [&str; 7] = [
     "none", "linux", "freebsd", "orbis", "ps4", "prospero", "ps5",
@@ -16,6 +16,7 @@ pub struct ParsedArgs {
     pub target_os: Option<String>,
     pub search_paths: Vec<PathBuf>,
     pub rpaths: Vec<String>,
+    pub frameworks: Vec<String>,
     pub verbose: bool,
     pub gc_sections: bool,
     pub strip_all: bool,
@@ -88,7 +89,9 @@ fn expand_argv(argv: &[String], depth: usize) -> Result<Vec<String>, String> {
     for a in argv {
         if let Some(rest) = a.strip_prefix("-Wl,") {
             out.extend(rest.split(',').filter(|s| !s.is_empty()).map(String::from));
-        } else if let Some(path) = a.strip_prefix('@') {
+        } else if let Some(path) = a.strip_prefix('@')
+            && Path::new(path).exists()
+        {
             if depth >= MAX_RESPONSE_DEPTH {
                 return Err(format!("response file nesting too deep at @{path}"));
             }
@@ -172,8 +175,11 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
                 let next = take_required_arg(argv, &mut i, "-e")?;
                 args.entry = Some(next);
             }
+            "-framework" => {
+                let next = take_required_arg(argv, &mut i, "-framework")?;
+                args.frameworks.push(next);
+            }
             "-lto_library"
-            | "-framework"
             | "-weak_framework"
             | "-syslibroot"
             | "-mllvm"

@@ -127,7 +127,7 @@ pub(crate) fn parse_macos_version(text: &str) -> Option<u32> {
     Some((major << 16) | (minor << 8) | patch)
 }
 
-fn macos_min_version() -> Result<u32> {
+pub fn macos_min_version() -> Result<u32> {
     match std::env::var(MACOSX_DEPLOYMENT_TARGET_ENV) {
         Ok(text) => parse_macos_version(&text).ok_or_else(|| {
             Error::new(
