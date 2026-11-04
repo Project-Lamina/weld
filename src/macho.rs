@@ -6,8 +6,9 @@ const MH_CIGAM_64: u32 = 0xCFFAEDFE;
 const MH_OBJECT: u32 = 1;
 const MH_DYLIB: u32 = 6;
 const LC_SEGMENT_64: u32 = 0x19;
-const LC_SYMTAB: u32 = 0x0b;
-const LC_SYMSEG: u32 = 0x02;
+/// Mach-O `loader.h`: `LC_SYMTAB` is 2. 0x0b is `LC_DYSYMTAB`, whose first two
+/// words are `ilocalsym`/`nlocalsym`, not `symoff`/`nsyms`.
+const LC_SYMTAB: u32 = 0x2;
 
 const N_TYPE: u8 = 0x0e;
 const N_SECT: u8 = 0x0e;
@@ -326,7 +327,7 @@ pub fn parse_macho64_object(data: &[u8]) -> Result<Macho64Object, String> {
         if cmd == LC_SEGMENT_64 && cmdsize >= 72 {
             let mut secs = parse_sections_from_segment(data, off, cmdsize);
             all_sections.append(&mut secs);
-        } else if (cmd == LC_SYMTAB || cmd == LC_SYMSEG) && cmdsize >= 24 {
+        } else if cmd == LC_SYMTAB && cmdsize >= 24 {
             let read_symoff = read_u32_le(data, off + 8).ok_or("bad symoff")?;
             let read_nsyms = read_u32_le(data, off + 12).ok_or("bad nsyms")?;
             let read_stroff = read_u32_le(data, off + 16).ok_or("bad stroff")?;
@@ -355,6 +356,12 @@ pub fn parse_macho64_object(data: &[u8]) -> Result<Macho64Object, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_load_commands_are_the_values_loader_h_gives_them() {
+        assert_eq!(LC_SEGMENT_64, 0x19);
+        assert_eq!(LC_SYMTAB, 0x2);
+    }
 
     #[test]
     fn test_is_macho64_elf() {
