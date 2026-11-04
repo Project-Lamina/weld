@@ -122,6 +122,17 @@ impl TargetArch {
         }
     }
 
+    /// Return the Mach-O `cpu_subtype_t` value. `<mach/machine.h>`:
+    /// `CPU_SUBTYPE_X86_64_ALL` is 3 and `CPU_SUBTYPE_ARM64_ALL` is 0. A zero subtype
+    /// on x86_64 names no architecture, and tools that map the header to a triple —
+    /// `dsymutil` among them — then refuse the file.
+    pub fn to_macho_cpusubtype(self) -> u32 {
+        match self {
+            Self::X86_64 => 3,
+            Self::AArch64 | Self::RiscV | Self::PowerPc64 => 0,
+        }
+    }
+
     /// Convert a Mach-O `cpu_type_t` to a `TargetArch`, or `None` if unrecognised.
     pub fn from_macho_cputype(cputype: u32) -> Option<Self> {
         match cputype {
