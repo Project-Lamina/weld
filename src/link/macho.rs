@@ -23,6 +23,9 @@ type StubTriple = (Vec<u8>, Vec<u8>, Vec<u8>);
 const SEG_BASE: u64 = 0x100000000;
 const VM_ADDR_BIAS: u64 = 0x4000;
 const SECTION_TYPE_MASK: u32 = 0x0000_00ff;
+/// Mach-O `loader.h`: `S_ATTR_DEBUG`. The linker drops such a section rather than
+/// carrying it into the image; `dsymutil` reads the DWARF from the objects instead.
+const S_ATTR_DEBUG: u32 = 0x0200_0000;
 const S_ZEROFILL: u32 = 0x1;
 const S_GB_ZEROFILL: u32 = 0xc;
 const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
@@ -50,6 +53,9 @@ fn macho_section_merge_order(sectname: &str) -> usize {
 
 fn is_mergeable_section(sec: &MachoSection) -> bool {
     if sec.size == 0 {
+        return false;
+    }
+    if sec.flags & S_ATTR_DEBUG != 0 {
         return false;
     }
     if sec.sectname == "__compact_unwind"
