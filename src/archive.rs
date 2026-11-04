@@ -643,7 +643,9 @@ mod tests {
         std::fs::write(dir.join("a_longer_member_name.o"), b"second").unwrap();
         let status = std::process::Command::new("ar")
             .current_dir(dir)
-            .args(["rcs", "lib.a", "first.o", "a_longer_member_name.o"])
+            // No `s`: ranlib rejects a member that is not an object for the host,
+            // and on Darwin drops it, leaving an archive of nothing but the index.
+            .args(["rc", "lib.a", "first.o", "a_longer_member_name.o"])
             .status()
             .unwrap();
         assert!(status.success());
