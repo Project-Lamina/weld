@@ -107,6 +107,9 @@ int main(void) { counter += 5; printf("%d\n", counter); return 0; }
 
 #[test]
 fn calls_into_libc_run_through_a_bind_now_plt() {
+    if !common::tool_available(GCC) {
+        return;
+    }
     let guard = TempDir::new("weld-aarch64-plt");
     let dir = guard.path();
     let object = compile(dir, "plt", PRINTS_SUM, &["-O1"]);
@@ -131,6 +134,9 @@ fn calls_into_libc_run_through_a_bind_now_plt() {
 /// reaches it, so it must trap rather than run whatever happens to be there.
 #[test]
 fn the_first_plt_slot_traps_instead_of_resolving_lazily() {
+    if !common::tool_available(GCC) {
+        return;
+    }
     let guard = TempDir::new("weld-aarch64-plt0");
     let dir = guard.path();
     let object = compile(dir, "plt0", PRINTS_SUM, &["-O1"]);
@@ -151,6 +157,9 @@ fn the_first_plt_slot_traps_instead_of_resolving_lazily() {
 
 #[test]
 fn a_got_page_pair_reaches_a_defined_symbol() {
+    if !common::tool_available(GCC) {
+        return;
+    }
     let guard = TempDir::new("weld-aarch64-got");
     let dir = guard.path();
     let object = compile(dir, "got", PRINTS_SUM, &["-O1", "-fPIC", "-fno-plt"]);
@@ -165,6 +174,9 @@ fn a_got_page_pair_reaches_a_defined_symbol() {
 
 #[test]
 fn local_exec_thread_locals_match_ld() {
+    if !common::tool_available(GCC) {
+        return;
+    }
     let guard = TempDir::new("weld-aarch64-tls-le");
     let dir = guard.path();
     let object = compile(dir, "le", THREAD_LOCAL, &["-O1", "-ftls-model=local-exec"]);
@@ -187,6 +199,9 @@ fn local_exec_thread_locals_match_ld() {
 
 #[test]
 fn initial_exec_thread_locals_resolve_through_the_got() {
+    if !common::tool_available(GCC) {
+        return;
+    }
     let guard = TempDir::new("weld-aarch64-tls-ie");
     let dir = guard.path();
     let object = compile(
@@ -228,6 +243,9 @@ fn thread_pointer_adds(dir: &Path, binary: &str) -> Vec<String> {
 
 #[test]
 fn global_dynamic_thread_locals_are_refused_by_relocation_name() {
+    if !common::tool_available(GCC) {
+        return;
+    }
     let guard = TempDir::new("weld-aarch64-tls-gd");
     let dir = guard.path();
     let object = compile(
@@ -245,6 +263,9 @@ fn global_dynamic_thread_locals_are_refused_by_relocation_name() {
 
 #[test]
 fn shared_objects_are_refused_for_aarch64() {
+    if !common::tool_available(GCC) {
+        return;
+    }
     let guard = TempDir::new("weld-aarch64-shared");
     let dir = guard.path();
     let object = compile(dir, "shared", PRINTS_SUM, &["-O1", "-fPIC"]);
