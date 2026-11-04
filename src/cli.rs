@@ -175,12 +175,24 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
                 let next = take_required_arg(argv, &mut i, "-e")?;
                 args.entry = Some(next);
             }
-            "-framework" => {
+            // Weak linking is not written, a required load beats a crash on the first call.
+            "-framework" | "-weak_framework" => {
                 let next = take_required_arg(argv, &mut i, "-framework")?;
                 args.frameworks.push(next);
             }
+            "-filelist" => {
+                let next = take_required_arg(argv, &mut i, "-filelist")?;
+                let listed = std::fs::read_to_string(&next)
+                    .map_err(|e| format!("cannot read file list {next}: {e}"))?;
+                args.input_files.extend(
+                    listed
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(PathBuf::from),
+                );
+            }
             "-lto_library"
-            | "-weak_framework"
             | "-syslibroot"
             | "-mllvm"
             | "-exported_symbols_list"
@@ -188,7 +200,6 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             | "-B"
             | "-F"
             | "-arch"
-            | "-filelist"
             | "-object_path_lto" => {
                 skip_args(argv, &mut i, 1);
             }

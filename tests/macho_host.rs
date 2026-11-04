@@ -159,3 +159,17 @@ fn cpp_exceptions_are_refused_by_name() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("C++ exception tables"), "{stderr}");
 }
+
+#[test]
+fn filelist_names_the_inputs() {
+    let guard = TempDir::new("weld-macho-filelist");
+    let dir = guard.path();
+    compile(
+        dir,
+        "main",
+        "#include <stdio.h>\nint main(void){puts(\"listed\");return 0;}\n",
+    );
+    fs::write(dir.join("inputs"), "main.o\n").unwrap();
+    weld(dir, &["-filelist", "inputs", "-lSystem", "-o", "main"]);
+    assert_eq!(run(dir, "main"), "listed\n");
+}
