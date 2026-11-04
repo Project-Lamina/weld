@@ -105,3 +105,32 @@ fn framework_flag_loads_the_framework() {
     );
     assert_eq!(run(dir, "main"), "2\n");
 }
+
+#[test]
+fn strip_accepts_the_output_and_it_still_runs() {
+    let guard = TempDir::new("weld-macho-strip");
+    let dir = guard.path();
+    compile(
+        dir,
+        "main",
+        "#include <stdio.h>\nint main(void){puts(\"ok\");return 0;}\n",
+    );
+    weld(dir, &["main.o", "-lSystem", "-o", "main"]);
+    let strip = Command::new("strip")
+        .current_dir(dir)
+        .arg("main")
+        .output()
+        .unwrap();
+    assert!(
+        strip.status.success(),
+        "{}",
+        String::from_utf8_lossy(&strip.stderr)
+    );
+    let sign = Command::new("codesign")
+        .current_dir(dir)
+        .args(["-f", "-s", "-", "main"])
+        .status()
+        .unwrap();
+    assert!(sign.success());
+    assert_eq!(run(dir, "main"), "ok\n");
+}

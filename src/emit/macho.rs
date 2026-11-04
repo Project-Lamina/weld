@@ -861,14 +861,17 @@ pub fn emit_macho_executable_dynamic_with(
     direct_bind_offsets.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     direct_bind_offsets.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3);
 
-    let rebase_opcodes = build_rebase_opcodes(DATA_SEGMENT_INDEX, &rebase_offsets);
-    let bind_opcodes = build_bind_opcodes(
+    let mut rebase_opcodes = build_rebase_opcodes(DATA_SEGMENT_INDEX, &rebase_offsets);
+    let mut bind_opcodes = build_bind_opcodes(
         &dyn_info.plt_symbols,
         &dyn_info.weak_plt_symbols,
         DATA_SEGMENT_INDEX,
         got_offset_in_segment,
         &direct_bind_offsets,
     );
+    // strip wants no gap between these and the symbol table. A zero byte is the DONE opcode.
+    rebase_opcodes.resize(align_up_usize(rebase_opcodes.len(), 8), 0);
+    bind_opcodes.resize(align_up_usize(bind_opcodes.len(), 8), 0);
 
     let cputype = arch.to_macho_cputype();
     if cputype == 0 {
