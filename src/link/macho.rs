@@ -1595,8 +1595,16 @@ pub fn link_macho_multi_object(
         }
         let mut needed = vec!["libSystem.B.dylib".into()];
         for p in dylib_paths {
-            if let Some(s) = p.to_str() {
-                needed.push(s.to_string());
+            let install_name = std::fs::read(p)
+                .ok()
+                .and_then(|data| crate::macho::dylib_install_name(&data));
+            match install_name {
+                Some(name) => needed.push(name),
+                None => {
+                    if let Some(s) = p.to_str() {
+                        needed.push(s.to_string());
+                    }
+                }
             }
         }
         Some(DynamicLinkInfo {

@@ -130,6 +130,25 @@ pub fn is_macho_dylib(data: &[u8]) -> bool {
             .unwrap_or(false)
 }
 
+/// The name a dylib answers to (`LC_ID_DYLIB`), which is what a program must load it by.
+pub fn dylib_install_name(data: &[u8]) -> Option<String> {
+    const LC_ID_DYLIB: u32 = 0xd;
+    let ncmds = read_u32_le(data, 16)?;
+    let mut at = 32usize;
+    for _ in 0..ncmds {
+        let cmd = read_u32_le(data, at)?;
+        let size = read_u32_le(data, at + 4)? as usize;
+        if cmd == LC_ID_DYLIB {
+            let name_at = at + read_u32_le(data, at + 8)? as usize;
+            let bytes = data.get(name_at..at + size)?;
+            let end = bytes.iter().position(|b| *b == 0)?;
+            return String::from_utf8(bytes[..end].to_vec()).ok();
+        }
+        at = at.checked_add(size).filter(|_| size >= 8)?;
+    }
+    None
+}
+
 pub fn parse_macho64_header(data: &[u8]) -> Result<Macho64Header, String> {
     if data.len() < 32 {
         return Err("file too short for Mach-O 64 header".to_string());
