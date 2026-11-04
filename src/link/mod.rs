@@ -95,6 +95,26 @@ pub struct LinkResult {
     pub e_machine: u16,
     pub symbol_addrs: HashMap<String, u64>,
     pub dynamic: Option<DynamicLinkInfo>,
+    /// Mach-O only, and only when the objects carried DWARF. Empty everywhere else.
+    pub debug_map: Vec<DebugMapObject>,
+}
+
+/// One function in the debug map, at its address in the linked image.
+#[derive(Debug, Clone)]
+pub struct DebugMapFunction {
+    pub name: String,
+    pub address: u64,
+    pub size: u64,
+}
+
+/// One object file's debug map entry. `dsymutil` reopens `path`, checks `mtime`
+/// against it, and rebases the DWARF it finds there onto these addresses.
+#[derive(Debug, Clone)]
+pub struct DebugMapObject {
+    pub path: PathBuf,
+    /// Seconds since the Unix epoch, which is what `N_OSO`'s `n_value` holds.
+    pub mtime: u64,
+    pub functions: Vec<DebugMapFunction>,
 }
 
 /// Fully link a single ELF64 object: merge sections, resolve symbols, and
@@ -957,6 +977,7 @@ fn link_multi_object_parsed(
         e_machine,
         symbol_addrs: global_symbols,
         dynamic: dynamic_info,
+        debug_map: Vec::new(),
     })
 }
 

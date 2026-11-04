@@ -7,7 +7,7 @@
 use crate::collections::{BTreeMap, HashMap, HashSet};
 use crate::{
     arch::TargetArch,
-    link::{DynamicLinkInfo, MergedLayout, MergedSection},
+    link::{DebugMapObject, DynamicLinkInfo, MergedLayout, MergedSection},
     segment::{align_up_u64, align_up_usize, build_segment_buffer},
 };
 use std::io::{Error, ErrorKind, Result, Write};
@@ -37,6 +37,16 @@ const MACOSX_DEPLOYMENT_TARGET_ENV: &str = "MACOSX_DEPLOYMENT_TARGET";
 const LC_SYMTAB: u32 = 0x2;
 const LC_DYSYMTAB: u32 = 0xb;
 const N_SECT_EXT: u8 = 0x0f;
+/// STABS types from `<mach-o/stab.h>`. `ld64` writes these into the linked image as
+/// the debug map: an `N_OSO` naming each object file and its mtime, then a
+/// `N_BNSYM`/`N_FUN`/`N_FUN`/`N_ENSYM` quartet per function. `dsymutil` reopens each
+/// `N_OSO`, looks each `N_FUN` name up in that object's own symbol table, and rebases
+/// the DWARF it finds onto the `N_FUN` address.
+const N_OSO: u8 = 0x66;
+/// The second `N_FUN` of a pair carries no name; its value is the function's size.
+const N_FUN: u8 = 0x24;
+const N_BNSYM: u8 = 0x2e;
+const N_ENSYM: u8 = 0x4e;
 const VM_PROT_READ: u32 = 1;
 const VM_PROT_WRITE: u32 = 2;
 const VM_PROT_EXECUTE: u32 = 4;
@@ -297,7 +307,7 @@ pub fn emit_macho_executable(
     let mut hdr = [0u8; 32];
     hdr[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
     hdr[4..8].copy_from_slice(&cputype.to_le_bytes());
-    hdr[8..12].copy_from_slice(&0u32.to_le_bytes());
+    hdr[8..12].copy_from_slice(&arch.to_macho_cpusubtype().to_le_bytes());
     hdr[12..16].copy_from_slice(&MH_EXECUTABLE.to_le_bytes());
     hdr[16..20].copy_from_slice(&total_cmds.to_le_bytes());
     hdr[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
@@ -730,6 +740,7 @@ pub fn emit_macho_executable_dynamic(
     arch: TargetArch,
     entry: u64,
     dyn_info: &DynamicLinkInfo,
+    debug_map: &[DebugMapObject],
     out: &mut impl Write,
 ) -> Result<()> {
     emit_macho_executable_dynamic_with(
@@ -739,10 +750,12 @@ pub fn emit_macho_executable_dynamic(
         dyn_info,
         &[],
         macos_min_version()?,
+        debug_map,
         out,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn emit_macho_executable_dynamic_with(
     layout: &MergedLayout,
     arch: TargetArch,
@@ -750,6 +763,7 @@ pub fn emit_macho_executable_dynamic_with(
     dyn_info: &DynamicLinkInfo,
     rpaths: &[String],
     min_os: u32,
+    debug_map: &[DebugMapObject],
     out: &mut impl Write,
 ) -> Result<()> {
     let text_sections_owned: Vec<MergedSection> = layout
@@ -934,17 +948,52 @@ pub fn emit_macho_executable_dynamic_with(
     let bind_pad_len = bind_off.saturating_sub(dyld_info_off + rebase_opcodes.len());
     let dyld_info_size = rebase_opcodes.len() + bind_pad_len + bind_opcodes.len();
 
-    let mut symtab_bytes = Vec::with_capacity(32);
-    let write_nlist = |buf: &mut Vec<u8>, strx: u32, value: u64| {
-        buf.extend_from_slice(&strx.to_le_bytes());
-        buf.push(N_SECT_EXT);
-        buf.push(1u8);
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&value.to_le_bytes());
-    };
-    write_nlist(&mut symtab_bytes, 1, text_vmaddr);
-    write_nlist(&mut symtab_bytes, 21, entry + PAGE_SIZE as u64);
-    let strtab_bytes = b"\0__mh_execute_header\0_main\0".to_vec();
+    let write_nlist =
+        |buf: &mut Vec<u8>, strx: u32, n_type: u8, sect: u8, desc: u16, value: u64| {
+            buf.extend_from_slice(&strx.to_le_bytes());
+            buf.push(n_type);
+            buf.push(sect);
+            buf.extend_from_slice(&desc.to_le_bytes());
+            buf.extend_from_slice(&value.to_le_bytes());
+        };
+    let mut strtab_bytes = b"\0__mh_execute_header\0_main\0".to_vec();
+    let mut stab_bytes = Vec::new();
+    for object in debug_map {
+        let Some(path) = object.path.to_str() else {
+            log::warn!(
+                "{}: the object's path is not UTF-8, so no N_OSO names it",
+                object.path.display()
+            );
+            continue;
+        };
+        let oso_strx = strtab_bytes.len() as u32;
+        strtab_bytes.extend_from_slice(path.as_bytes());
+        strtab_bytes.push(0);
+        write_nlist(&mut stab_bytes, oso_strx, N_OSO, 0, 1, object.mtime);
+        for function in &object.functions {
+            let strx = strtab_bytes.len() as u32;
+            strtab_bytes.extend_from_slice(function.name.as_bytes());
+            strtab_bytes.push(0);
+            let address = function.address + PAGE_SIZE as u64;
+            write_nlist(&mut stab_bytes, 0, N_BNSYM, 1, 0, address);
+            write_nlist(&mut stab_bytes, strx, N_FUN, 1, 0, address);
+            write_nlist(&mut stab_bytes, 0, N_FUN, 0, 0, function.size);
+            write_nlist(&mut stab_bytes, 0, N_ENSYM, 1, 0, address + function.size);
+        }
+    }
+    let stab_count = (stab_bytes.len() / 16) as u32;
+    let mut symtab_bytes = stab_bytes;
+    symtab_bytes.reserve(32);
+    write_nlist(&mut symtab_bytes, 1, N_SECT_EXT, 1, 0, text_vmaddr);
+    write_nlist(
+        &mut symtab_bytes,
+        21,
+        N_SECT_EXT,
+        1,
+        0,
+        entry + PAGE_SIZE as u64,
+    );
+    let nsyms = stab_count + 2;
 
     let symoff_unaligned = linkedit_file_off as usize + dyld_info_size;
     let symoff = align_up_usize(symoff_unaligned, 8) as u32;
@@ -1027,7 +1076,7 @@ pub fn emit_macho_executable_dynamic_with(
     lc_symtab[0..4].copy_from_slice(&LC_SYMTAB.to_le_bytes());
     lc_symtab[4..8].copy_from_slice(&24u32.to_le_bytes());
     lc_symtab[8..12].copy_from_slice(&symoff.to_le_bytes());
-    lc_symtab[12..16].copy_from_slice(&2u32.to_le_bytes());
+    lc_symtab[12..16].copy_from_slice(&nsyms.to_le_bytes());
     lc_symtab[16..20].copy_from_slice(&stroff.to_le_bytes());
     lc_symtab[20..24].copy_from_slice(&strsize.to_le_bytes());
     lc_buf.extend_from_slice(&lc_symtab);
@@ -1038,10 +1087,10 @@ pub fn emit_macho_executable_dynamic_with(
     lc_dysymtab[0..4].copy_from_slice(&LC_DYSYMTAB.to_le_bytes());
     lc_dysymtab[4..8].copy_from_slice(&80u32.to_le_bytes());
     lc_dysymtab[8..12].copy_from_slice(&0u32.to_le_bytes());
-    lc_dysymtab[12..16].copy_from_slice(&0u32.to_le_bytes());
-    lc_dysymtab[16..20].copy_from_slice(&0u32.to_le_bytes());
+    lc_dysymtab[12..16].copy_from_slice(&stab_count.to_le_bytes());
+    lc_dysymtab[16..20].copy_from_slice(&stab_count.to_le_bytes());
     lc_dysymtab[20..24].copy_from_slice(&2u32.to_le_bytes());
-    lc_dysymtab[24..28].copy_from_slice(&2u32.to_le_bytes());
+    lc_dysymtab[24..28].copy_from_slice(&nsyms.to_le_bytes());
     lc_dysymtab[28..32].copy_from_slice(&0u32.to_le_bytes());
     lc_buf.extend_from_slice(&lc_dysymtab);
     total_cmds += 1;
@@ -1154,7 +1203,7 @@ pub fn emit_macho_executable_dynamic_with(
     let mut hdr = [0u8; 32];
     hdr[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
     hdr[4..8].copy_from_slice(&cputype.to_le_bytes());
-    hdr[8..12].copy_from_slice(&0u32.to_le_bytes());
+    hdr[8..12].copy_from_slice(&arch.to_macho_cpusubtype().to_le_bytes());
     hdr[12..16].copy_from_slice(&MH_EXECUTABLE.to_le_bytes());
     hdr[16..20].copy_from_slice(&total_cmds.to_le_bytes());
     hdr[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
@@ -1204,6 +1253,163 @@ pub fn emit_macho_executable_dynamic_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::DebugMapFunction;
+
+    fn one_text_layout() -> MergedLayout {
+        let mut section_by_name = HashMap::default();
+        section_by_name.insert("__text".to_string(), 0);
+        MergedLayout {
+            sections: vec![MergedSection {
+                entsize: 0,
+                sh_type: 1,
+                name: "__text".to_string(),
+                data: vec![0xc3; 0x40],
+                vaddr: SEG_BASE,
+                flags: 6,
+                align: 4,
+            }],
+            section_by_name,
+        }
+    }
+
+    fn emit_with_debug_map(debug_map: &[DebugMapObject]) -> Vec<u8> {
+        let dyn_info = DynamicLinkInfo {
+            pie: false,
+            shared: false,
+            needed: vec!["/usr/lib/libSystem.B.dylib".to_string()],
+            plt_symbols: Vec::new(),
+            weak_plt_symbols: Vec::new(),
+            interpreter: None,
+            macho_rebase_addrs: Vec::new(),
+            macho_direct_binds: Vec::new(),
+        };
+        let mut out = Vec::new();
+        emit_macho_executable_dynamic_with(
+            &one_text_layout(),
+            TargetArch::X86_64,
+            SEG_BASE,
+            &dyn_info,
+            &[],
+            MACOS_DEFAULT_MIN_OS,
+            debug_map,
+            &mut out,
+        )
+        .expect("emit");
+        out
+    }
+
+    /// `(n_strx, n_type, n_sect, n_value)` of one symbol table entry.
+    type Nlist = (u32, u8, u8, u64);
+
+    /// Every entry in the image's symbol table, and its string table.
+    fn symbol_table(image: &[u8]) -> (Vec<Nlist>, Vec<u8>) {
+        let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap()) as usize;
+        let mut at = 32;
+        for _ in 0..ncmds {
+            let cmd = u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+            let size = u32::from_le_bytes(image[at + 4..at + 8].try_into().unwrap()) as usize;
+            if cmd == LC_SYMTAB {
+                let read = |off: usize| {
+                    u32::from_le_bytes(image[at + off..at + off + 4].try_into().unwrap()) as usize
+                };
+                let (symoff, nsyms, stroff, strsize) = (read(8), read(12), read(16), read(20));
+                let symbols = (0..nsyms)
+                    .map(|i| {
+                        let e = symoff + i * 16;
+                        (
+                            u32::from_le_bytes(image[e..e + 4].try_into().unwrap()),
+                            image[e + 4],
+                            image[e + 5],
+                            u64::from_le_bytes(image[e + 8..e + 16].try_into().unwrap()),
+                        )
+                    })
+                    .collect();
+                return (symbols, image[stroff..stroff + strsize].to_vec());
+            }
+            at += size;
+        }
+        panic!("no LC_SYMTAB");
+    }
+
+    #[test]
+    fn a_debug_map_becomes_an_oso_and_a_stab_quartet_per_function() {
+        let debug_map = [DebugMapObject {
+            path: "/tmp/one.o".into(),
+            mtime: 0x1234,
+            functions: vec![DebugMapFunction {
+                name: "_main".to_string(),
+                address: SEG_BASE + 0x10,
+                size: 0x20,
+            }],
+        }];
+        let image = emit_with_debug_map(&debug_map);
+        let (symbols, strings) = symbol_table(&image);
+        let name = |strx: u32| {
+            let rest = &strings[strx as usize..];
+            String::from_utf8(rest[..rest.iter().position(|&c| c == 0).unwrap()].to_vec()).unwrap()
+        };
+        assert_eq!(symbols.len(), 7);
+        assert_eq!(symbols[0].1, N_OSO);
+        assert_eq!(name(symbols[0].0), "/tmp/one.o");
+        assert_eq!(symbols[0].3, 0x1234);
+        let entry = SEG_BASE + 0x10 + PAGE_SIZE as u64;
+        assert_eq!(symbols[1], (0, N_BNSYM, 1, entry));
+        assert_eq!(symbols[2], (symbols[2].0, N_FUN, 1, entry));
+        assert_eq!(name(symbols[2].0), "_main");
+        assert_eq!(symbols[3], (0, N_FUN, 0, 0x20));
+        assert_eq!(symbols[4], (0, N_ENSYM, 1, entry + 0x20));
+        assert_eq!(name(symbols[5].0), "__mh_execute_header");
+        assert_eq!(name(symbols[6].0), "_main");
+    }
+
+    /// The stabs are local symbols, so `LC_DYSYMTAB` must count them as such or the
+    /// two real symbols stop being the external range.
+    #[test]
+    fn dysymtab_ranges_follow_the_stabs() {
+        let debug_map = [DebugMapObject {
+            path: "/tmp/one.o".into(),
+            mtime: 1,
+            functions: vec![DebugMapFunction {
+                name: "_main".to_string(),
+                address: SEG_BASE,
+                size: 4,
+            }],
+        }];
+        for (map, stabs) in [(&debug_map[..], 5u32), (&[][..], 0)] {
+            let image = emit_with_debug_map(map);
+            let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap()) as usize;
+            let mut at = 32;
+            let mut found = false;
+            for _ in 0..ncmds {
+                let cmd = u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+                let size = u32::from_le_bytes(image[at + 4..at + 8].try_into().unwrap()) as usize;
+                if cmd == LC_DYSYMTAB {
+                    let read = |off: usize| {
+                        u32::from_le_bytes(image[at + off..at + off + 4].try_into().unwrap())
+                    };
+                    assert_eq!((read(8), read(12)), (0, stabs));
+                    assert_eq!((read(16), read(20)), (stabs, 2));
+                    assert_eq!((read(24), read(28)), (stabs + 2, 0));
+                    found = true;
+                }
+                at += size;
+            }
+            assert!(found, "no LC_DYSYMTAB");
+        }
+    }
+
+    #[test]
+    fn an_empty_debug_map_leaves_the_symbol_table_as_it_was() {
+        let (symbols, strings) = symbol_table(&emit_with_debug_map(&[]));
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(strings, b"\0__mh_execute_header\0_main\0");
+    }
+
+    #[test]
+    fn the_header_names_a_cpu_subtype_a_triple_can_be_derived_from() {
+        let image = emit_with_debug_map(&[]);
+        assert_eq!(u32::from_le_bytes(image[8..12].try_into().unwrap()), 3);
+    }
 
     #[test]
     fn direct_bind_sets_addend_on_every_bind() {
@@ -1303,6 +1509,7 @@ mod tests {
             TargetArch::AArch64,
             0x100004000,
             &dyn_info,
+            &[],
             &mut image,
         )
         .expect_err("rebase slot before __DATA");
@@ -1449,6 +1656,7 @@ mod macho_layout_tests {
                 TargetArch::AArch64,
                 0x100004000,
                 &dyn_info,
+                &[],
                 &mut image,
             )
             .expect("emit");
@@ -1495,6 +1703,7 @@ mod macho_layout_tests {
             TargetArch::AArch64,
             0x100004000,
             &dyn_info,
+            &[],
             &mut image,
         )
         .expect("emit");
@@ -1553,6 +1762,7 @@ mod macho_layout_tests {
             TargetArch::AArch64,
             0x100004000,
             &dyn_info,
+            &[],
             &mut image,
         )
         .expect("emit");
@@ -1709,6 +1919,7 @@ mod linker_option_tests {
             &dylib_info(),
             &rpath_list,
             0x000E_0201,
+            &[],
             &mut image,
         )
         .expect("emit");
@@ -1730,7 +1941,7 @@ mod linker_option_tests {
             &[text(vec![0xC3], Vec::new())],
             &[defined("_main", 1, 0)],
         );
-        let linked = link_macho_single_object(&obj).expect("links");
+        let linked = link_macho_single_object(&obj, None).expect("links");
         let mut image = Vec::new();
         emit_macho_executable_dynamic_with(
             &linked.layout,
@@ -1739,6 +1950,7 @@ mod linker_option_tests {
             &dylib_info(),
             &[],
             MACOS_DEFAULT_MIN_OS,
+            &[],
             &mut image,
         )
         .expect("emit");
@@ -1748,11 +1960,14 @@ mod linker_option_tests {
 
     #[test]
     fn empty_or_nul_rpath_is_rejected() {
-        let linked = link_macho_single_object(&macho_object(
-            X86_64_CPU,
-            &[text(vec![0xC3], Vec::new())],
-            &[defined("_main", 1, 0)],
-        ))
+        let linked = link_macho_single_object(
+            &macho_object(
+                X86_64_CPU,
+                &[text(vec![0xC3], Vec::new())],
+                &[defined("_main", 1, 0)],
+            ),
+            None,
+        )
         .expect("links");
         for bad in ["", "a\0b"] {
             let mut out = Vec::new();
@@ -1763,6 +1978,7 @@ mod linker_option_tests {
                 &dylib_info(),
                 &[bad.to_string()],
                 MACOS_DEFAULT_MIN_OS,
+                &[],
                 &mut out,
             )
             .expect_err("bad rpath");

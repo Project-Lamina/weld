@@ -565,8 +565,15 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
         macho_direct_binds: Vec::new(),
     };
     let dyn_info = result.dynamic.as_ref().unwrap_or(&fallback_dyn);
-    emit::macho::emit_macho_executable_dynamic(&result.layout, arch, entry, dyn_info, &mut out)
-        .ok()?;
+    emit::macho::emit_macho_executable_dynamic(
+        &result.layout,
+        arch,
+        entry,
+        dyn_info,
+        &result.debug_map,
+        &mut out,
+    )
+    .ok()?;
     out.flush().ok()?;
     drop(out);
     set_executable(out_path);
@@ -848,6 +855,7 @@ mod tests {
         let mut symbol_addrs = HashMap::default();
         symbol_addrs.insert("main".to_string(), 0x400000u64);
         LinkResult {
+            debug_map: Vec::new(),
             symbols: Vec::new(),
             layout: MergedLayout {
                 sections: vec![MergedSection {

@@ -5,7 +5,10 @@
 use crate::collections::{HashMap, HashSet};
 use crate::{
     arch::TargetArch,
-    link::{DynamicLinkInfo, LinkResult, MergedLayout, MergedSection, ObjectSectionContrib},
+    link::{
+        DebugMapFunction, DebugMapObject, DynamicLinkInfo, LinkResult, MergedLayout, MergedSection,
+        ObjectSectionContrib,
+    },
     macho::{
         ARM64_RELOC_ADDEND, ARM64_RELOC_BRANCH26, ARM64_RELOC_GOT_LOAD_PAGE21,
         ARM64_RELOC_GOT_LOAD_PAGEOFF12, ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12,
@@ -14,7 +17,7 @@ use crate::{
         parse_macho64_object,
     },
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Three binary sections emitted when building stub trampolines:
 /// stubs, stub helper, and GOT slots.
@@ -233,17 +236,126 @@ fn merge_macho_sections(obj: &Macho64Object) -> MergedLayout {
     layout
 }
 
-fn resolve_macho_symbols(obj: &Macho64Object, layout: &MergedLayout) -> HashMap<String, u64> {
-    let mut addrs = HashMap::default();
-    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::default();
+/// Mach-O reserves a leading `L` for assembler temporaries. They are not function
+/// starts, so a debug map must not let one cut a function's extent short.
+fn is_temporary_label(name: &str) -> bool {
+    name.starts_with('L') || name.starts_with(".L")
+}
 
-    for (i, sec) in obj.sections.iter().enumerate() {
-        let sect_idx = (i + 1) as u8;
-        let name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
-        if let Some(&idx) = layout.section_by_name.get(&name) {
-            vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr);
+fn file_mtime_seconds(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_secs())
+}
+
+/// Pair each parsed object with the command-line file it was read from, so an
+/// `N_OSO` can name a path `dsymutil` will reopen. Objects pulled out of an archive
+/// have no such path and get `None`; so does every object when nothing carries
+/// DWARF, which keeps a non-debug link from touching the filesystem again.
+fn macho_object_origins(
+    datas: &[&[u8]],
+    objects: &[Macho64Object],
+    input_paths: &[PathBuf],
+) -> Vec<Option<PathBuf>> {
+    if !objects.iter().any(has_dwarf_sections) {
+        return vec![None; datas.len()];
+    }
+    let contents: Vec<(&PathBuf, Vec<u8>)> = input_paths
+        .iter()
+        .filter_map(|path| Some((path, std::fs::read(path).ok()?)))
+        .collect();
+    datas
+        .iter()
+        .zip(objects)
+        .map(|(data, obj)| {
+            let origin = contents
+                .iter()
+                .find(|(_, bytes)| bytes.as_slice() == *data)
+                .map(|(path, _)| (*path).clone());
+            if origin.is_none() && has_dwarf_sections(obj) {
+                log::warn!(
+                    "an object carries DWARF but was not read from a named file, so it gets no debug map entry and dsymutil will not see it"
+                );
+            }
+            origin
+        })
+        .collect()
+}
+
+/// Whether the object carries DWARF for `dsymutil` to find. `S_ATTR_DEBUG` alone is
+/// not the question: `__LD,__compact_unwind` sets it too and holds no debug info.
+fn has_dwarf_sections(obj: &Macho64Object) -> bool {
+    obj.sections.iter().any(|sec| sec.segname == "__DWARF")
+}
+
+/// The debug map entry for one object: every function it defines, at the address
+/// the link gave it. Mach-O's `nlist` carries no size, so an extent runs to the next
+/// non-temporary symbol in the same section, or to the section's end.
+fn debug_map_for_object(
+    obj: &Macho64Object,
+    vaddr_by_sect: &HashMap<u8, u64>,
+    origin: &Path,
+) -> Option<DebugMapObject> {
+    if !has_dwarf_sections(obj) {
+        return None;
+    }
+    let mtime = file_mtime_seconds(origin)?;
+    let path = std::fs::canonicalize(origin).unwrap_or_else(|_| origin.to_path_buf());
+    let mut functions = Vec::new();
+    for (index, sec) in obj.sections.iter().enumerate() {
+        if sec.segname != "__TEXT" || sec.sectname != "__text" {
+            continue;
+        }
+        let sect_idx = (index + 1) as u8;
+        let Some(&base) = vaddr_by_sect.get(&sect_idx) else {
+            continue;
+        };
+        let mut starts: Vec<(u64, &str)> = obj
+            .symbols
+            .iter()
+            .filter(|sym| {
+                sym.is_defined
+                    && sym.sect == sect_idx
+                    && !sym.name.is_empty()
+                    && !is_temporary_label(&sym.name)
+            })
+            .map(|sym| (symbol_offset_in_section(obj, sym), sym.name.as_str()))
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        for (nth, &(offset, name)) in starts.iter().enumerate() {
+            let end = starts.get(nth + 1).map_or(sec.size, |next| next.0);
+            functions.push(DebugMapFunction {
+                name: name.to_string(),
+                address: base + offset,
+                size: end.saturating_sub(offset),
+            });
         }
     }
+    (!functions.is_empty()).then_some(DebugMapObject {
+        path,
+        mtime,
+        functions,
+    })
+}
+
+fn section_vaddrs(obj: &Macho64Object, layout: &MergedLayout) -> HashMap<u8, u64> {
+    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::default();
+    for (i, sec) in obj.sections.iter().enumerate() {
+        let name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
+        if let Some(&idx) = layout.section_by_name.get(&name) {
+            vaddr_by_sect.insert((i + 1) as u8, layout.sections[idx].vaddr);
+        }
+    }
+    vaddr_by_sect
+}
+
+fn resolve_macho_symbols(obj: &Macho64Object, layout: &MergedLayout) -> HashMap<String, u64> {
+    let mut addrs = HashMap::default();
+    let vaddr_by_sect = section_vaddrs(obj, layout);
 
     for sym in &obj.symbols {
         if !sym.is_defined || sym.name.is_empty() {
@@ -262,14 +374,7 @@ fn symbol_addr_by_index(
     layout: &MergedLayout,
     symbol_addrs: &HashMap<String, u64>,
 ) -> Vec<Option<u64>> {
-    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::default();
-    for (i, sec) in obj.sections.iter().enumerate() {
-        let sect_idx = (i + 1) as u8;
-        let name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
-        if let Some(&idx) = layout.section_by_name.get(&name) {
-            vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr);
-        }
-    }
+    let vaddr_by_sect = section_vaddrs(obj, layout);
 
     obj.symbols
         .iter()
@@ -1016,13 +1121,18 @@ fn apply_macho_relocations(
     Ok(())
 }
 
-pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
+pub fn link_macho_single_object(data: &[u8], origin: Option<&Path>) -> Result<LinkResult, String> {
     let obj = parse_macho64_object(data)?;
     let arch = TargetArch::from_macho_cputype(obj.header.cputype)
         .ok_or_else(|| format!("unsupported Mach-O cputype {}", obj.header.cputype))?;
 
     let mut layout = merge_macho_sections(&obj);
     let symbol_addrs = resolve_macho_symbols(&obj, &layout);
+    let debug_map = origin
+        .filter(|path| std::fs::read(path).is_ok_and(|bytes| bytes == data))
+        .and_then(|path| debug_map_for_object(&obj, &section_vaddrs(&obj, &layout), path))
+        .into_iter()
+        .collect();
     let symbol_addr_by_idx = symbol_addr_by_index(&obj, &layout, &symbol_addrs);
     let mut rebase_addrs: HashSet<u64> = HashSet::default();
     apply_macho_relocations(
@@ -1062,6 +1172,7 @@ pub fn link_macho_single_object(data: &[u8]) -> Result<LinkResult, String> {
         e_machine,
         symbol_addrs,
         dynamic,
+        debug_map,
     })
 }
 
@@ -1069,13 +1180,13 @@ pub fn link_macho_multi_object(
     datas: &[&[u8]],
     libs: Option<&[String]>,
     dylib_paths: &[PathBuf],
-    _input_paths: &[PathBuf],
+    input_paths: &[PathBuf],
 ) -> Result<LinkResult, String> {
     if datas.is_empty() {
         return Err("no objects to link".to_string());
     }
     if datas.len() == 1 && libs.is_none() {
-        return link_macho_single_object(datas[0]);
+        return link_macho_single_object(datas[0], input_paths.first().map(PathBuf::as_path));
     }
 
     let objects: Vec<Macho64Object> = datas
@@ -1088,6 +1199,8 @@ pub fn link_macho_multi_object(
         .ok_or_else(|| format!("unsupported Mach-O cputype {}", objects[0].header.cputype))?;
     let e_machine = arch.to_elf_machine();
 
+    let origins = macho_object_origins(datas, &objects, input_paths);
+    let mut debug_map: Vec<DebugMapObject> = Vec::new();
     let mut global_symbols: HashMap<String, u64> = HashMap::default();
     let mut global_symbol_weak: HashMap<String, bool> = HashMap::default();
     for (obj_idx, obj) in objects.iter().enumerate() {
@@ -1102,6 +1215,11 @@ pub fn link_macho_multi_object(
             ) {
                 vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr + off.offset_in_merged);
             }
+        }
+        if let Some(origin) = origins.get(obj_idx).and_then(Option::as_ref)
+            && let Some(entry) = debug_map_for_object(obj, &vaddr_by_sect, origin)
+        {
+            debug_map.push(entry);
         }
         for sym in &obj.symbols {
             if !sym.is_defined || sym.name.is_empty() || (sym.n_type & N_EXT) == 0 {
@@ -1501,6 +1619,7 @@ pub fn link_macho_multi_object(
         e_machine,
         symbol_addrs: global_symbols,
         dynamic,
+        debug_map,
     })
 }
 
@@ -1944,6 +2063,83 @@ pub(crate) mod tests {
         }
     }
 
+    fn debug_map_section(segname: &str, sectname: &str, size: u64, flags: u32) -> MachoSection {
+        MachoSection {
+            sectname: sectname.to_string(),
+            segname: segname.to_string(),
+            addr: 0,
+            size,
+            offset: 0,
+            align: 0,
+            reloff: 0,
+            nreloc: 0,
+            flags,
+        }
+    }
+
+    fn debug_map_symbol(name: &str, value: u64) -> MachoSymbol {
+        MachoSymbol {
+            name: name.to_string(),
+            value,
+            sect: 1,
+            n_type: 0x0e,
+            n_desc: 0,
+            is_defined: true,
+            is_weak_ref: false,
+        }
+    }
+
+    fn debug_map_object(with_dwarf: bool) -> Macho64Object {
+        let mut sections = vec![debug_map_section("__TEXT", "__text", 0x40, 0)];
+        if with_dwarf {
+            sections.push(debug_map_section(
+                "__DWARF",
+                "__debug_info",
+                8,
+                S_ATTR_DEBUG,
+            ));
+        }
+        Macho64Object {
+            header: Macho64Header {
+                cputype: 0x0100_0007,
+                filetype: 1,
+                ncmds: 0,
+                sizeofcmds: 0,
+                segments: Vec::new(),
+            },
+            sections,
+            symbols: vec![
+                debug_map_symbol("_a", 0),
+                debug_map_symbol(".L_a.body", 4),
+                debug_map_symbol("_b", 0x20),
+            ],
+            data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_function_extent_runs_past_temporary_labels_to_the_next_function() {
+        let obj = debug_map_object(true);
+        let mut vaddrs: HashMap<u8, u64> = HashMap::default();
+        vaddrs.insert(1, 0x1000);
+        let entry = debug_map_for_object(&obj, &vaddrs, Path::new(file!())).expect("debug map");
+        let extents: Vec<(&str, u64, u64)> = entry
+            .functions
+            .iter()
+            .map(|f| (f.name.as_str(), f.address, f.size))
+            .collect();
+        assert_eq!(extents, [("_a", 0x1000, 0x20), ("_b", 0x1020, 0x20)]);
+    }
+
+    #[test]
+    fn an_object_without_dwarf_contributes_no_debug_map() {
+        let mut vaddrs: HashMap<u8, u64> = HashMap::default();
+        vaddrs.insert(1, 0x1000);
+        assert!(
+            debug_map_for_object(&debug_map_object(false), &vaddrs, Path::new(file!())).is_none()
+        );
+    }
+
     pub(crate) fn macho_object(
         cputype: u32,
         sections: &[TestSection],
@@ -2119,7 +2315,7 @@ pub(crate) mod tests {
             )],
             &[defined("_self", 1, 6)],
         );
-        let result = link_macho_single_object(&obj).expect("links");
+        let result = link_macho_single_object(&obj, None).expect("links");
         let (bytes, text_vaddr) = text_bytes(&result.layout);
         assert_eq!(
             i32_at(bytes, 1),
@@ -2165,7 +2361,7 @@ pub(crate) mod tests {
             )],
             &[],
         );
-        let result = link_macho_single_object(&obj).expect("links");
+        let result = link_macho_single_object(&obj, None).expect("links");
         let (bytes, text_vaddr) = text_bytes(&result.layout);
         assert_eq!(
             i32_at(bytes, 0),
@@ -2220,7 +2416,7 @@ pub(crate) mod tests {
             ],
             &[defined("_target", 1, 0)],
         );
-        let result = link_macho_single_object(&obj).expect("links");
+        let result = link_macho_single_object(&obj, None).expect("links");
         let data = result
             .layout
             .sections
@@ -2238,7 +2434,7 @@ pub(crate) mod tests {
             &[text(vec![0; 16], vec![reloc(8, 0, false, 3, true, 0)])],
             &[defined("_here", 1, 0)],
         );
-        let err = link_macho_single_object(&obj).expect_err("text cannot be rebased");
+        let err = link_macho_single_object(&obj, None).expect_err("text cannot be rebased");
         assert!(err.contains("_here"), "{err}");
         assert!(err.contains("cannot be rebased"), "{err}");
     }
@@ -2310,7 +2506,7 @@ pub(crate) mod tests {
             )],
             &[undefined("_printf")],
         );
-        let Err(err) = link_macho_single_object(&obj) else {
+        let Err(err) = link_macho_single_object(&obj, None) else {
             panic!("must fail")
         };
         assert!(err.contains("undefined symbol"), "{err}");
@@ -2334,7 +2530,7 @@ pub(crate) mod tests {
                 )],
                 &[defined("_s", 1, 0)],
             );
-            let err = link_macho_single_object(&obj)
+            let err = link_macho_single_object(&obj, None)
                 .err()
                 .unwrap_or_else(|| panic!("type {rtype} must be refused"));
             assert!(err.contains(want), "type {rtype}: {err}");
