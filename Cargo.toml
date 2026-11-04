@@ -1,6 +1,6 @@
 [package]
 name = "lamina-weld"
-version = "0.2.2"
+version = "0.2.3"
 rust-version = "1.88"
 edition = "2024"
 authors = ["Eira <eira@nornity.com>"]
@@ -9,6 +9,10 @@ license = "Apache-2.0"
 keywords = ["linker", "elf", "pe", "macho", "compiler"]
 categories = ["compilers", "development-tools"]
 repository = "https://github.com/Project-Lamina/weld"
+
+[lib]
+name = "weld"
+path = "src/lib.rs"
 
 [[bin]]
 name = "weld"
