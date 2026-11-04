@@ -604,6 +604,37 @@ mod tests {
         assert_eq!(scan.members.len(), 1);
     }
 
+    /// Every member header, for a failure message. The host `ar` decides the archive
+    /// dialect, so a mismatch has to say what it actually wrote.
+    fn walk(ar: &[u8]) -> String {
+        let mut out = String::from("\narchive layout:");
+        let mut off = MAGIC.len();
+        while off + HEADER_LEN <= ar.len() {
+            let header = &ar[off..off + HEADER_LEN];
+            let raw = String::from_utf8_lossy(&header[..16])
+                .trim_end()
+                .to_string();
+            let Ok(size) = String::from_utf8_lossy(&header[48..58])
+                .trim()
+                .parse::<usize>()
+            else {
+                out.push_str(&format!("\n  off={off} unparsable size"));
+                break;
+            };
+            out.push_str(&format!("\n  off={off} name={raw:?} size={size}"));
+            if let Some(len) = raw
+                .strip_prefix("#1/")
+                .and_then(|n| n.parse::<usize>().ok())
+                && let Some(bytes) = ar.get(off + HEADER_LEN..off + HEADER_LEN + len)
+            {
+                out.push_str(&format!(" bsdname={:?}", String::from_utf8_lossy(bytes)));
+            }
+            off += HEADER_LEN + size + (size & 1);
+        }
+        out.push_str(&format!("\n  ended at {off}, len {}", ar.len()));
+        out
+    }
+
     #[test]
     fn system_ar_archive_parses_with_the_reader() {
         let guard = crate::test_support::TempDir::new("archive-ar");
@@ -619,9 +650,15 @@ mod tests {
         let ar = std::fs::read(dir.join("lib.a")).unwrap();
         let archive = parse_members(&ar).unwrap();
         let names: Vec<&str> = archive.members.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(names, ["first.o", "a_longer_member_name.o"]);
-        assert_eq!(archive.members[0].data(&ar), b"first body!");
-        assert_eq!(archive.members[1].data(&ar), b"second");
+        assert_eq!(
+            names,
+            ["first.o", "a_longer_member_name.o"],
+            "{}",
+            walk(&ar)
+        );
+        // `ar` may pad a member's data; the content it was given comes first.
+        assert!(archive.members[0].data(&ar).starts_with(b"first body!"));
+        assert!(archive.members[1].data(&ar).starts_with(b"second"));
     }
 
     #[test]
