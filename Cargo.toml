@@ -23,5 +23,5 @@ rustc-hash = "2.1.2"
 log = "0.4"
 
 [dev-dependencies]
-lamina-platform = { version = "0.2.0" }
-ras = { package = "lamina-ras", version = "0.2.0", features = ["encoder"] }
+lamina-platform = { version = "0.2.1" }
+ras = { package = "lamina-ras", version = "0.2.4", features = ["encoder"] }
