@@ -173,3 +173,113 @@ fn filelist_names_the_inputs() {
     weld(dir, &["-filelist", "inputs", "-lSystem", "-o", "main"]);
     assert_eq!(run(dir, "main"), "listed\n");
 }
+
+const HELPER_DYLIB_SOURCE: &str = "int helper(void){return 7;}\nint other = 5;\n";
+
+fn weld_dylib(dir: &Path) {
+    compile(dir, "helper", HELPER_DYLIB_SOURCE);
+    weld(
+        dir,
+        &[
+            "helper.o",
+            "-dylib",
+            "-install_name",
+            "@rpath/libhelper.dylib",
+            "-o",
+            "libhelper.dylib",
+        ],
+    );
+}
+
+#[test]
+fn dylib_from_weld_is_named_signed_and_linked_against() {
+    let guard = TempDir::new("weld-macho-dylib");
+    let dir = guard.path();
+    weld_dylib(dir);
+
+    let load = Command::new("otool")
+        .current_dir(dir)
+        .args(["-l", "libhelper.dylib"])
+        .output()
+        .unwrap();
+    let load = String::from_utf8_lossy(&load.stdout);
+    assert!(load.contains("cmd LC_ID_DYLIB"), "{load}");
+    assert!(load.contains("name @rpath/libhelper.dylib"), "{load}");
+    assert!(!load.contains("LC_MAIN"), "{load}");
+    let header = Command::new("otool")
+        .current_dir(dir)
+        .args(["-hv", "libhelper.dylib"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&header.stdout).contains("DYLIB"),
+        "{}",
+        String::from_utf8_lossy(&header.stdout)
+    );
+    let sign = Command::new("codesign")
+        .current_dir(dir)
+        .args(["-v", "libhelper.dylib"])
+        .status()
+        .unwrap();
+    assert!(sign.success());
+
+    compile(
+        dir,
+        "main",
+        "#include <stdio.h>\nint helper(void);\nextern int other;\n\
+         int main(void){printf(\"%d %d\\n\",helper(),other);return 0;}\n",
+    );
+    weld(
+        dir,
+        &[
+            "main.o",
+            "-L.",
+            "-lhelper",
+            "-lSystem",
+            "-rpath",
+            "@executable_path",
+            "-o",
+            "main",
+        ],
+    );
+    assert_eq!(run(dir, "main"), "7 5\n");
+}
+
+#[test]
+fn dylib_from_weld_opens_with_dlopen() {
+    let guard = TempDir::new("weld-macho-dlopen");
+    let dir = guard.path();
+    weld_dylib(dir);
+    fs::write(
+        dir.join("open.c"),
+        r#"#include <dlfcn.h>
+#include <stdio.h>
+int main(void) {
+    void *h = dlopen("./libhelper.dylib", RTLD_NOW);
+    if (!h) { printf("%s\n", dlerror()); return 1; }
+    int (*helper)(void) = (int (*)(void))dlsym(h, "helper");
+    int *other = (int *)dlsym(h, "other");
+    if (!helper || !other) { printf("missing symbol\n"); return 1; }
+    printf("%d %d\n", helper(), *other);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("clang")
+        .current_dir(dir)
+        .args(["open.c", "-o", "open"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let output = Command::new(dir.join("open"))
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "7 5\n");
+}
