@@ -650,6 +650,9 @@ enum RelocKind {
     Arm64GotLoadPageOff12,
     Arm64TlvpPage21,
     Arm64TlvpPageOff12,
+    /// A 32-bit pc-relative field that holds the address of a symbol's GOT slot, as
+    /// LSDA type tables do for typeinfo. It resolves through the GOT like a GOT load.
+    Arm64PointerToGot,
     /// A 32-bit pc-relative field. `adjust` is the number of instruction bytes
     /// that follow the field. `through_got` marks references that must resolve
     /// to a GOT slot instead of the symbol itself.
@@ -670,14 +673,7 @@ fn decode_arm64_reloc_kind(r_type: u32) -> Result<RelocKind, String> {
         ARM64_RELOC_GOT_LOAD_PAGEOFF12 => RelocKind::Arm64GotLoadPageOff12,
         ARM64_RELOC_TLVP_LOAD_PAGE21 => RelocKind::Arm64TlvpPage21,
         ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => RelocKind::Arm64TlvpPageOff12,
-        ARM64_RELOC_POINTER_TO_GOT => {
-            // Linking this would still abort at the first throw: no __unwind_info is written.
-            return Err(
-                "C++ exception tables are not supported on Mach-O (ARM64_RELOC_POINTER_TO_GOT); \
-                 build with -fno-exceptions or link with ld"
-                    .to_string(),
-            );
-        }
+        ARM64_RELOC_POINTER_TO_GOT => RelocKind::Arm64PointerToGot,
         other => return Err(format!("unsupported Mach-O relocation type {}", other)),
     })
 }
@@ -869,6 +865,11 @@ fn apply_macho_relocations(
                     got_slot_by_symbol
                         .and_then(|m| m.get(name).copied())
                         .ok_or_else(|| format!("x86_64 GOT reference to {name} has no GOT slot"))?
+                } else if kind == RelocKind::Arm64PointerToGot {
+                    let name = sym.map(|s| s.name.as_str()).unwrap_or("?");
+                    got_slot_by_symbol
+                        .and_then(|m| m.get(name).copied())
+                        .ok_or_else(|| format!("GOT reference to {name} has no GOT slot"))?
                 } else {
                     let is_got_reloc = matches!(
                         kind,
@@ -914,6 +915,12 @@ fn apply_macho_relocations(
                 ) {
                     return Err(format!(
                         "x86_64 GOT reference at offset 0x{:x} has no external symbol",
+                        off
+                    ));
+                }
+                if kind == RelocKind::Arm64PointerToGot {
+                    return Err(format!(
+                        "GOT reference at offset 0x{:x} has no external symbol",
                         off
                     ));
                 }
@@ -1204,6 +1211,21 @@ fn apply_macho_relocations(
                     write_u32_le(&mut merged.data, off, patched);
                 }
                 RelocKind::Addend => {}
+                RelocKind::Arm64PointerToGot => {
+                    if merged.data.len() < off + 4 {
+                        return Err("pointer-to-GOT reloc: buffer too short".to_string());
+                    }
+                    // The field is overwritten, not added to: the object's contents are the
+                    // assembler's placeholder, and ld64 ignores them too.
+                    let delta = base_runtime as i128 - place_runtime as i128;
+                    let delta = i32::try_from(delta).map_err(|_| {
+                        format!(
+                            "pointer-to-GOT reloc out of range: slot=0x{:x} place=0x{:x}",
+                            base_runtime, place_runtime
+                        )
+                    })?;
+                    write_u32_le(&mut merged.data, off, delta as u32);
+                }
                 RelocKind::X86Pcrel { adjust, .. } => {
                     if merged.data.len() < off + 4 {
                         return Err("x86_64 pc-relative reloc: buffer too short".to_string());
@@ -1472,10 +1494,11 @@ pub fn link_macho_multi_object(
                     let is_tlvp_reloc = r.r_type == ARM64_RELOC_TLVP_LOAD_PAGE21
                         || r.r_type == ARM64_RELOC_TLVP_LOAD_PAGEOFF12;
                     let is_locally_resolved = global_symbols.contains_key(&sym.name);
+                    let is_pointer_to_got = r.r_type == ARM64_RELOC_POINTER_TO_GOT;
                     let needs_got = if is_tlvp_reloc {
                         !is_locally_resolved
                     } else {
-                        !sym.is_defined && is_got_reloc
+                        (!sym.is_defined && is_got_reloc) || is_pointer_to_got
                     };
                     if needs_got && got_symbol_set.insert(sym.name.clone()) {
                         got_symbols.push(sym.name.clone());
