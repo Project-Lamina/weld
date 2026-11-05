@@ -739,6 +739,7 @@ fn apply_macho_relocations(
                 !r.r_pcrel && r.r_length == 3 && is_data_layout_section(&merged.name);
 
             let mut direct_bind_symbol: Option<(String, bool, i64)> = None;
+            let mut used_got_slot = false;
             let base = if r.r_extern {
                 let idx = r.r_symbolnum as usize;
                 let sym = obj.symbols.get(idx);
@@ -794,6 +795,7 @@ fn apply_macho_relocations(
                     } else {
                         None
                     };
+                    used_got_slot = addr_opt.is_some();
                     let addr_opt = addr_opt.or(resolved_sym_addr);
                     let Some(addr) = addr_opt else {
                         let sym_name = obj.symbols.get(idx).map(|s| s.name.as_str()).unwrap_or("?");
@@ -1083,13 +1085,10 @@ fn apply_macho_relocations(
                     let addend = insn_addend + extra_addend;
                     let target = add_signed_u64(base_runtime, addend);
                     let pageoff = (target & 0x0fff) as u32;
-                    let patched = if kind == RelocKind::Arm64TlvpPageOff12
+                    let patched = if (kind == RelocKind::Arm64TlvpPageOff12
+                        || kind == RelocKind::Arm64GotLoadPageOff12)
                         && r.r_extern
-                        && obj
-                            .symbols
-                            .get(r.r_symbolnum as usize)
-                            .map(|s| s.is_defined)
-                            .unwrap_or(false)
+                        && !used_got_slot
                     {
                         encode_arm64_tlvp_local_add(insn, pageoff)
                     } else {
@@ -1753,7 +1752,7 @@ fn symbol_addr_by_index_multi(
             } else {
                 None
             };
-            defined_addr.or(undef_addr)
+            undef_addr.or(defined_addr)
         })
         .collect()
 }
