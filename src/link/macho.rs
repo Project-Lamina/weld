@@ -6,8 +6,8 @@ use crate::collections::{HashMap, HashSet};
 use crate::{
     arch::TargetArch,
     link::{
-        DebugMapFunction, DebugMapObject, DynamicLinkInfo, LinkResult, MergedLayout, MergedSection,
-        ObjectSectionContrib,
+        DebugMapFunction, DebugMapObject, DynamicLinkInfo, LinkResult, MachoExport, MergedLayout,
+        MergedSection, ObjectSectionContrib,
     },
     macho::{
         ARM64_RELOC_ADDEND, ARM64_RELOC_BRANCH26, ARM64_RELOC_GOT_LOAD_PAGE21,
@@ -1159,6 +1159,19 @@ pub fn link_macho_single_object(data: &[u8], origin: Option<&Path>) -> Result<Li
         None,
     )?;
 
+    let macho_exports: Vec<MachoExport> = obj
+        .symbols
+        .iter()
+        .filter(|sym| sym.is_defined && !sym.name.is_empty() && (sym.n_type & N_EXT) != 0)
+        .filter_map(|sym| {
+            symbol_addrs.get(&sym.name).map(|&address| MachoExport {
+                name: sym.name.clone(),
+                address,
+                weak: (sym.n_desc & N_WEAK_DEF) != 0,
+            })
+        })
+        .collect();
+
     let e_machine = arch.to_elf_machine();
     let dynamic = (!rebase_addrs.is_empty()).then(|| {
         let mut macho_rebase_addrs: Vec<u64> = rebase_addrs.into_iter().collect();
@@ -1182,6 +1195,7 @@ pub fn link_macho_single_object(data: &[u8], origin: Option<&Path>) -> Result<Li
         symbol_addrs,
         dynamic,
         debug_map,
+        macho_exports,
     })
 }
 
@@ -1253,6 +1267,15 @@ pub fn link_macho_multi_object(
             }
         }
     }
+
+    let macho_exports: Vec<MachoExport> = global_symbols
+        .iter()
+        .map(|(name, &address)| MachoExport {
+            name: name.clone(),
+            address,
+            weak: global_symbol_weak.get(name).copied().unwrap_or(false),
+        })
+        .collect();
 
     let _has_system = libs
         .map(|l| l.iter().any(|x| x == "System" || x == "c" || x == "m"))
@@ -1637,6 +1660,7 @@ pub fn link_macho_multi_object(
         symbol_addrs: global_symbols,
         dynamic,
         debug_map,
+        macho_exports,
     })
 }
 

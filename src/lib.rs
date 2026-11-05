@@ -559,9 +559,13 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
     };
     let result = link_macho_multi_object(&obj_refs, libs, &dylib_paths, &args.input_files).ok()?;
     let arch = TargetArch::from_elf_machine(result.e_machine)?;
-    let entry = match entry_address(args, &result) {
-        Ok(entry) => entry,
-        Err(message) => return fail(message),
+    let entry = if args.dylib {
+        0
+    } else {
+        match entry_address(args, &result) {
+            Ok(entry) => entry,
+            Err(message) => return fail(message),
+        }
     };
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
     let out_file = create_output(out_path).ok()?;
@@ -583,17 +587,37 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
             .iter()
             .map(|name| format!("/System/Library/Frameworks/{name}.framework/{name}")),
     );
-    emit::macho::emit_macho_executable_dynamic_with(
-        &result.layout,
-        arch,
-        entry,
-        &dyn_info,
-        &args.rpaths,
-        emit::macho::macos_min_version().ok()?,
-        &result.debug_map,
-        &mut out,
-    )
-    .ok()?;
+    let min_os = emit::macho::macos_min_version().ok()?;
+    if args.dylib {
+        let install_name = args
+            .install_name
+            .clone()
+            .unwrap_or_else(|| out_path.display().to_string());
+        emit::macho::emit_macho_dylib(
+            &result.layout,
+            arch,
+            &install_name,
+            &result.macho_exports,
+            &dyn_info,
+            &args.rpaths,
+            min_os,
+            &result.debug_map,
+            &mut out,
+        )
+        .ok()?;
+    } else {
+        emit::macho::emit_macho_executable_dynamic_with(
+            &result.layout,
+            arch,
+            entry,
+            &dyn_info,
+            &args.rpaths,
+            min_os,
+            &result.debug_map,
+            &mut out,
+        )
+        .ok()?;
+    }
     out.flush().ok()?;
     drop(out);
     set_executable(out_path);
@@ -708,6 +732,9 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
             return Some(1);
         }
         return try_weld_relocatable(args, &loaded.objects);
+    }
+    if args.dylib && loaded.format != ObjectFormat::MachO {
+        return fail("-dylib needs Mach-O inputs");
     }
     match loaded.format {
         ObjectFormat::Elf => try_weld_link_elf(args, loaded.objects, loaded.positions),
@@ -892,6 +919,7 @@ mod tests {
             e_machine: 62,
             symbol_addrs,
             dynamic: None,
+            macho_exports: Vec::new(),
         }
     }
 
