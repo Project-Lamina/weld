@@ -10,6 +10,7 @@ mod aarch64;
 mod dynamic;
 mod gc;
 pub mod macho;
+mod macho_unwind;
 mod merge;
 mod notes;
 mod pie;

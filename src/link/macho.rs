@@ -2,6 +2,7 @@
 //!
 //! Merges sections, resolves symbols, applies relocations.
 
+use super::macho_unwind::{self, CompactEntry};
 use crate::collections::{HashMap, HashSet};
 use crate::{
     arch::TargetArch,
@@ -193,6 +194,105 @@ fn align_up_bytes(value: u64, align_bytes: u64) -> u64 {
         return value;
     }
     (value + align_bytes - 1) & !(align_bytes - 1)
+}
+
+/// The output section that holds the table built from `__LD,__compact_unwind`.
+const UNWIND_SECTION: &str = "__TEXT.__unwind_info";
+
+/// Inserts a zero-filled `__TEXT,__unwind_info` of `count` entries' reserved size ahead
+/// of the data sections, and lays out the sections after it again. Symbol addresses are
+/// taken from the layout later, so this must run before they are.
+fn reserve_unwind_section(layout: &mut MergedLayout, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let size = macho_unwind::reserved_size(count);
+    let at = layout
+        .sections
+        .iter()
+        .position(|s| is_data_layout_section(&s.name))
+        .unwrap_or(layout.sections.len());
+    let prev_end = match at {
+        0 => SEG_BASE,
+        _ => {
+            let prev = &layout.sections[at - 1];
+            prev.vaddr + prev.data.len() as u64
+        }
+    };
+    let vaddr = align_up(prev_end, 2);
+    layout.sections.insert(
+        at,
+        MergedSection {
+            entsize: 0,
+            sh_type: 1,
+            name: UNWIND_SECTION.into(),
+            data: vec![0u8; size],
+            vaddr,
+            flags: 2,
+            align: 2,
+        },
+    );
+    let mut next = vaddr + size as u64;
+    for sec in layout.sections[at + 1..].iter_mut() {
+        next = align_up(next, sec.align);
+        sec.vaddr = next;
+        next += sec.data.len() as u64;
+    }
+    layout.section_by_name = layout
+        .sections
+        .iter()
+        .enumerate()
+        .map(|(i, sec)| (sec.name.clone(), i))
+        .collect();
+}
+
+/// Writes the table into the reserved section. The table never grows past the
+/// reservation, so no address after it moves.
+fn fill_unwind_section(
+    layout: &mut MergedLayout,
+    entries: &[CompactEntry],
+    offset_of: impl Fn(u64) -> Result<u32, String>,
+    personality_offset: impl Fn(&str) -> Result<u32, String>,
+) -> Result<(), String> {
+    let Some(&idx) = layout.section_by_name.get(UNWIND_SECTION) else {
+        return Ok(());
+    };
+    let bytes = macho_unwind::build_unwind_info(entries, offset_of, personality_offset)?;
+    let sec = &mut layout.sections[idx];
+    if bytes.len() > sec.data.len() {
+        return Err(format!(
+            "__unwind_info is {} bytes, more than the {} reserved",
+            bytes.len(),
+            sec.data.len()
+        ));
+    }
+    sec.data[..bytes.len()].copy_from_slice(&bytes);
+    Ok(())
+}
+
+/// The Mach-O header offset of a runtime address, which is how `__unwind_info` names
+/// functions, personality slots and LSDAs.
+fn header_offset(runtime: u64) -> Result<u32, String> {
+    runtime
+        .checked_sub(SEG_BASE)
+        .and_then(|off| u32::try_from(off).ok())
+        .ok_or_else(|| format!("address 0x{runtime:x} is outside the __TEXT offset range"))
+}
+
+/// Stage gate: personality routines and LSDAs are not linked yet. Refusing here keeps
+/// C++ exception tables from linking into a binary whose unwinder cannot find them.
+fn refuse_exception_tables(entries: &[CompactEntry]) -> Result<(), String> {
+    if entries
+        .iter()
+        .any(|e| e.personality.is_some() || e.lsda.is_some())
+    {
+        return Err(
+            "C++ exception tables are not supported on Mach-O yet (personality routines and LSDAs); \
+             build with -fno-exceptions or link with ld"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn merge_macho_sections(obj: &Macho64Object) -> MergedLayout {
@@ -1136,6 +1236,9 @@ pub fn link_macho_single_object(data: &[u8], origin: Option<&Path>) -> Result<Li
         .ok_or_else(|| format!("unsupported Mach-O cputype {}", obj.header.cputype))?;
 
     let mut layout = merge_macho_sections(&obj);
+    if arch == TargetArch::AArch64 {
+        reserve_unwind_section(&mut layout, macho_unwind::entry_count(&obj));
+    }
     let symbol_addrs = resolve_macho_symbols(&obj, &layout);
     let debug_map = origin
         .filter(|path| std::fs::read(path).is_ok_and(|bytes| bytes == data))
@@ -1143,6 +1246,22 @@ pub fn link_macho_single_object(data: &[u8], origin: Option<&Path>) -> Result<Li
         .into_iter()
         .collect();
     let symbol_addr_by_idx = symbol_addr_by_index(&obj, &layout, &symbol_addrs);
+    if layout.section_by_name.contains_key(UNWIND_SECTION) {
+        let entries = macho_unwind::collect_entries(
+            &obj,
+            &section_vaddrs(&obj, &layout),
+            &symbol_addr_by_idx,
+        )?;
+        refuse_exception_tables(&entries)?;
+        // Without a GOT there is no personality slot, and refuse_exception_tables has
+        // already rejected any entry that would need one.
+        fill_unwind_section(
+            &mut layout,
+            &entries,
+            |addr| header_offset(addr + VM_ADDR_BIAS),
+            |name| Err(format!("personality routine {name} has no GOT slot")),
+        )?;
+    }
     let mut rebase_addrs: HashSet<u64> = HashSet::default();
     apply_macho_relocations(
         &obj,
@@ -1221,6 +1340,10 @@ pub fn link_macho_multi_object(
     let arch = TargetArch::from_macho_cputype(objects[0].header.cputype)
         .ok_or_else(|| format!("unsupported Mach-O cputype {}", objects[0].header.cputype))?;
     let e_machine = arch.to_elf_machine();
+    if arch == TargetArch::AArch64 {
+        let count = objects.iter().map(macho_unwind::entry_count).sum();
+        reserve_unwind_section(&mut layout, count);
+    }
 
     let origins = macho_object_origins(datas, &objects, input_paths);
     let mut debug_map: Vec<DebugMapObject> = Vec::new();
@@ -1266,6 +1389,22 @@ pub fn link_macho_multi_object(
                 }
             }
         }
+    }
+
+    // Before the stubs are added: a personality routine must still look undefined here.
+    let mut unwind_entries: Vec<CompactEntry> = Vec::new();
+    if layout.section_by_name.contains_key(UNWIND_SECTION) {
+        for (obj_idx, obj) in objects.iter().enumerate() {
+            let contrib = &section_contribs[obj_idx];
+            let vaddr_by_sect = multi_section_vaddrs(obj, &layout, contrib);
+            let symbol_addrs = symbol_addr_by_index_multi(obj, &layout, &global_symbols, contrib);
+            unwind_entries.extend(macho_unwind::collect_entries(
+                obj,
+                &vaddr_by_sect,
+                &symbol_addrs,
+            )?);
+        }
+        refuse_exception_tables(&unwind_entries)?;
     }
 
     let macho_exports: Vec<MachoExport> = global_symbols
@@ -1568,6 +1707,28 @@ pub fn link_macho_multi_object(
         HashMap::default()
     };
 
+    if !unwind_entries.is_empty() {
+        let offset_of = |addr: u64| {
+            header_offset(runtime_addr_for_layout_addr(
+                &section_ranges,
+                text_shift,
+                addr,
+            ))
+        };
+        let personality_offset = |name: &str| {
+            let slot = got_slot_by_symbol
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("personality routine {name} has no GOT slot"))?;
+            header_offset(runtime_addr_for_layout_addr(
+                &section_ranges,
+                text_shift,
+                slot,
+            ))
+        };
+        fill_unwind_section(&mut layout, &unwind_entries, offset_of, personality_offset)?;
+    }
+
     for (obj_idx, obj) in objects.iter().enumerate() {
         let contrib = &section_contribs[obj_idx];
         let symbol_addrs = symbol_addr_by_index_multi(obj, &layout, &global_symbols, contrib);
@@ -1731,6 +1892,26 @@ fn merged_section_name_for_lookup(segname: &str, sectname: &str) -> String {
     } else {
         sectname.to_string()
     }
+}
+
+/// The layout address of each section of `obj` in the merged layout.
+fn multi_section_vaddrs(
+    obj: &Macho64Object,
+    layout: &MergedLayout,
+    contrib: &HashMap<u8, ObjectSectionContrib>,
+) -> HashMap<u8, u64> {
+    let mut vaddr_by_sect: HashMap<u8, u64> = HashMap::default();
+    for (i, sec) in obj.sections.iter().enumerate() {
+        let sect_idx = (i + 1) as u8;
+        let merged_name = merged_section_name_for_lookup(&sec.segname, &sec.sectname);
+        if let (Some(&idx), Some(off)) = (
+            layout.section_by_name.get(&merged_name),
+            contrib.get(&sect_idx),
+        ) {
+            vaddr_by_sect.insert(sect_idx, layout.sections[idx].vaddr + off.offset_in_merged);
+        }
+    }
+    vaddr_by_sect
 }
 
 fn symbol_addr_by_index_multi(

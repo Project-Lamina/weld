@@ -135,6 +135,54 @@ fn strip_accepts_the_output_and_it_still_runs() {
     assert_eq!(run(dir, "main"), "ok\n");
 }
 
+/// Frame-based and frameless functions both need their compact unwind entries to walk.
+/// The reference is the same objects linked by clang, so the count must match Apple's.
+#[test]
+fn unwind_info_lets_backtrace_walk_frames() {
+    let guard = TempDir::new("weld-macho-unwind-info");
+    let dir = guard.path();
+    fs::write(
+        dir.join("bt_main.c"),
+        "#include <stdio.h>\nint leaf(int x);\nint middle(int x){return leaf(x)+1;}\n\
+         int main(void){printf(\"frames=%d\\n\",leaf(0)+middle(0)*0);return 0;}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("bt_leaf.c"),
+        "#include <execinfo.h>\nstatic int depth(void){void *b[32];return backtrace(b,32);}\n\
+         int leaf(int x){return depth()+x;}\n",
+    )
+    .unwrap();
+    for opt in ["-O0", "-O2"] {
+        for name in ["bt_main", "bt_leaf"] {
+            let status = Command::new("clang")
+                .current_dir(dir)
+                .args([opt, "-c", &format!("{name}.c"), "-o", &format!("{name}.o")])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let reference = Command::new("clang")
+            .current_dir(dir)
+            .args(["bt_main.o", "bt_leaf.o", "-o", "bt_reference"])
+            .status()
+            .unwrap();
+        assert!(reference.success());
+        weld(
+            dir,
+            &["bt_main.o", "bt_leaf.o", "-lSystem", "-o", "bt_weld"],
+        );
+        let expected = run(dir, "bt_reference");
+        assert_eq!(run(dir, "bt_weld"), expected, "{opt}");
+        let frames: usize = expected
+            .trim()
+            .strip_prefix("frames=")
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        assert!(frames >= 3, "{opt}: {expected}");
+    }
+}
+
 #[test]
 fn cpp_exceptions_are_refused_by_name() {
     let guard = TempDir::new("weld-macho-eh");
