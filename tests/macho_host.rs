@@ -173,3 +173,30 @@ fn filelist_names_the_inputs() {
     weld(dir, &["-filelist", "inputs", "-lSystem", "-o", "main"]);
     assert_eq!(run(dir, "main"), "listed\n");
 }
+
+#[test]
+fn links_in_process_through_the_library() {
+    let guard = TempDir::new("weld-macho-lib");
+    let dir = guard.path();
+    compile(
+        dir,
+        "main",
+        "#include <stdio.h>\nint main(void){puts(\"in process\");return 0;}\n",
+    );
+    let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let args = [path("main.o"), "-lSystem".into(), "-o".into(), path("main")];
+    weld::link(&args).unwrap();
+    assert_eq!(run(dir, "main"), "in process\n");
+    let missing = [
+        path("main.o"),
+        "-lSystem".into(),
+        "-e".into(),
+        "nope".into(),
+        "-o".into(),
+        path("bad"),
+    ];
+    assert_eq!(
+        weld::link(&missing),
+        Err("entry symbol nope is not defined".to_string())
+    );
+}
