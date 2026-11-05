@@ -557,7 +557,10 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
     } else {
         Some(args.libraries.as_slice())
     };
-    let result = link_macho_multi_object(&obj_refs, libs, &dylib_paths, &args.input_files).ok()?;
+    let result = match link_macho_multi_object(&obj_refs, libs, &dylib_paths, &args.input_files) {
+        Ok(result) => result,
+        Err(error) => return fail(error),
+    };
     let arch = TargetArch::from_elf_machine(result.e_machine)?;
     let entry = if args.dylib {
         0

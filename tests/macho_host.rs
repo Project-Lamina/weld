@@ -183,8 +183,78 @@ fn unwind_info_lets_backtrace_walk_frames() {
     }
 }
 
+const CXX_LIB: &str = r#"#include <stdio.h>
+#include <stdexcept>
+#include <string>
+#include <vector>
+struct Guard {
+    std::string name;
+    explicit Guard(const char *n) : name(n) { printf("enter %s\n", name.c_str()); }
+    ~Guard() { printf("leave %s\n", name.c_str()); }
+};
+int deepest(int n) {
+    Guard g("deepest");
+    std::vector<int> v(n, 1);
+    if (n > 2) throw std::runtime_error("too deep");
+    return static_cast<int>(v.size());
+}
+int middle(int n) {
+    Guard g("middle");
+    std::string msg = "middle work";
+    return deepest(n) + static_cast<int>(msg.size());
+}
+"#;
+
+const CXX_MAIN: &str = r#"#include <stdio.h>
+#include <stdexcept>
+int middle(int n);
+int rethrow_once(int n) {
+    try { return middle(n); }
+    catch (const std::logic_error &) { printf("logic\n"); return -1; }
+    catch (...) { printf("rethrowing\n"); throw; }
+}
+int main() {
+    try { printf("ok %d\n", middle(1)); } catch (const std::exception &e) { printf("caught1 %s\n", e.what()); }
+    try { printf("ok %d\n", rethrow_once(5)); } catch (const std::runtime_error &e) { printf("caught2 %s\n", e.what()); }
+    try { throw 42; } catch (int v) { printf("int %d\n", v); }
+    return 0;
+}
+"#;
+
+/// Exceptions thrown two frames down, with destructors running in the frames they unwind
+/// through, rethrown by `catch (...)`, and caught by type and by `int`. The expected output
+/// is what the same objects print when Apple's linker builds them.
 #[test]
-fn cpp_exceptions_are_refused_by_name() {
+fn cpp_exceptions_unwind_across_frames() {
+    let guard = TempDir::new("weld-macho-eh-unwind");
+    let dir = guard.path();
+    fs::write(dir.join("lib.cpp"), CXX_LIB).unwrap();
+    fs::write(dir.join("main.cpp"), CXX_MAIN).unwrap();
+    let expected = "enter middle\nenter deepest\nleave deepest\nleave middle\nok 12\n\
+                    enter middle\nenter deepest\nleave deepest\nleave middle\nrethrowing\n\
+                    caught2 too deep\nint 42\n";
+    for opt in ["-O0", "-O2"] {
+        for name in ["lib", "main"] {
+            let status = Command::new("clang++")
+                .current_dir(dir)
+                .args([
+                    opt,
+                    "-c",
+                    &format!("{name}.cpp"),
+                    "-o",
+                    &format!("{name}.o"),
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        weld(dir, &["main.o", "lib.o", "-lc++", "-lSystem", "-o", "main"]);
+        assert_eq!(run(dir, "main"), expected, "{opt}");
+    }
+}
+
+#[test]
+fn cpp_exceptions_without_a_library_are_refused_by_name() {
     let guard = TempDir::new("weld-macho-eh");
     let dir = guard.path();
     fs::write(
@@ -200,7 +270,7 @@ fn cpp_exceptions_are_refused_by_name() {
     assert!(status.success());
     let output = Command::new(env!("CARGO_BIN_EXE_weld"))
         .current_dir(dir)
-        .args(["main.o", "-lc++", "-lSystem", "-o", "main"])
+        .args(["main.o", "-o", "main"])
         .output()
         .unwrap();
     assert!(!output.status.success());

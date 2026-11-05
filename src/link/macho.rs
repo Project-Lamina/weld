@@ -279,22 +279,6 @@ fn header_offset(runtime: u64) -> Result<u32, String> {
         .ok_or_else(|| format!("address 0x{runtime:x} is outside the __TEXT offset range"))
 }
 
-/// Stage gate: personality routines and LSDAs are not linked yet. Refusing here keeps
-/// C++ exception tables from linking into a binary whose unwinder cannot find them.
-fn refuse_exception_tables(entries: &[CompactEntry]) -> Result<(), String> {
-    if entries
-        .iter()
-        .any(|e| e.personality.is_some() || e.lsda.is_some())
-    {
-        return Err(
-            "C++ exception tables are not supported on Mach-O yet (personality routines and LSDAs); \
-             build with -fno-exceptions or link with ld"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
 fn merge_macho_sections(obj: &Macho64Object) -> MergedLayout {
     let mut to_merge: Vec<&MachoSection> = obj
         .sections
@@ -1274,14 +1258,17 @@ pub fn link_macho_single_object(data: &[u8], origin: Option<&Path>) -> Result<Li
             &section_vaddrs(&obj, &layout),
             &symbol_addr_by_idx,
         )?;
-        refuse_exception_tables(&entries)?;
-        // Without a GOT there is no personality slot, and refuse_exception_tables has
-        // already rejected any entry that would need one.
+        // A single-object link has no GOT, so an entry with a personality routine cannot
+        // name the slot the unwinder reads. Link the object with a library to get one.
         fill_unwind_section(
             &mut layout,
             &entries,
             |addr| header_offset(addr + VM_ADDR_BIAS),
-            |name| Err(format!("personality routine {name} has no GOT slot")),
+            |name| {
+                Err(format!(
+                    "C++ exception tables need a GOT slot for personality routine {name}, which a single-object link does not have; link with -lc++ or another library"
+                ))
+            },
         )?;
     }
     let mut rebase_addrs: HashSet<u64> = HashSet::default();
@@ -1426,7 +1413,6 @@ pub fn link_macho_multi_object(
                 &symbol_addrs,
             )?);
         }
-        refuse_exception_tables(&unwind_entries)?;
     }
 
     let macho_exports: Vec<MachoExport> = global_symbols
