@@ -253,6 +253,63 @@ fn cpp_exceptions_unwind_across_frames() {
     }
 }
 
+/// A throw that leaves a dylib built by weld, through its unwind table, into the program.
+#[test]
+fn cpp_exceptions_cross_a_dylib_from_weld() {
+    let guard = TempDir::new("weld-macho-eh-dylib");
+    let dir = guard.path();
+    fs::write(
+        dir.join("lib.cpp"),
+        "#include <stdio.h>\n#include <stdexcept>\n\
+         struct G { int id; explicit G(int i) : id(i) {} ~G() { printf(\"dtor %d\\n\", id); } };\n\
+         __attribute__((noinline)) void thrower() { G g(1); throw std::runtime_error(\"from dylib\"); }\n\
+         extern \"C\" void throw_through_dylib() { G g(2); thrower(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("main.cpp"),
+        "#include <stdio.h>\n#include <stdexcept>\nextern \"C\" void throw_through_dylib();\n\
+         int main() { try { throw_through_dylib(); } catch (const std::exception &e) { printf(\"caught %s\\n\", e.what()); } return 0; }\n",
+    )
+    .unwrap();
+    for name in ["lib", "main"] {
+        let status = Command::new("clang++")
+            .current_dir(dir)
+            .args(["-c", &format!("{name}.cpp"), "-o", &format!("{name}.o")])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    weld(
+        dir,
+        &[
+            "lib.o",
+            "-dylib",
+            "-install_name",
+            "@rpath/libeh.dylib",
+            "-lc++",
+            "-lSystem",
+            "-o",
+            "libeh.dylib",
+        ],
+    );
+    weld(
+        dir,
+        &[
+            "main.o",
+            "-L.",
+            "-leh",
+            "-lc++",
+            "-lSystem",
+            "-rpath",
+            "@executable_path",
+            "-o",
+            "main",
+        ],
+    );
+    assert_eq!(run(dir, "main"), "dtor 1\ndtor 2\ncaught from dylib\n");
+}
+
 #[test]
 fn cpp_exceptions_without_a_library_are_refused_by_name() {
     let guard = TempDir::new("weld-macho-eh");
