@@ -173,3 +173,54 @@ fn filelist_names_the_inputs() {
     weld(dir, &["-filelist", "inputs", "-lSystem", "-o", "main"]);
     assert_eq!(run(dir, "main"), "listed\n");
 }
+
+#[test]
+fn archive_written_by_weld_links_with_ld64_and_weld() {
+    let guard = TempDir::new("weld-macho-archive");
+    let dir = guard.path();
+    compile(dir, "alpha", "int alpha(void){return 1;}\n");
+    compile(
+        dir,
+        "a_member_with_a_long_name",
+        "__attribute__((visibility(\"hidden\"))) int hidden(void){return 40;}\n\
+         int gamma(void){return hidden();}\n",
+    );
+    compile(
+        dir,
+        "main",
+        "#include <stdio.h>\nint alpha(void);int gamma(void);\n\
+         int main(void){printf(\"%d %d\\n\",alpha(),gamma());return 0;}\n",
+    );
+    weld(
+        dir,
+        &[
+            "--archive",
+            "alpha.o",
+            "a_member_with_a_long_name.o",
+            "-o",
+            "libparts.a",
+        ],
+    );
+    let map = Command::new("nm")
+        .current_dir(dir)
+        .args(["--print-armap", "libparts.a"])
+        .output()
+        .unwrap();
+    let map = String::from_utf8_lossy(&map.stdout);
+    for line in [
+        "_alpha in alpha.o",
+        "_gamma in a_member_with_a_long_name.o",
+        "_hidden in a_member_with_a_long_name.o",
+    ] {
+        assert!(map.contains(line), "{map}");
+    }
+    let status = Command::new("clang")
+        .current_dir(dir)
+        .args(["main.o", "-L.", "-lparts", "-o", "by_ld64"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(run(dir, "by_ld64"), "1 40\n");
+    weld(dir, &["main.o", "libparts.a", "-lSystem", "-o", "by_weld"]);
+    assert_eq!(run(dir, "by_weld"), "1 40\n");
+}
