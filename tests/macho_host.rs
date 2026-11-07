@@ -350,6 +350,33 @@ fn filelist_names_the_inputs() {
 }
 
 #[test]
+fn links_in_process_through_the_library() {
+    let guard = TempDir::new("weld-macho-lib");
+    let dir = guard.path();
+    compile(
+        dir,
+        "main",
+        "#include <stdio.h>\nint main(void){puts(\"in process\");return 0;}\n",
+    );
+    let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let args = [path("main.o"), "-lSystem".into(), "-o".into(), path("main")];
+    weld::link(&args).unwrap();
+    assert_eq!(run(dir, "main"), "in process\n");
+    let missing = [
+        path("main.o"),
+        "-lSystem".into(),
+        "-e".into(),
+        "nope".into(),
+        "-o".into(),
+        path("bad"),
+    ];
+    assert_eq!(
+        weld::link(&missing),
+        Err("entry symbol nope is not defined".to_string())
+    );
+}
+
+#[test]
 fn strong_definition_overrides_weak() {
     let guard = TempDir::new("weld-macho-weak");
     let dir = guard.path();
@@ -404,7 +431,7 @@ fn weld_dylib(dir: &Path) {
 
 #[test]
 fn dylib_from_weld_is_named_signed_and_linked_against() {
-    let guard = TempDir::new("weld-macho-dylib");
+    let guard = TempDir::new("weld-macho-dyl
     let dir = guard.path();
     weld_dylib(dir);
 
@@ -414,9 +441,9 @@ fn dylib_from_weld_is_named_signed_and_linked_against() {
         .output()
         .unwrap();
     let load = String::from_utf8_lossy(&load.stdout);
-    assert!(load.contains("cmd LC_ID_DYLIB"), "{load}");
+    assert!(load.contains("cmd LC_ID_DYLIB")
     assert!(load.contains("name @rpath/libhelper.dylib"), "{load}");
-    assert!(!load.contains("LC_MAIN"), "{load}");
+    assert!(!load.contains("LC_MAIN"), "{loa
     let header = Command::new("otool")
         .current_dir(dir)
         .args(["-hv", "libhelper.dylib"])
@@ -438,7 +465,7 @@ fn dylib_from_weld_is_named_signed_and_linked_against() {
         dir,
         "main",
         "#include <stdio.h>\nint helper(void);\nextern int other;\n\
-         int main(void){printf(\"%d %d\\n\",helper(),other);return 0;}\n",
+         int main(void){printf(\"%d %d\\n\",,
     );
     weld(
         dir,
@@ -458,7 +485,7 @@ fn dylib_from_weld_is_named_signed_and_linked_against() {
 
 #[test]
 fn dylib_from_weld_opens_with_dlopen() {
-    let guard = TempDir::new("weld-macho-dlopen");
+    let guard = TempDir::new("weld-macho-dlo
     let dir = guard.path();
     weld_dylib(dir);
     fs::write(
@@ -466,11 +493,11 @@ fn dylib_from_weld_opens_with_dlopen() {
         r#"#include <dlfcn.h>
 #include <stdio.h>
 int main(void) {
-    void *h = dlopen("./libhelper.dylib", RTLD_NOW);
+    void *h = dlopen("./libhelper.dylib", RT
     if (!h) { printf("%s\n", dlerror()); return 1; }
-    int (*helper)(void) = (int (*)(void))dlsym(h, "helper");
+    int (*helper)(void) = (int (*)(void))dls
     int *other = (int *)dlsym(h, "other");
-    if (!helper || !other) { printf("missing symbol\n"); return 1; }
+    if (!helper || !other) { printf("missing
     printf("%d %d\n", helper(), *other);
     return 0;
 }
@@ -490,7 +517,7 @@ int main(void) {
     assert!(
         output.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&output.stdo
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "7 5\n");
+    assert_eq!(String::from_utf8_lossy(&outp
 }

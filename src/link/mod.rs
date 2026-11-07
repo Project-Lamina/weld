@@ -176,17 +176,6 @@ fn requested_interpreter(opts: &LinkOptions) -> Result<Option<String>, String> {
     }
 }
 
-/// Links ELF64 objects with `LinkOptions::default()`. `libs` names the libraries to
-/// resolve. Unless `static_link` is set, an x86_64 link that names a shared library
-/// (or `c` / `System`) gets PLT and GOT entries for its undefined symbols.
-pub fn link_multi_object_with_options(
-    objects: &[&[u8]],
-    libs: Option<&[String]>,
-    opts: &LinkOptions,
-) -> Result<LinkResult, String> {
-    link_elf_objects(objects.iter().map(|s| s.to_vec()).collect(), libs, opts)
-}
-
 pub fn link_elf_objects(
     objects: Vec<Vec<u8>>,
     libs: Option<&[String]>,
@@ -1315,9 +1304,8 @@ mod tests {
         let _ = std::fs::remove_file(&tmp1);
         let _ = std::fs::remove_file(&tmp2);
 
-        let objects: Vec<&[u8]> = vec![&d1, &d2];
-        let result = link_multi_object_with_options(&objects, None, &LinkOptions::default())
-            .expect("link_multi_object");
+        let result = link_elf_objects(vec![d1, d2], None, &LinkOptions::default())
+            .expect("link_elf_objects");
         assert!(!result.layout.sections.is_empty());
         assert!(result.layout.section_by_name.contains_key(".text"));
         assert!(result.symbol_addrs.contains_key("main"));
