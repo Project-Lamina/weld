@@ -10,6 +10,7 @@ mod aarch64;
 mod dynamic;
 mod gc;
 pub mod macho;
+mod macho_unwind;
 mod merge;
 mod notes;
 mod pie;
@@ -97,6 +98,17 @@ pub struct LinkResult {
     pub dynamic: Option<DynamicLinkInfo>,
     /// Mach-O only, and only when the objects carried DWARF. Empty everywhere else.
     pub debug_map: Vec<DebugMapObject>,
+    /// Mach-O only: the global symbols the inputs define, at their layout addresses.
+    /// Imports are not here. Empty everywhere else.
+    pub macho_exports: Vec<MachoExport>,
+}
+
+/// A global symbol a Mach-O image defines, for the export trie of a dylib.
+#[derive(Debug, Clone)]
+pub struct MachoExport {
+    pub name: String,
+    pub address: u64,
+    pub weak: bool,
 }
 
 /// One function in the debug map, at its address in the linked image.
@@ -967,6 +979,7 @@ fn link_multi_object_parsed(
         symbol_addrs: global_symbols,
         dynamic: dynamic_info,
         debug_map: Vec::new(),
+        macho_exports: Vec::new(),
     })
 }
 
