@@ -196,6 +196,7 @@ const IMAGE_REL_AMD64_REL32: u16 = 0x0004;
 /// Type indicators from the Microsoft PE/COFF specification, "COFF Relocations", ARM64
 /// processors. `IMAGE_REL_ARM64_ADDR64` is genuinely `0x000E` on this machine type.
 const IMAGE_REL_ARM64_ADDR32: u16 = 0x0001;
+const IMAGE_REL_ARM64_ADDR32NB: u16 = 0x0002;
 const IMAGE_REL_ARM64_BRANCH26: u16 = 0x0003;
 const IMAGE_REL_ARM64_PAGEBASE_REL21: u16 = 0x0004;
 const IMAGE_REL_ARM64_PAGEOFFSET_12A: u16 = 0x0006;
@@ -1840,7 +1841,7 @@ fn arm64_import_thunk(iat_va: u64, thunk_va: u64, name: &str) -> Result<[u32; 3]
 fn arm64_reloc_name(rel_type: u16) -> &'static str {
     match rel_type {
         IMAGE_REL_ARM64_ADDR32 => "IMAGE_REL_ARM64_ADDR32",
-        0x0002 => "IMAGE_REL_ARM64_ADDR32NB",
+        IMAGE_REL_ARM64_ADDR32NB => "IMAGE_REL_ARM64_ADDR32NB",
         IMAGE_REL_ARM64_BRANCH26 => "IMAGE_REL_ARM64_BRANCH26",
         IMAGE_REL_ARM64_PAGEBASE_REL21 => "IMAGE_REL_ARM64_PAGEBASE_REL21",
         0x0005 => "IMAGE_REL_ARM64_REL21",
@@ -2736,6 +2737,21 @@ pub fn link_and_emit_pe_from_coffs(
                         if image_addr {
                             base_relocs.push((site_rva, IMAGE_REL_BASED_DIR64));
                         }
+                    }
+                    IMAGE_REL_ARM64_ADDR32NB => {
+                        let (target, _) = resolve(object, sym_idx as usize, false, &sec.name)?;
+                        write_rva(&mut blob[at..at + 4], target + addend, &sec.name)?;
+                    }
+                    IMAGE_REL_ARM64_ADDR32 if is_exception_table(&sec.name) => {
+                        // Every field of a RUNTIME_FUNCTION is an image-relative address, so
+                        // an absolute 32-bit one would name nothing the unwinder can use. An
+                        // assembler without ADDR32NB is taken at its intent here.
+                        log::debug!(
+                            "reading ADDR32 at {site_rva:#x} in {} as image-relative",
+                            sec.name
+                        );
+                        let (target, _) = resolve(object, sym_idx as usize, false, &sec.name)?;
+                        write_rva(&mut blob[at..at + 4], target + addend, &sec.name)?;
                     }
                     IMAGE_REL_ARM64_ADDR32 => {
                         return Err(coff_error(format!(
@@ -4457,6 +4473,7 @@ mod tests {
     #[test]
     fn test_arm64_relocation_types_are_the_values_the_pe_spec_gives_them() {
         assert_eq!(IMAGE_REL_ARM64_ADDR32, 0x0001);
+        assert_eq!(IMAGE_REL_ARM64_ADDR32NB, 0x0002);
         assert_eq!(IMAGE_REL_ARM64_BRANCH26, 0x0003);
         assert_eq!(IMAGE_REL_ARM64_PAGEBASE_REL21, 0x0004);
         assert_eq!(IMAGE_REL_ARM64_PAGEOFFSET_12A, 0x0006);
@@ -4663,6 +4680,44 @@ mod tests {
         link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
         let (reloc_rva, reloc_size) = pe_base_reloc_dir(&out);
         assert!(reloc_rva != 0 && reloc_size >= 12);
+    }
+
+    #[test]
+    fn test_arm64_image_relative_pointer_holds_an_rva() {
+        let obj = arm64_object(
+            &[
+                TestSection {
+                    name: ".text",
+                    flags: TEXT_FLAGS,
+                    data: &words(&[ARM64_RET]),
+                    relocs: &[],
+                    selection: 0,
+                    assoc: 0,
+                },
+                TestSection {
+                    name: ".data",
+                    flags: IMAGE_SCN_CNT_INITIALIZED_DATA
+                        | IMAGE_SCN_MEM_READ
+                        | IMAGE_SCN_MEM_WRITE,
+                    data: &[0u8; 4],
+                    relocs: &[(0, 4, IMAGE_REL_ARM64_ADDR32NB)],
+                    selection: 0,
+                    assoc: 0,
+                },
+            ],
+            &[("main", 1, IMAGE_SYM_CLASS_EXTERNAL, 0)],
+        );
+        let mut out = Vec::new();
+        link_and_emit_pe_from_coffs(&[obj.as_slice()], None, &mut out).expect("links");
+        let sections = pe_section_table(&out);
+        let text = pe_section(&sections, ".text");
+        let data = pe_section(&sections, ".data");
+        let at = data.raw as usize;
+        let stored = u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+        assert_eq!(stored, text.rva, "image relative, not an absolute address");
+        // An RVA needs no fixup when the loader moves the image.
+        let (reloc_rva, _) = pe_base_reloc_dir(&out);
+        assert_eq!(reloc_rva, 0);
     }
 
     #[test]
