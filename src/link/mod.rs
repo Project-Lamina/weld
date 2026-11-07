@@ -10,6 +10,7 @@ mod aarch64;
 mod dynamic;
 mod gc;
 pub mod macho;
+mod macho_unwind;
 mod merge;
 mod notes;
 mod pie;
@@ -97,6 +98,17 @@ pub struct LinkResult {
     pub dynamic: Option<DynamicLinkInfo>,
     /// Mach-O only, and only when the objects carried DWARF. Empty everywhere else.
     pub debug_map: Vec<DebugMapObject>,
+    /// Mach-O only: the global symbols the inputs define, at their layout addresses.
+    /// Imports are not here. Empty everywhere else.
+    pub macho_exports: Vec<MachoExport>,
+}
+
+/// A global symbol a Mach-O image defines, for the export trie of a dylib.
+#[derive(Debug, Clone)]
+pub struct MachoExport {
+    pub name: String,
+    pub address: u64,
+    pub weak: bool,
 }
 
 /// One function in the debug map, at its address in the linked image.
@@ -162,17 +174,6 @@ fn requested_interpreter(opts: &LinkOptions) -> Result<Option<String>, String> {
             "no default dynamic linker is known for --target {os}; pass --dynamic-linker"
         )),
     }
-}
-
-/// Links ELF64 objects with `LinkOptions::default()`. `libs` names the libraries to
-/// resolve. Unless `static_link` is set, an x86_64 link that names a shared library
-/// (or `c` / `System`) gets PLT and GOT entries for its undefined symbols.
-pub fn link_multi_object_with_options(
-    objects: &[&[u8]],
-    libs: Option<&[String]>,
-    opts: &LinkOptions,
-) -> Result<LinkResult, String> {
-    link_elf_objects(objects.iter().map(|s| s.to_vec()).collect(), libs, opts)
 }
 
 pub fn link_elf_objects(
@@ -978,6 +979,7 @@ fn link_multi_object_parsed(
         symbol_addrs: global_symbols,
         dynamic: dynamic_info,
         debug_map: Vec::new(),
+        macho_exports: Vec::new(),
     })
 }
 
@@ -1302,9 +1304,8 @@ mod tests {
         let _ = std::fs::remove_file(&tmp1);
         let _ = std::fs::remove_file(&tmp2);
 
-        let objects: Vec<&[u8]> = vec![&d1, &d2];
-        let result = link_multi_object_with_options(&objects, None, &LinkOptions::default())
-            .expect("link_multi_object");
+        let result = link_elf_objects(vec![d1, d2], None, &LinkOptions::default())
+            .expect("link_elf_objects");
         assert!(!result.layout.sections.is_empty());
         assert!(result.layout.section_by_name.contains_key(".text"));
         assert!(result.symbol_addrs.contains_key("main"));

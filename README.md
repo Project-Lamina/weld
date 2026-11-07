@@ -1,18 +1,44 @@
 # weld
-Cross-platform Liner from the Lamina project
 
-`-static` supports freestanding ELF executables and static archives, including
-archive dependency cycles inside `--start-group` / `--end-group`. Static library
-lookup uses `.a` files exclusively. Output uses `ET_EXEC` without an interpreter
-or dynamic symbol tables; `.init_array` and `.fini_array` are preserved for startup
-code to execute.
+Cross-platform linker from the Lamina project
 
-Static glibc linking remains unsupported. Inputs requiring GNU IFUNC resolvers
-fail before output is created; static IFUNC needs resolver stubs and IRELATIVE
-startup relocation tables, which weld does not yet supply. TLS is supported:
-`.tdata` and `.tbss` are laid out under `PT_TLS`, local-exec and initial-exec
-relocations are applied against the thread pointer, and global-dynamic sequences
-relax to local-exec. Local-dynamic TLS and thread-local symbols imported from a
-shared library are rejected with an error. GCC LTO inputs also fail explicitly
-with their input filename. Unresolved strong symbols are link errors;
-unresolved weak symbols remain permitted.
+weld is a library (`lamina-weld`, `[lib] name = "weld"`) and a `weld` binary. The
+binary calls `weld::main`, which runs one link from `std::env::args`.
+
+`cargo install lamina` installs `weld` beside `lamina`, which uses it as the default
+linker. `weld --version` prints `weld 0.2.3` for this release.
+
+Output formats live in `src/emit/`: ELF, PE and Mach-O.
+
+## Static linking
+
+`-static` links freestanding ELF executables and static archives. Archive dependency
+cycles resolve inside `--start-group` / `--end-group`. Without the group, a cycle across
+archives fails with `weld: undefined symbol <name>`.
+
+Static library lookup uses `.a` files only. Output is `ET_EXEC` with no interpreter and
+no dynamic symbol tables. `.init_array`, `.fini_array` and `.preinit_array` are kept for
+startup code to run.
+
+Static glibc linking is not supported. Linking against glibc's static `libc.a` fails with
+`weld: static GNU IFUNC is not supported: <name>`. A static IFUNC needs resolver stubs and
+IRELATIVE startup relocations, which weld does not supply yet. This check runs before the
+output file is created.
+
+## TLS
+
+`.tdata` and `.tbss` are laid out under `PT_TLS`. The local-exec and initial-exec
+relocations are applied against the thread pointer. Global-dynamic sequences are relaxed
+to local-exec.
+
+Local-dynamic TLS is rejected with an error that names the relocation and section, for
+example `weld: local dynamic TLS is not supported (R_X86_64_TLSLD in section .text); use
+-ftls-model=global-dynamic or local-exec`.
+
+## Inputs and symbols
+
+GCC LTO objects are rejected with `weld: GCC LTO is not supported`. The message does not
+name the file.
+
+Unresolved strong symbols are link errors: `weld: undefined symbol <name>`. Unresolved
+weak symbols are allowed.

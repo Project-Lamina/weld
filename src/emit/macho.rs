@@ -7,13 +7,14 @@
 use crate::collections::{BTreeMap, HashMap, HashSet};
 use crate::{
     arch::TargetArch,
-    link::{DebugMapObject, DynamicLinkInfo, MergedLayout, MergedSection},
+    link::{DebugMapObject, DynamicLinkInfo, MachoExport, MergedLayout, MergedSection},
     segment::{align_up_u64, align_up_usize, build_segment_buffer},
 };
 use std::io::{Error, ErrorKind, Result, Write};
 
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
 const MH_EXECUTABLE: u32 = 2;
+const MH_DYLIB: u32 = 6;
 const MH_NOUNDEFS: u32 = 0x1;
 const MH_DYLDLINK: u32 = 0x4;
 const MH_TWOLEVEL: u32 = 0x80;
@@ -26,6 +27,7 @@ const LC_SEGMENT_64: u32 = 0x19;
 const LC_MAIN: u32 = 0x80000028;
 const LC_LOAD_DYLINKER: u32 = 0x0E;
 const LC_LOAD_DYLIB: u32 = 0x0C;
+const LC_ID_DYLIB: u32 = 0x0D;
 const LC_UUID: u32 = 0x1B;
 const LC_DYLD_INFO_ONLY: u32 = 0x80000022;
 const LC_DYLD_EXPORTS_TRIE: u32 = 0x80000033;
@@ -37,6 +39,9 @@ const MACOSX_DEPLOYMENT_TARGET_ENV: &str = "MACOSX_DEPLOYMENT_TARGET";
 const LC_SYMTAB: u32 = 0x2;
 const LC_DYSYMTAB: u32 = 0xb;
 const N_SECT_EXT: u8 = 0x0f;
+const N_WEAK_DEF: u16 = 0x0080;
+/// Export trie flag for a weak definition, from `<mach-o/loader.h>`.
+const EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION: u64 = 0x04;
 /// STABS types from `<mach-o/stab.h>`. `ld64` writes these into the linked image as
 /// the debug map: an `N_OSO` naming each object file and its mtime, then a
 /// `N_BNSYM`/`N_FUN`/`N_FUN`/`N_ENSYM` quartet per function. `dsymutil` reopens each
@@ -483,7 +488,7 @@ struct ExportTrieNode {
     offset: usize,
 }
 
-fn insert_export_symbol(nodes: &mut Vec<ExportRawNode>, name: &str, address: u64) {
+fn insert_export_symbol(nodes: &mut Vec<ExportRawNode>, name: &str, flags: u64, address: u64) {
     let mut idx = 0usize;
     for &ch in name.as_bytes() {
         let next = if let Some(&n) = nodes[idx].children.get(&ch) {
@@ -496,7 +501,7 @@ fn insert_export_symbol(nodes: &mut Vec<ExportRawNode>, name: &str, address: u64
         };
         idx = next;
     }
-    nodes[idx].terminal = Some((0, address));
+    nodes[idx].terminal = Some((flags, address));
 }
 
 fn compress_export_node(
@@ -546,14 +551,15 @@ fn export_node_size(nodes: &[ExportTrieNode], idx: usize) -> usize {
     size
 }
 
-fn build_export_trie(exports: &[(String, u64)]) -> Vec<u8> {
+/// Each export is (name, flags, address), with the address relative to the image base.
+fn build_export_trie(exports: &[(String, u64, u64)]) -> Vec<u8> {
     if exports.is_empty() {
         return vec![0, 0];
     }
 
     let mut raw_nodes = vec![ExportRawNode::default()];
-    for (name, address) in exports {
-        insert_export_symbol(&mut raw_nodes, name, *address);
+    for (name, flags, address) in exports {
+        insert_export_symbol(&mut raw_nodes, name, *flags, *address);
     }
 
     let mut nodes = Vec::new();
@@ -755,6 +761,18 @@ pub fn emit_macho_executable_dynamic(
     )
 }
 
+/// What a dynamic Mach-O image is: a program entered at `entry`, or a dylib that
+/// answers to `install_name` and exports `exports`.
+enum MachoImage<'a> {
+    Executable {
+        entry: u64,
+    },
+    Dylib {
+        install_name: &'a str,
+        exports: &'a [MachoExport],
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn emit_macho_executable_dynamic_with(
     layout: &MergedLayout,
@@ -766,6 +784,59 @@ pub fn emit_macho_executable_dynamic_with(
     debug_map: &[DebugMapObject],
     out: &mut impl Write,
 ) -> Result<()> {
+    emit_macho_image(
+        layout,
+        arch,
+        MachoImage::Executable { entry },
+        dyn_info,
+        rpaths,
+        min_os,
+        debug_map,
+        out,
+    )
+}
+
+/// Write an MH_DYLIB image with an `LC_ID_DYLIB` of `install_name`, exporting the
+/// `exports` (layout addresses, converted to runtime addresses here).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_macho_dylib(
+    layout: &MergedLayout,
+    arch: TargetArch,
+    install_name: &str,
+    exports: &[MachoExport],
+    dyn_info: &DynamicLinkInfo,
+    rpaths: &[String],
+    min_os: u32,
+    debug_map: &[DebugMapObject],
+    out: &mut impl Write,
+) -> Result<()> {
+    emit_macho_image(
+        layout,
+        arch,
+        MachoImage::Dylib {
+            install_name,
+            exports,
+        },
+        dyn_info,
+        rpaths,
+        min_os,
+        debug_map,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_macho_image(
+    layout: &MergedLayout,
+    arch: TargetArch,
+    image: MachoImage<'_>,
+    dyn_info: &DynamicLinkInfo,
+    rpaths: &[String],
+    min_os: u32,
+    debug_map: &[DebugMapObject],
+    out: &mut impl Write,
+) -> Result<()> {
+    let is_dylib = matches!(image, MachoImage::Dylib { .. });
     let text_sections_owned: Vec<MergedSection> = layout
         .sections
         .iter()
@@ -827,7 +898,56 @@ pub fn emit_macho_executable_dynamic_with(
     let got_section = data_sections.iter().find(|s| s.name == "__got");
     let got_offset_in_segment = got_section.map(|s| s.vaddr - data_base).unwrap_or(0);
 
-    const DATA_SEGMENT_INDEX: u32 = 2;
+    // Segment 0 is __PAGEZERO in an executable only, so a dylib's __DATA is segment 1.
+    let data_segment_index: u32 = if is_dylib { 1 } else { 2 };
+    // Each export as (name, runtime address, section number, weak). Runtime addresses
+    // are where the section is mapped: text sits PAGE_SIZE above its layout address,
+    // data at data_vmaddr.
+    let mut export_entries: Vec<(&str, u64, u8, bool)> = Vec::new();
+    if let MachoImage::Dylib { exports, .. } = &image {
+        for export in exports.iter() {
+            let in_section = |s: &&MergedSection| {
+                export.address >= s.vaddr && export.address < s.vaddr + s.data.len() as u64
+            };
+            let entry = if let Some(i) = text_sections.iter().position(in_section) {
+                (export.address + PAGE_SIZE as u64, i + 1)
+            } else if let Some(i) = data_sections.iter().position(in_section) {
+                (
+                    data_vmaddr + (export.address - data_base),
+                    text_sections.len() + i + 1,
+                )
+            } else {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "export {} at {:#x} is in no section",
+                        export.name, export.address
+                    ),
+                ));
+            };
+            export_entries.push((export.name.as_str(), entry.0, entry.1 as u8, export.weak));
+        }
+    }
+    let export_trie = if is_dylib {
+        let mut trie_exports: Vec<(String, u64, u64)> = Vec::with_capacity(export_entries.len());
+        for (name, runtime, _, weak) in &export_entries {
+            let flags = if *weak {
+                EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
+            } else {
+                0
+            };
+            let offset = runtime.checked_sub(text_vmaddr).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("export {name} lies below the __TEXT segment"),
+                )
+            })?;
+            trie_exports.push((name.to_string(), flags, offset));
+        }
+        build_export_trie(&trie_exports)
+    } else {
+        Vec::new()
+    };
     let mut rebase_offsets: Vec<u64> = Vec::with_capacity(dyn_info.macho_rebase_addrs.len());
     for &addr in &dyn_info.macho_rebase_addrs {
         match addr.checked_sub(data_base) {
@@ -861,11 +981,11 @@ pub fn emit_macho_executable_dynamic_with(
     direct_bind_offsets.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     direct_bind_offsets.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3);
 
-    let mut rebase_opcodes = build_rebase_opcodes(DATA_SEGMENT_INDEX, &rebase_offsets);
+    let mut rebase_opcodes = build_rebase_opcodes(data_segment_index, &rebase_offsets);
     let mut bind_opcodes = build_bind_opcodes(
         &dyn_info.plt_symbols,
         &dyn_info.weak_plt_symbols,
-        DATA_SEGMENT_INDEX,
+        data_segment_index,
         got_offset_in_segment,
         &direct_bind_offsets,
     );
@@ -890,10 +1010,12 @@ pub fn emit_macho_executable_dynamic_with(
     lc_pagezero[4..8].copy_from_slice(&72u32.to_le_bytes());
     lc_pagezero[8..24].copy_from_slice(&pad_segname("__PAGEZERO"));
     lc_pagezero[24..32].copy_from_slice(&0u64.to_le_bytes());
-    lc_pagezero[32..40].copy_from_slice(&text_vmaddr.to_le_bytes());
-    lc_buf.extend_from_slice(&lc_pagezero);
-    total_cmds += 1;
-    sizeofcmds += 72;
+    if !is_dylib {
+        lc_pagezero[32..40].copy_from_slice(&text_vmaddr.to_le_bytes());
+        lc_buf.extend_from_slice(&lc_pagezero);
+        total_cmds += 1;
+        sizeofcmds += 72;
+    }
 
     const SECT64_SIZE: usize = 80;
     let text_seg_size = 72 + SECT64_SIZE * text_sections.len();
@@ -949,7 +1071,14 @@ pub fn emit_macho_executable_dynamic_with(
     let dyld_info_off = linkedit_file_off as usize;
     let bind_off = align_up_usize(dyld_info_off + rebase_opcodes.len(), 8);
     let bind_pad_len = bind_off.saturating_sub(dyld_info_off + rebase_opcodes.len());
-    let dyld_info_size = rebase_opcodes.len() + bind_pad_len + bind_opcodes.len();
+    let bind_end = bind_off + bind_opcodes.len();
+    let export_off = align_up_usize(bind_end, 8);
+    let export_pad_len = export_off - bind_end;
+    let dyld_info_size = rebase_opcodes.len()
+        + bind_pad_len
+        + bind_opcodes.len()
+        + export_pad_len
+        + export_trie.len();
 
     let write_nlist =
         |buf: &mut Vec<u8>, strx: u32, n_type: u8, sect: u8, desc: u16, value: u64| {
@@ -959,7 +1088,11 @@ pub fn emit_macho_executable_dynamic_with(
             buf.extend_from_slice(&desc.to_le_bytes());
             buf.extend_from_slice(&value.to_le_bytes());
         };
-    let mut strtab_bytes = b"\0__mh_execute_header\0_main\0".to_vec();
+    let mut strtab_bytes = if is_dylib {
+        b"\0__mh_dylib_header\0".to_vec()
+    } else {
+        b"\0__mh_execute_header\0_main\0".to_vec()
+    };
     let mut stab_bytes = Vec::new();
     for object in debug_map {
         let Some(path) = object.path.to_str() else {
@@ -988,15 +1121,31 @@ pub fn emit_macho_executable_dynamic_with(
     let mut symtab_bytes = stab_bytes;
     symtab_bytes.reserve(32);
     write_nlist(&mut symtab_bytes, 1, N_SECT_EXT, 1, 0, text_vmaddr);
-    write_nlist(
-        &mut symtab_bytes,
-        21,
-        N_SECT_EXT,
-        1,
-        0,
-        entry + PAGE_SIZE as u64,
-    );
-    let nsyms = stab_count + 2;
+    // Externally defined symbols: the header, then `_main` or the dylib exports.
+    let defined_count = match &image {
+        MachoImage::Executable { entry } => {
+            write_nlist(
+                &mut symtab_bytes,
+                21,
+                N_SECT_EXT,
+                1,
+                0,
+                *entry + PAGE_SIZE as u64,
+            );
+            2
+        }
+        MachoImage::Dylib { .. } => {
+            for (name, runtime, sect, weak) in &export_entries {
+                let strx = strtab_bytes.len() as u32;
+                strtab_bytes.extend_from_slice(name.as_bytes());
+                strtab_bytes.push(0);
+                let desc = if *weak { N_WEAK_DEF } else { 0 };
+                write_nlist(&mut symtab_bytes, strx, N_SECT_EXT, *sect, desc, *runtime);
+            }
+            1 + export_entries.len() as u32
+        }
+    };
+    let nsyms = stab_count + defined_count;
 
     let symoff_unaligned = linkedit_file_off as usize + dyld_info_size;
     let symoff = align_up_usize(symoff_unaligned, 8) as u32;
@@ -1092,24 +1241,54 @@ pub fn emit_macho_executable_dynamic_with(
     lc_dysymtab[8..12].copy_from_slice(&0u32.to_le_bytes());
     lc_dysymtab[12..16].copy_from_slice(&stab_count.to_le_bytes());
     lc_dysymtab[16..20].copy_from_slice(&stab_count.to_le_bytes());
-    lc_dysymtab[20..24].copy_from_slice(&2u32.to_le_bytes());
+    lc_dysymtab[20..24].copy_from_slice(&defined_count.to_le_bytes());
     lc_dysymtab[24..28].copy_from_slice(&nsyms.to_le_bytes());
     lc_dysymtab[28..32].copy_from_slice(&0u32.to_le_bytes());
     lc_buf.extend_from_slice(&lc_dysymtab);
     total_cmds += 1;
     sizeofcmds += 80;
 
-    let dyld_path = "/usr/lib/dyld\0";
-    let dyld_len = dyld_path.len();
-    let dyld_cmd_size = align_up_usize(12 + dyld_len, 8);
-    let mut lc_dyld = vec![0u8; dyld_cmd_size];
-    lc_dyld[0..4].copy_from_slice(&LC_LOAD_DYLINKER.to_le_bytes());
-    lc_dyld[4..8].copy_from_slice(&(dyld_cmd_size as u32).to_le_bytes());
-    lc_dyld[8..12].copy_from_slice(&12u32.to_le_bytes());
-    lc_dyld[12..12 + dyld_len - 1].copy_from_slice(&dyld_path.as_bytes()[..dyld_len - 1]);
-    lc_buf.extend_from_slice(&lc_dyld);
-    total_cmds += 1;
-    sizeofcmds += dyld_cmd_size as u32;
+    match &image {
+        MachoImage::Executable { entry } => {
+            let dyld_path = "/usr/lib/dyld\0";
+            let dyld_len = dyld_path.len();
+            let dyld_cmd_size = align_up_usize(12 + dyld_len, 8);
+            let mut lc_dyld = vec![0u8; dyld_cmd_size];
+            lc_dyld[0..4].copy_from_slice(&LC_LOAD_DYLINKER.to_le_bytes());
+            lc_dyld[4..8].copy_from_slice(&(dyld_cmd_size as u32).to_le_bytes());
+            lc_dyld[8..12].copy_from_slice(&12u32.to_le_bytes());
+            lc_dyld[12..12 + dyld_len - 1].copy_from_slice(&dyld_path.as_bytes()[..dyld_len - 1]);
+            lc_buf.extend_from_slice(&lc_dyld);
+            total_cmds += 1;
+            sizeofcmds += dyld_cmd_size as u32;
+
+            let entry_offset = (*entry + PAGE_SIZE as u64).saturating_sub(text_vmaddr);
+            let mut lc_main = vec![0u8; 24];
+            lc_main[0..4].copy_from_slice(&LC_MAIN.to_le_bytes());
+            lc_main[4..8].copy_from_slice(&24u32.to_le_bytes());
+            lc_main[8..16].copy_from_slice(&entry_offset.to_le_bytes());
+            lc_main[16..24].copy_from_slice(&0u64.to_le_bytes());
+            lc_buf.extend_from_slice(&lc_main);
+            total_cmds += 1;
+            sizeofcmds += 24;
+        }
+        MachoImage::Dylib { install_name, .. } => {
+            let mut name_bytes = install_name.as_bytes().to_vec();
+            name_bytes.push(0);
+            let id_cmd_size = align_up_usize(24 + name_bytes.len(), 8);
+            let mut lc_id = vec![0u8; id_cmd_size];
+            lc_id[0..4].copy_from_slice(&LC_ID_DYLIB.to_le_bytes());
+            lc_id[4..8].copy_from_slice(&(id_cmd_size as u32).to_le_bytes());
+            lc_id[8..12].copy_from_slice(&24u32.to_le_bytes());
+            lc_id[12..16].copy_from_slice(&2u32.to_le_bytes());
+            lc_id[16..20].copy_from_slice(&0x10000u32.to_le_bytes());
+            lc_id[20..24].copy_from_slice(&0x10000u32.to_le_bytes());
+            lc_id[24..24 + name_bytes.len()].copy_from_slice(&name_bytes);
+            lc_buf.extend_from_slice(&lc_id);
+            total_cmds += 1;
+            sizeofcmds += id_cmd_size as u32;
+        }
+    }
 
     let mut lc_uuid = [0u8; 24];
     lc_uuid[0..4].copy_from_slice(&LC_UUID.to_le_bytes());
@@ -1135,16 +1314,6 @@ pub fn emit_macho_executable_dynamic_with(
         lc_buf.extend_from_slice(&lc_rpath);
         total_cmds += 1;
     }
-
-    let entry_offset = (entry + PAGE_SIZE as u64).saturating_sub(text_vmaddr);
-    let mut lc_main = vec![0u8; 24];
-    lc_main[0..4].copy_from_slice(&LC_MAIN.to_le_bytes());
-    lc_main[4..8].copy_from_slice(&24u32.to_le_bytes());
-    lc_main[8..16].copy_from_slice(&entry_offset.to_le_bytes());
-    lc_main[16..24].copy_from_slice(&0u64.to_le_bytes());
-    lc_buf.extend_from_slice(&lc_main);
-    total_cmds += 1;
-    sizeofcmds += 24;
 
     if dyn_info.needed.is_empty() {
         let lib_path = "/usr/lib/libSystem.B.dylib\0";
@@ -1196,8 +1365,8 @@ pub fn emit_macho_executable_dynamic_with(
         lc_dyld_info[28..32].copy_from_slice(&0u32.to_le_bytes());
         lc_dyld_info[32..36].copy_from_slice(&0u32.to_le_bytes());
         lc_dyld_info[36..40].copy_from_slice(&0u32.to_le_bytes());
-        lc_dyld_info[40..44].copy_from_slice(&0u32.to_le_bytes());
-        lc_dyld_info[44..48].copy_from_slice(&0u32.to_le_bytes());
+        lc_dyld_info[40..44].copy_from_slice(&(export_off as u32).to_le_bytes());
+        lc_dyld_info[44..48].copy_from_slice(&(export_trie.len() as u32).to_le_bytes());
         lc_buf.extend_from_slice(&lc_dyld_info);
         total_cmds += 1;
         sizeofcmds += 48;
@@ -1207,10 +1376,14 @@ pub fn emit_macho_executable_dynamic_with(
     hdr[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
     hdr[4..8].copy_from_slice(&cputype.to_le_bytes());
     hdr[8..12].copy_from_slice(&arch.to_macho_cpusubtype().to_le_bytes());
-    hdr[12..16].copy_from_slice(&MH_EXECUTABLE.to_le_bytes());
+    let filetype = if is_dylib { MH_DYLIB } else { MH_EXECUTABLE };
+    hdr[12..16].copy_from_slice(&filetype.to_le_bytes());
     hdr[16..20].copy_from_slice(&total_cmds.to_le_bytes());
     hdr[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
-    let mut flags = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE;
+    let mut flags = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL;
+    if !is_dylib {
+        flags |= MH_PIE;
+    }
     if has_thread_vars {
         flags |= MH_HAS_TLV_DESCRIPTORS;
     }
@@ -1243,6 +1416,10 @@ pub fn emit_macho_executable_dynamic_with(
             out.write_all(&vec![0u8; bind_pad_len])?;
         }
         out.write_all(&bind_opcodes)?;
+        if export_pad_len > 0 {
+            out.write_all(&vec![0u8; export_pad_len])?;
+        }
+        out.write_all(&export_trie)?;
     }
     if symtab_pad_len > 0 {
         out.write_all(&vec![0u8; symtab_pad_len])?;

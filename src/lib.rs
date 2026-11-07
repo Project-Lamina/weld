@@ -28,9 +28,9 @@ use crate::{
     cli::{ParseAction, ParsedArgs, parse_args, print_usage},
     link::{
         DynamicLinkInfo, LibraryResolver, LinkOptions, LinkResult, MergedSection,
-        link_multi_object_with_options, macho::link_macho_multi_object,
+        macho::link_macho_multi_object,
     },
-    object::{ObjectFormat, load_objects},
+    object::ObjectFormat,
     platform::TargetPlatform,
 };
 use std::{
@@ -112,10 +112,22 @@ fn ad_hoc_codesign(_path: &Path) -> std::io::Result<()> {
 /// The version of this linker, as `--version` prints it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn fail(message: impl std::fmt::Display) -> Option<i32> {
-    eprintln!("weld: {message}");
-    Some(1)
+/// What a link reports when it fails. The message is what the command line prints
+/// after `weld: `.
+type LinkResultOrMessage = std::result::Result<(), String>;
+
+/// An output file error, named after the file.
+fn output_error(path: &Path, error: impl std::fmt::Display) -> String {
+    format!("{}: {error}", path.display())
 }
+
+/// The machine of a link result, which the link has already checked it can emit.
+fn link_arch(result: &LinkResult) -> std::result::Result<TargetArch, String> {
+    TargetArch::from_elf_machine(result.e_machine)
+        .ok_or_else(|| format!("no output format for ELF machine {}", result.e_machine))
+}
+
+const UNREADABLE_INPUTS: &str = "could not read the input objects";
 
 /// The address of the `-e` symbol, or of the default entry `_start`, `main` or `_main`.
 fn entry_address(args: &ParsedArgs, result: &LinkResult) -> std::result::Result<u64, String> {
@@ -463,7 +475,7 @@ fn try_weld_link_elf(
     args: &ParsedArgs,
     obj_data_list: Vec<Vec<u8>>,
     object_positions: Vec<usize>,
-) -> Option<i32> {
+) -> LinkResultOrMessage {
     let mut timer = timing::PhaseTimer::new();
     let libs = if args.libraries.is_empty() {
         None
@@ -475,29 +487,24 @@ fn try_weld_link_elf(
     let freebsd_abi = os_abi == ELFOSABI_FREEBSD;
     let mut opts = link_options(args);
     opts.object_positions = object_positions;
-    let mut result = link::link_elf_objects(obj_data_list, libs, &opts).ok()?;
+    let mut result = link::link_elf_objects(obj_data_list, libs, &opts)?;
     timer.mark("link ELF objects");
-    let arch = TargetArch::from_elf_machine(result.e_machine)?;
+    let arch = link_arch(&result)?;
     if let Some(emul) = args.emulation.as_deref() {
         match TargetArch::from_emulation(emul) {
             Some(want) if want != arch => {
-                eprintln!("weld: -m {emul} does not match the objects, which are {arch:?}");
-                return None;
+                return Err(format!(
+                    "-m {emul} does not match the objects, which are {arch:?}"
+                ));
             }
-            None => {
-                eprintln!("weld: unknown emulation {emul}");
-                return None;
-            }
+            None => return Err(format!("unknown emulation {emul}")),
             _ => {}
         }
     }
     let entry = if opts.shared {
         0
     } else {
-        match elf_entry(args, &mut result, freebsd_abi) {
-            Ok(entry) => entry,
-            Err(message) => return fail(message),
-        }
+        elf_entry(args, &mut result, freebsd_abi)?
     };
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
     if let Some(path) = args.map_file.as_deref() {
@@ -505,11 +512,11 @@ fn try_weld_link_elf(
         if path == Path::new("-") {
             print!("{map}");
         } else {
-            std::fs::write(path, map).ok()?;
+            std::fs::write(path, map).map_err(|e| output_error(path, e))?;
         }
     }
     let symbols = (!args.strip_all).then_some(result.symbols.as_slice());
-    let out_file = create_output(out_path).ok()?;
+    let out_file = create_output(out_path).map_err(|e| output_error(out_path, e))?;
     let mut out = std::io::BufWriter::new(out_file);
     if let Some(ref dyn_info) = result.dynamic {
         emit::elf::emit_elf_executable_dynamic(
@@ -521,16 +528,15 @@ fn try_weld_link_elf(
             symbols,
             &mut out,
         )
-        .ok()?;
     } else {
         emit::elf::emit_elf_executable(&result.layout, arch, entry, os_abi, symbols, &mut out)
-            .ok()?;
     }
-    out.flush().ok()?;
+    .and_then(|()| out.flush())
+    .map_err(|e| output_error(out_path, e))?;
     timer.mark("emit ELF");
     drop(out);
     set_executable(out_path);
-    Some(0)
+    Ok(())
 }
 
 /// `-lNAME` as a dylib in a `-L` directory. ld prefers it to an archive in the same place.
@@ -546,25 +552,27 @@ fn macho_dylib_paths(args: &ParsedArgs) -> Vec<PathBuf> {
         .collect()
 }
 
-fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
+fn try_weld_link_macho(args: &ParsedArgs) -> LinkResultOrMessage {
     let mut inputs = args.input_files.clone();
     inputs.extend(macho_dylib_paths(args));
     let (obj_data_list, dylib_paths) =
-        object::load_macho_objects(&inputs, &static_library_paths(args), &entry_seeds(args))?;
+        object::load_macho_objects(&inputs, &static_library_paths(args), &entry_seeds(args))
+            .ok_or(UNREADABLE_INPUTS)?;
     let obj_refs: Vec<&[u8]> = obj_data_list.iter().map(|d| d.as_slice()).collect();
     let libs = if args.libraries.is_empty() {
         None
     } else {
         Some(args.libraries.as_slice())
     };
-    let result = link_macho_multi_object(&obj_refs, libs, &dylib_paths, &args.input_files).ok()?;
-    let arch = TargetArch::from_elf_machine(result.e_machine)?;
-    let entry = match entry_address(args, &result) {
-        Ok(entry) => entry,
-        Err(message) => return fail(message),
+    let result = link_macho_multi_object(&obj_refs, libs, &dylib_paths, &args.input_files)?;
+    let arch = link_arch(&result)?;
+    let entry = if args.dylib {
+        0
+    } else {
+        entry_address(args, &result)?
     };
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
-    let out_file = create_output(out_path).ok()?;
+    let out_file = create_output(out_path).map_err(|e| output_error(out_path, e))?;
     let mut out = std::io::BufWriter::new(out_file);
     let fallback_dyn = DynamicLinkInfo {
         pie: false,
@@ -583,51 +591,62 @@ fn try_weld_link_macho(args: &ParsedArgs) -> Option<i32> {
             .iter()
             .map(|name| format!("/System/Library/Frameworks/{name}.framework/{name}")),
     );
-    emit::macho::emit_macho_executable_dynamic_with(
-        &result.layout,
-        arch,
-        entry,
-        &dyn_info,
-        &args.rpaths,
-        emit::macho::macos_min_version().ok()?,
-        &result.debug_map,
-        &mut out,
-    )
-    .ok()?;
-    out.flush().ok()?;
+    let min_os = emit::macho::macos_min_version().map_err(|e| e.to_string())?;
+    if args.dylib {
+        let install_name = args
+            .install_name
+            .clone()
+            .unwrap_or_else(|| out_path.display().to_string());
+        emit::macho::emit_macho_dylib(
+            &result.layout,
+            arch,
+            &install_name,
+            &result.macho_exports,
+            &dyn_info,
+            &args.rpaths,
+            min_os,
+            &result.debug_map,
+            &mut out,
+        )
+    } else {
+        emit::macho::emit_macho_executable_dynamic_with(
+            &result.layout,
+            arch,
+            entry,
+            &dyn_info,
+            &args.rpaths,
+            min_os,
+            &result.debug_map,
+            &mut out,
+        )
+    }
+    .and_then(|()| out.flush())
+    .map_err(|e| output_error(out_path, e))?;
     drop(out);
     set_executable(out_path);
-    ad_hoc_codesign(out_path).ok()?;
-    Some(0)
+    ad_hoc_codesign(out_path).map_err(|e| output_error(out_path, e))
 }
 
-fn try_weld_link_coff(args: &ParsedArgs, objects: Vec<Vec<u8>>) -> Option<i32> {
+fn try_weld_link_coff(args: &ParsedArgs, objects: Vec<Vec<u8>>) -> LinkResultOrMessage {
     if args.shared {
-        return fail("-shared is not supported for PE output");
+        return Err("-shared is not supported for PE output".into());
     }
     let refs: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.exe"));
     let mut image = Vec::new();
-    if let Err(error) =
-        emit::pe::link_and_emit_pe_from_coffs(&refs, args.entry.as_deref(), &mut image)
-    {
-        eprintln!("weld: {error}");
-        return Some(1);
-    }
-    let write = create_output(out_path).and_then(|file| {
-        let mut out = std::io::BufWriter::new(file);
-        std::io::Write::write_all(&mut out, &image)?;
-        out.flush()
-    });
-    if let Err(error) = write {
-        eprintln!("weld: {}: {error}", out_path.display());
-        return Some(1);
-    }
-    Some(0)
+    emit::pe::link_and_emit_pe_from_coffs(&refs, args.entry.as_deref(), &mut image)
+        .map_err(|e| e.to_string())?;
+    create_output(out_path)
+        .and_then(|file| {
+            let mut out = std::io::BufWriter::new(file);
+            std::io::Write::write_all(&mut out, &image)?;
+            out.flush()
+        })
+        .map_err(|e| output_error(out_path, e))
 }
 
 /// PE output is written from COFF objects only.
-fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
+fn try_weld_link_pe(args: &ParsedArgs) -> LinkResultOrMessage {
     let (libraries, library_positions): (Vec<_>, Vec<_>) =
         static_library_inputs(args).into_iter().unzip();
     let loaded = object::load_objects_with_positions(
@@ -637,27 +656,24 @@ fn try_weld_link_pe(args: &ParsedArgs) -> Option<i32> {
         &args.input_positions,
         &library_positions,
         &args.groups,
-    )?;
+    )
+    .ok_or(UNREADABLE_INPUTS)?;
     match loaded.format {
         ObjectFormat::Coff => try_weld_link_coff(args, loaded.objects),
-        ObjectFormat::Elf => {
-            fail("PE output cannot be built from ELF inputs: the PE writer only takes COFF objects")
-        }
-        ObjectFormat::MachO => fail("PE output cannot be built from Mach-O inputs"),
+        ObjectFormat::Elf => Err(
+            "PE output cannot be built from ELF inputs: the PE writer only takes COFF objects"
+                .into(),
+        ),
+        ObjectFormat::MachO => Err("PE output cannot be built from Mach-O inputs".into()),
     }
 }
 
-fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
+fn try_weld_link(args: &ParsedArgs) -> LinkResultOrMessage {
     if args.input_files.is_empty() {
-        return None;
+        return Err("no input files".into());
     }
 
-    if let Err(error) =
-        object::check_archive_indexes(&args.input_files, &static_library_paths(args))
-    {
-        eprintln!("weld: {error}");
-        return Some(1);
-    }
+    object::check_archive_indexes(&args.input_files, &static_library_paths(args))?;
 
     let wants_pe = args
         .output_file
@@ -680,8 +696,7 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         }
         for name in &args.libraries {
             if resolver.resolve_static(name).is_none() {
-                eprintln!("weld: cannot find static library -l{name}");
-                return Some(1);
+                return Err(format!("cannot find static library -l{name}"));
             }
         }
     }
@@ -695,19 +710,19 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
         &args.input_positions,
         &library_positions,
         &args.groups,
-    )?;
-    if let Err(error) = object::reject_lto_objects(&loaded.objects) {
-        eprintln!("weld: {error}");
-        return Some(1);
-    }
+    )
+    .ok_or(UNREADABLE_INPUTS)?;
+    object::reject_lto_objects(&loaded.objects)?;
 
     timer.mark("detect format and load objects");
     if args.relocatable {
         if loaded.format != ObjectFormat::Elf {
-            eprintln!("weld: -r supports ELF inputs only");
-            return Some(1);
+            return Err("-r supports ELF inputs only".into());
         }
         return try_weld_relocatable(args, &loaded.objects);
+    }
+    if args.dylib && loaded.format != ObjectFormat::MachO {
+        return Err("-dylib needs Mach-O inputs".into());
     }
     match loaded.format {
         ObjectFormat::Elf => try_weld_link_elf(args, loaded.objects, loaded.positions),
@@ -716,20 +731,17 @@ fn try_weld_link(args: &ParsedArgs) -> Option<i32> {
     }
 }
 
-fn try_weld_relocatable(args: &ParsedArgs, objects: &[Vec<u8>]) -> Option<i32> {
+fn try_weld_relocatable(args: &ParsedArgs, objects: &[Vec<u8>]) -> LinkResultOrMessage {
     let refs: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
-    let image = match link::link_relocatable(&refs) {
-        Ok(image) => image,
-        Err(error) => {
-            eprintln!("weld: {error}");
-            return Some(1);
-        }
-    };
+    let image = link::link_relocatable(&refs)?;
     let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
-    let mut out = std::io::BufWriter::new(create_output(out_path).ok()?);
-    out.write_all(&image).ok()?;
-    out.flush().ok()?;
-    Some(0)
+    create_output(out_path)
+        .and_then(|file| {
+            let mut out = std::io::BufWriter::new(file);
+            out.write_all(&image)?;
+            out.flush()
+        })
+        .map_err(|e| output_error(out_path, e))
 }
 
 struct StderrLogger;
@@ -773,88 +785,48 @@ fn write_archive_mode(args: &ParsedArgs) -> std::result::Result<(), String> {
     archive::create_archive(output, &args.input_files)
 }
 
+fn run(args: &ParsedArgs) -> LinkResultOrMessage {
+    if args.archive {
+        write_archive_mode(args)
+    } else {
+        // The output format follows the input objects, not the host, so ELF and
+        // Mach-O links work when cross-linking from another host.
+        try_weld_link(args)
+    }
+}
+
+/// Run one link in process, with the arguments the command line takes (without the
+/// program name), `--archive` included.
+///
+/// Returns instead of exiting. An error is the message the command line prints after
+/// `weld: `; `--help` and `--version` are refused, as they only make sense there.
+pub fn link(args: &[String]) -> std::result::Result<(), String> {
+    match parse_args(args)? {
+        ParseAction::Run(args) => run(&args),
+        ParseAction::Help | ParseAction::Version => {
+            Err("--help and --version are command line options".into())
+        }
+    }
+}
+
 /// Run one link from the process argument vector, then exit.
 pub fn main() {
     init_logging();
-    let argv: Vec<String> = env::args().collect();
-    let link_args: Vec<String> = argv.get(1..).unwrap_or(&[]).to_vec();
-
+    let link_args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&link_args) {
-        Ok(ParseAction::Run(args)) if args.archive => match write_archive_mode(&args) {
+        Ok(ParseAction::Run(args)) => match run(&args) {
             Ok(()) => {
                 if args.verbose {
-                    log::info!("archived");
+                    log::info!("{}", if args.archive { "archived" } else { "linked" });
                 }
-                std::process::exit(0);
             }
             Err(e) => {
                 eprintln!("weld: {e}");
                 std::process::exit(1);
             }
         },
-        Ok(ParseAction::Run(args)) => {
-            // Output format is chosen from the input objects, not the host OS, so
-            // ELF/Mach-O linking works even when cross-linking from another host.
-            // Unsupported output formats are reported per-format in `try_weld_link`.
-            match try_weld_link(&args) {
-                Some(0) => {
-                    if args.verbose {
-                        log::info!("linked");
-                    }
-                    std::process::exit(0);
-                }
-                None => {
-                    {
-                        if let Some((format, data, dylib_paths)) = load_objects(
-                            &args.input_files,
-                            &static_library_paths(&args),
-                            &entry_seeds(&args),
-                        ) {
-                            let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
-                            let err = match format {
-                                ObjectFormat::Elf => link_multi_object_with_options(
-                                    &refs,
-                                    Some(&args.libraries),
-                                    &link_options(&args),
-                                )
-                                .err(),
-                                ObjectFormat::MachO => link_macho_multi_object(
-                                    &refs,
-                                    Some(&args.libraries),
-                                    &dylib_paths,
-                                    &args.input_files,
-                                )
-                                .err(),
-                                ObjectFormat::Coff => {
-                                    let mut image: Vec<u8> = Vec::new();
-                                    emit::pe::link_and_emit_pe_from_coffs(
-                                        &refs,
-                                        args.entry.as_deref(),
-                                        &mut image,
-                                    )
-                                    .err()
-                                    .map(|error| error.to_string())
-                                }
-                            };
-                            if let Some(e) = err {
-                                eprintln!("weld: {e}");
-                            }
-                        } else {
-                            eprintln!("weld: could not read the input objects");
-                        }
-                    }
-                    eprintln!("weld: link failed");
-                    std::process::exit(1);
-                }
-                Some(code) => std::process::exit(code),
-            }
-        }
-        Ok(ParseAction::Help) => {
-            print_usage();
-        }
-        Ok(ParseAction::Version) => {
-            println!("weld {}", VERSION);
-        }
+        Ok(ParseAction::Help) => print_usage(),
+        Ok(ParseAction::Version) => println!("weld {}", VERSION),
         Err(e) => {
             eprintln!("Error: {}", e);
             print_usage();
@@ -892,6 +864,7 @@ mod tests {
             e_machine: 62,
             symbol_addrs,
             dynamic: None,
+            macho_exports: Vec::new(),
         }
     }
 
@@ -1065,7 +1038,10 @@ mod tests {
             output_file: Some(PathBuf::from("target/scratch-cli/never.dll")),
             ..ParsedArgs::default()
         };
-        assert_eq!(try_weld_link_coff(&args, Vec::new()), Some(1));
+        assert_eq!(
+            try_weld_link_coff(&args, Vec::new()),
+            Err("-shared is not supported for PE output".to_string())
+        );
         assert!(!Path::new("target/scratch-cli/never.dll").exists());
     }
 }
