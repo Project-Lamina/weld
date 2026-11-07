@@ -349,6 +349,42 @@ fn filelist_names_the_inputs() {
     assert_eq!(run(dir, "main"), "listed\n");
 }
 
+#[test]
+fn strong_definition_overrides_weak() {
+    let guard = TempDir::new("weld-macho-weak");
+    let dir = guard.path();
+    compile(
+        dir,
+        "weak",
+        "#include <stdio.h>\n__attribute__((weak)) long w = 7;\n\
+         int main(void){printf(\"%ld\\n\",w);return 0;}\n",
+    );
+    compile(dir, "strong", "long w = 99;\n");
+    weld(dir, &["weak.o", "strong.o", "-lSystem", "-o", "both"]);
+    assert_eq!(run(dir, "both"), "99\n");
+    weld(dir, &["weak.o", "-lSystem", "-o", "alone"]);
+    assert_eq!(run(dir, "alone"), "7\n");
+}
+
+#[test]
+fn thread_local_from_another_object() {
+    let guard = TempDir::new("weld-macho-tlv");
+    let dir = guard.path();
+    compile(
+        dir,
+        "main",
+        "#include <stdio.h>\n__thread long tv = 5;\nlong get(void);\n\
+         int main(void){printf(\"%ld\\n\",get());return 0;}\n",
+    );
+    compile(
+        dir,
+        "get",
+        "extern __thread long tv;\nlong get(void){return tv;}\n",
+    );
+    weld(dir, &["main.o", "get.o", "-lSystem", "-o", "main"]);
+    assert_eq!(run(dir, "main"), "5\n");
+}
+
 const HELPER_DYLIB_SOURCE: &str = "int helper(void){return 7;}\nint other = 5;\n";
 
 fn weld_dylib(dir: &Path) {
