@@ -570,7 +570,8 @@ fn try_weld_link_macho(args: &ParsedArgs) -> LinkResultOrMessage {
         0
     } else {
         entry_address(args, &result)?
-    };    let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
+    };
+    let out_path = args.output_file.as_deref().unwrap_or(Path::new("a.out"));
     let out_file = create_output(out_path).map_err(|e| output_error(out_path, e))?;
     let mut out = std::io::BufWriter::new(out_file);
     let fallback_dyn = DynamicLinkInfo {
@@ -721,7 +722,7 @@ fn try_weld_link(args: &ParsedArgs) -> LinkResultOrMessage {
         return try_weld_relocatable(args, &loaded.objects);
     }
     if args.dylib && loaded.format != ObjectFormat::MachO {
-        return fail("-dylib needs Mach-O inputs");
+        return Err("-dylib needs Mach-O inputs".into());
     }
     match loaded.format {
         ObjectFormat::Elf => try_weld_link_elf(args, loaded.objects, loaded.positions),
