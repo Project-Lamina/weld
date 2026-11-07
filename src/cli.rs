@@ -23,6 +23,8 @@ pub struct ParsedArgs {
     pub build_id: bool,
     pub pie: bool,
     pub shared: bool,
+    pub dylib: bool,
+    pub install_name: Option<String>,
     pub soname: Option<String>,
     pub static_link: bool,
     pub relocatable: bool,
@@ -196,7 +198,6 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             | "-syslibroot"
             | "-mllvm"
             | "-exported_symbols_list"
-            | "-install_name"
             | "-B"
             | "-F"
             | "-arch"
@@ -313,8 +314,9 @@ pub fn parse_args(argv: &[String]) -> Result<ParseAction, String> {
             s if s.starts_with("--soname=") => {
                 args.soname = Some(s["--soname=".len()..].to_string());
             }
-            "-dylib" => {
-                return Err(format!("{a} is not supported yet"));
+            "-dylib" => args.dylib = true,
+            "-install_name" => {
+                args.install_name = Some(take_required_arg(argv, &mut i, "-install_name")?);
             }
             _ => {
                 if a.starts_with('-') {
