@@ -601,12 +601,21 @@ pub fn check_archive_indexes(paths: &[PathBuf], libs: &[PathBuf]) -> Result<(), 
 /// Global symbols an object defines, sorted, for an archive's symbol index.
 pub fn object_symbols(data: &[u8]) -> Result<Vec<String>, String> {
     if is_macho64(data) {
-        return Err(
-            "Mach-O objects cannot be archived: the BSD symbol index is not written".into(),
-        );
+        const N_STAB: u8 = 0xe0;
+        const N_EXT: u8 = 0x01;
+        let object = parse_macho64_object(data)?;
+        let mut names: Vec<String> = object
+            .symbols
+            .into_iter()
+            .filter(|s| s.is_defined && s.n_type & N_STAB == 0 && s.n_type & N_EXT != 0)
+            .map(|s| s.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        return Ok(names);
     }
     if !is_elf(data) && !is_coff(data) {
-        return Err("not an ELF64 or COFF object".into());
+        return Err("not an ELF64, Mach-O or COFF object".into());
     }
     if is_elf(data) {
         let (header, _, _) = parse_elf64_slice(data)?;

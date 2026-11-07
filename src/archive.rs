@@ -376,8 +376,106 @@ pub fn create_archive(output: &Path, inputs: &[PathBuf]) -> Result<(), String> {
             symbols,
         })
         .collect();
-    let archive = write_archive(&members)?;
+    let macho = loaded
+        .iter()
+        .filter(|(_, data, _)| crate::macho::is_macho64(data))
+        .count();
+    let archive = match macho {
+        0 => write_archive(&members)?,
+        n if n == members.len() => write_archive_bsd(&members)?,
+        _ => return Err("Mach-O objects cannot share an archive with other formats".into()),
+    };
     std::fs::write(output, archive).map_err(|e| format!("{}: {e}", output.display()))
+}
+
+/// The symbol index a BSD archive leads with, sorted by name as `ranlib -s` leaves it.
+const BSD_SYMDEF: &str = "__.SYMDEF SORTED";
+
+/// `#1/` name length that pads `name` so the member body after it starts on an
+/// eight-byte boundary, given a header that does.
+fn bsd_name_len(name: &str) -> usize {
+    (HEADER_LEN + name.len()).next_multiple_of(8) - HEADER_LEN
+}
+
+/// Size field of a BSD member: the padded name, the body, and the zero bytes that put
+/// the next header on an eight-byte boundary. ld64 wants Mach-O members aligned.
+fn bsd_member_size(name: &str, body: usize) -> usize {
+    (HEADER_LEN + bsd_name_len(name) + body).next_multiple_of(8) - HEADER_LEN
+}
+
+fn push_bsd_member(out: &mut Vec<u8>, name: &str, body: &[u8]) {
+    let name_len = bsd_name_len(name);
+    let size = bsd_member_size(name, body.len());
+    push_header(out, &format!("#1/{name_len}"), size);
+    out.extend_from_slice(name.as_bytes());
+    out.resize(out.len() + name_len - name.len(), 0);
+    out.extend_from_slice(body);
+    out.resize(out.len() + size - name_len - body.len(), 0);
+}
+
+/// Writes a BSD archive as Apple's `libtool -static` does: a `__.SYMDEF SORTED` index of
+/// little-endian `ranlib` entries (name offset, member header offset) and a string
+/// table, then each member under a `#1/` name. Headers have zeroed mtime, uid and gid.
+pub fn write_archive_bsd(members: &[NewMember]) -> Result<Vec<u8>, String> {
+    let mut entries: Vec<(&str, usize)> = Vec::new();
+    for (index, member) in members.iter().enumerate() {
+        check_member_name(member.name).map_err(|e| format!("{}: {e}", member.name))?;
+        for symbol in member.symbols {
+            if symbol.is_empty() || symbol.contains('\0') {
+                return Err(format!(
+                    "{}: symbol name {symbol:?} cannot be indexed",
+                    member.name
+                ));
+            }
+            entries.push((symbol, index));
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut strings = Vec::new();
+    let mut name_offsets = Vec::with_capacity(entries.len());
+    for (symbol, _) in &entries {
+        name_offsets.push(strings.len());
+        strings.extend_from_slice(symbol.as_bytes());
+        strings.push(0);
+    }
+    strings.resize(strings.len().next_multiple_of(8), 0);
+    let table_len = 4 + 8 * entries.len() + 4 + strings.len();
+
+    let mut offset = MAGIC.len() + HEADER_LEN + bsd_member_size(BSD_SYMDEF, table_len);
+    let mut member_offsets = Vec::with_capacity(members.len());
+    for member in members {
+        member_offsets.push(offset);
+        let size = bsd_member_size(member.name, member.data.len());
+        if size > MAX_MEMBER_SIZE {
+            return Err(format!(
+                "{}: member is too large for an archive header",
+                member.name
+            ));
+        }
+        offset += HEADER_LEN + size;
+    }
+    if offset > u32::MAX as usize {
+        return Err("archive is larger than the 32-bit symbol index can address".to_string());
+    }
+
+    let mut table = Vec::with_capacity(table_len);
+    table.extend_from_slice(&((8 * entries.len()) as u32).to_le_bytes());
+    for ((_, member), name_at) in entries.iter().zip(&name_offsets) {
+        table.extend_from_slice(&(*name_at as u32).to_le_bytes());
+        table.extend_from_slice(&(member_offsets[*member] as u32).to_le_bytes());
+    }
+    table.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+    table.extend_from_slice(&strings);
+
+    let mut out = Vec::with_capacity(offset);
+    out.extend_from_slice(MAGIC);
+    push_bsd_member(&mut out, BSD_SYMDEF, &table);
+    for member in members {
+        push_bsd_member(&mut out, member.name, member.data);
+    }
+    debug_assert_eq!(out.len(), offset);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -513,6 +611,62 @@ mod tests {
             members.iter().map(|m| (m.offset, m.start, m.len)).collect()
         };
         assert_eq!(spans(&scan.members), spans(&archive.members));
+    }
+
+    #[test]
+    fn bsd_archive_aligns_members_and_sorts_its_index() {
+        let long = "a_member_with_a_name_longer_than_sixteen.o";
+        let symbols_a = owned(&["_zeta", "_alpha"]);
+        let symbols_b = owned(&["_beta"]);
+        let ar = write_archive_bsd(&[
+            NewMember {
+                name: "a.o",
+                data: b"object-a!",
+                symbols: &symbols_a,
+            },
+            NewMember {
+                name: long,
+                data: b"object-b",
+                symbols: &symbols_b,
+            },
+        ])
+        .unwrap();
+
+        let archive = parse_members(&ar).unwrap();
+        assert_eq!(archive.members.len(), 2);
+        for (member, body) in archive.members.iter().zip([&b"object-a!"[..], b"object-b"]) {
+            assert_eq!(member.offset % 8, 0);
+            assert_eq!(member.start % 8, 0);
+            assert!(member.data(&ar).starts_with(body));
+        }
+
+        // The index: ranlib array size, (name offset, header offset) pairs, string
+        // table size, strings.
+        let word = |at: usize| u32::from_le_bytes(ar[at..at + 4].try_into().unwrap()) as usize;
+        let table = MAGIC.len() + HEADER_LEN + bsd_name_len(BSD_SYMDEF);
+        assert_eq!(
+            &ar[MAGIC.len() + HEADER_LEN..table - 4],
+            BSD_SYMDEF.as_bytes()
+        );
+        let count = word(table) / 8;
+        let strings = table + 4 + 8 * count + 4;
+        let entries: Vec<(String, usize)> = (0..count)
+            .map(|i| {
+                let name_at = strings + word(table + 4 + 8 * i);
+                let end = ar[name_at..].iter().position(|&b| b == 0).unwrap();
+                let name = String::from_utf8(ar[name_at..name_at + end].to_vec()).unwrap();
+                (name, word(table + 8 + 8 * i))
+            })
+            .collect();
+        let (a, b) = (archive.members[0].offset, archive.members[1].offset);
+        assert_eq!(
+            entries,
+            [
+                ("_alpha".to_string(), a),
+                ("_beta".to_string(), b),
+                ("_zeta".to_string(), a)
+            ]
+        );
     }
 
     #[test]
@@ -726,6 +880,6 @@ mod tests {
     #[test]
     fn non_object_inputs_are_refused_for_archiving() {
         let err = crate::object::object_symbols(b"plain text, not an object").unwrap_err();
-        assert!(err.contains("not an ELF64 or COFF object"), "{err}");
+        assert!(err.contains("not an ELF64, Mach-O or COFF object"), "{err}");
     }
 }

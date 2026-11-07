@@ -350,6 +350,14 @@ fn filelist_names_the_inputs() {
 }
 
 #[test]
+r = guard.path();
+    weld_dylib(dir);
+
+    let load = Command::new("otool")
+        .current_dir(dir)
+        .args(["-l", "libhelper.dylib"])
+!(load.contains("cmd LC_ID_DYLIB"), "{load}");
+eader = Command::new("otool")
 fn strong_definition_overrides_weak() {
     let guard = TempDir::new("weld-macho-weak");
     let dir = guard.path();
@@ -425,7 +433,7 @@ fn dylib_from_weld_is_named_signed_and_linked_against() {
     assert!(
         String::from_utf8_lossy(&header.stdout).contains("DYLIB"),
         "{}",
-        String::from_utf8_lossy(&header.stdout)
+        String::from_utf8_lossy(&header.stdo
     );
     let sign = Command::new("codesign")
         .current_dir(dir)
@@ -437,7 +445,7 @@ fn dylib_from_weld_is_named_signed_and_linked_against() {
     compile(
         dir,
         "main",
-        "#include <stdio.h>\nint helper(void);\nextern int other;\n\
+        "#include <stdio.h>\nint helper(void
          int main(void){printf(\"%d %d\\n\",helper(),other);return 0;}\n",
     );
     weld(
@@ -448,6 +456,8 @@ fn dylib_from_weld_is_named_signed_and_linked_against() {
             "-lhelper",
             "-lSystem",
             "-rpath",
+            "@executable_path",
+            "-o",
             "@executable_path",
             "-o",
             "main",
@@ -467,7 +477,7 @@ fn dylib_from_weld_opens_with_dlopen() {
 #include <stdio.h>
 int main(void) {
     void *h = dlopen("./libhelper.dylib", RTLD_NOW);
-    if (!h) { printf("%s\n", dlerror()); return 1; }
+    if (!h) { printf("%s\n", dlerror()); ret
     int (*helper)(void) = (int (*)(void))dlsym(h, "helper");
     int *other = (int *)dlsym(h, "other");
     if (!helper || !other) { printf("missing symbol\n"); return 1; }
@@ -483,7 +493,7 @@ int main(void) {
         .status()
         .unwrap();
     assert!(status.success());
-    let output = Command::new(dir.join("open"))
+    let output = Command::new(dir.join("open
         .current_dir(dir)
         .output()
         .unwrap();
@@ -497,7 +507,7 @@ int main(void) {
 
 #[test]
 fn links_in_process_through_the_library() {
-    let guard = TempDir::new("weld-macho-lib");
+    let guard = TempDir::new("weld-macho-lib
     let dir = guard.path();
     compile(
         dir,
@@ -505,6 +515,25 @@ fn links_in_process_through_the_library() {
         "#include <stdio.h>\nint main(void){puts(\"in process\");return 0;}\n",
     );
     let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let args = [path("main.o"), "-lSystem".in")];
+    weld::link(&args).unwrap();
+    assert_eq!(run(dir, "main"), "in process
+    let missing = [
+        path("main.o"),
+        "-lSystem".into(),
+        "-e".into(),
+        "nope".into(),
+        "-o".into(),
+        path("bad"),
+    ];
+    assert_eq!(
+        weld::link(&missing),
+        Err("entry symbol nope is not defined".to_string())
+    );
+}
+
+#[test]
+fn archive_written_by_weld_links_with_ld64_a
     let args = [path("main.o"), "-lSystem".into(), "-o".into(), path("main")];
     weld::link(&args).unwrap();
     assert_eq!(run(dir, "main"), "in process\n");
@@ -518,6 +547,57 @@ fn links_in_process_through_the_library() {
     ];
     assert_eq!(
         weld::link(&missing),
-        Err("entry symbol nope is not defined".to_string())
+        Err("entry symbol nope is not define
     );
+}
+
+#[test]
+fn archive_written_by_weld_links_with_ld64_and_weld() {
+    let guard = TempDir::new("weld-macho-arc
+    let dir = guard.path();
+    compile(dir, "alpha", "int alpha(void){r
+    compile(
+        dir,
+        "a_member_with_a_long_name",
+        "__attribute__((visibility(\"hidden\40;}\n\
+         int gamma(void){return hidden();}\n",
+    );
+    compile(
+        dir,
+        "main",
+        "#include <stdio.h>\nint alpha(void)
+         int main(void){printf(\"%d %d\\n\",alpha(),gamma());return 0;}\n",
+    );
+    weld(
+        dir,
+        &[
+            "--archive",
+            "alpha.o",
+            "a_member_with_a_long_name.o",
+            "-o",
+            "libparts.a",
+        ],
+    );
+    let map = Command::new("nm")
+        .current_dir(dir)
+        .args(["--print-armap", "libparts.a"])
+        .output()
+        .unwrap();
+    let map = String::from_utf8_lossy(&map.s
+    for line in [
+        "_alpha in alpha.o",
+        "_gamma in a_member_with_a_long_name.o",
+        "_hidden in a_member_with_a_long_nam
+    ] {
+        assert!(map.contains(line), "{map}")
+    }
+    let status = Command::new("clang")
+        .current_dir(dir)
+        .args(["main.o", "-L.", "-lparts", "
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(run(dir, "by_ld64"), "1 40\n"
+    weld(dir, &["main.o", "libparts.a", "-lSystem", "-o", "by_weld"]);
+    assert_eq!(run(dir, "by_weld"), "1 40\n"
 }

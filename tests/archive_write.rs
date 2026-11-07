@@ -126,7 +126,7 @@ fn archive_mode_refuses_bad_invocations() {
     assert!(!not_object.status.success());
     let stderr = String::from_utf8_lossy(&not_object.stderr);
     assert!(
-        stderr.contains("junk.a: not an ELF64 or COFF object"),
+        stderr.contains("junk.a: not an ELF64, Mach-O or COFF object"),
         "{stderr}"
     );
     assert!(!dir.join("out.a").exists());
