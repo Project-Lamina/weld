@@ -966,6 +966,54 @@ mod tests {
         use crate::test_support::weld_binary;
         use std::{fs, os::unix::fs::symlink, process::Command};
 
+        /// An executable has one module, so `__tls_get_addr` can only ever return this
+        /// module's thread pointer. The x86-64 psABI relaxes the local-dynamic sequence
+        /// to a `%fs` load for that reason, and the call is left undefined on purpose:
+        /// nothing reaches it.
+        #[test]
+        fn local_dynamic_tls_relaxes_to_local_exec() {
+            let guard = TempDir::new("weld-ld-tls");
+            let dir = guard.path();
+            fs::create_dir_all(dir.join("drv")).unwrap();
+            symlink(weld_binary(), dir.join("drv/ld")).unwrap();
+            fs::write(
+                dir.join("input.c"),
+                "#include <stdio.h>\n\
+                 static __thread int a = 11;\n\
+                 static __thread int b = 22;\n\
+                 int main(void) { a += 1; b += 2; printf(\"%d %d\\n\", a, b); return 0; }",
+            )
+            .unwrap();
+            for flags in [
+                vec!["-fPIC", "-ftls-model=local-dynamic"],
+                vec!["-fPIC", "-ftls-model=local-dynamic", "-no-pie"],
+            ] {
+                let built = Command::new("gcc")
+                    .current_dir(dir)
+                    .args(["-Bdrv", "input.c", "-o", "output"])
+                    .args(&flags)
+                    .output()
+                    .unwrap();
+                assert!(
+                    built.status.success(),
+                    "{flags:?}: {}",
+                    String::from_utf8_lossy(&built.stderr)
+                );
+                let run = Command::new(dir.join("output")).output().unwrap();
+                assert_eq!(String::from_utf8_lossy(&run.stdout), "12 24\n", "{flags:?}");
+                // The call is relaxed away, so the symbol never has to resolve.
+                let symbols = Command::new("nm")
+                    .current_dir(dir)
+                    .args(["-D", "output"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    !String::from_utf8_lossy(&symbols.stdout).contains("__tls_get_addr"),
+                    "{flags:?}: __tls_get_addr survived relaxation"
+                );
+            }
+        }
+
         #[test]
         fn rejects_lto_and_unresolved_symbols_before_emission() {
             let guard = TempDir::new("weld-errors");
@@ -997,11 +1045,6 @@ mod tests {
                     "extern __thread int value; int main(void) { return value; }",
                     vec!["-fPIC"],
                     "thread-local symbol value is not defined by the inputs",
-                ),
-                (
-                    "static __thread int value = 1; int get(void) { return value; } int main(void) { return get(); }",
-                    vec!["-fPIC", "-ftls-model=local-dynamic"],
-                    "local dynamic TLS is not supported",
                 ),
                 (
                     "extern int missing(void); int main(void) { return missing(); }",
