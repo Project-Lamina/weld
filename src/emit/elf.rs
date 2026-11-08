@@ -3747,21 +3747,36 @@ mod tests {
             }
         }
 
+        /// `--gc-sections` keeps the debug sections and the addresses in them.
+        ///
+        /// A debug section is never reachable from a root, so gc must not take its
+        /// relocations with it, or every address in the line table stays unrelocated.
+        /// Code that gc did take away is named by address zero, which is what a reader
+        /// takes for something that is not in the image.
         #[test]
-        fn gc_sections_refuses_debug_info_instead_of_zeroing_addresses() {
+        fn gc_sections_keeps_debug_addresses_and_zeroes_what_it_dropped() {
             let guard = TempDir::new("weld-gc-debug");
             let dir = guard.path();
             fs::create_dir_all(dir).unwrap();
             fs::write(
                 dir.join("one.c"),
-                "int other(int x);\nint main(void) {\n  return other(21) * 2;\n}\n",
+                "int other(int x);\nint dead(void) { return 9; }\n\
+                 int main(void) {\n  return other(21) * 2;\n}\n",
             )
             .unwrap();
             fs::write(dir.join("two.c"), "int other(int x) {\n  return x;\n}\n").unwrap();
-            run("gcc", &["-g", "-O0", "-c", "one.c", "-o", "dbg1.o"], dir);
-            run("gcc", &["-g", "-O0", "-c", "two.c", "-o", "dbg2.o"], dir);
-            run("gcc", &["-O0", "-c", "one.c", "-o", "bare1.o"], dir);
-            run("gcc", &["-O0", "-c", "two.c", "-o", "bare2.o"], dir);
+            for (flag, one, two) in [
+                (vec!["-g", "-O0"], "dbg1.o", "dbg2.o"),
+                (vec!["-g", "-O0", "-ffunction-sections"], "fn1.o", "fn2.o"),
+                (vec!["-O0"], "bare1.o", "bare2.o"),
+            ] {
+                let mut args = flag.clone();
+                args.extend(["-c", "one.c", "-o", one]);
+                run("gcc", &args, dir);
+                let mut args = flag;
+                args.extend(["-c", "two.c", "-o", two]);
+                run("gcc", &args, dir);
+            }
 
             let link = |args: &[&str]| {
                 Command::new(weld_binary())
@@ -3771,36 +3786,57 @@ mod tests {
                     .unwrap()
             };
 
-            let refused = link(&["--gc-sections", "-o", "gc-dbg", "dbg1.o", "dbg2.o"]);
-            assert!(
-                !refused.status.success(),
-                "gc with debug info linked anyway"
-            );
-            let message = String::from_utf8_lossy(&refused.stderr);
-            assert!(message.contains("--gc-sections"), "{message}");
-            assert!(
-                !dir.join("gc-dbg").exists(),
-                "a binary was written despite the refusal"
-            );
+            for (out, one, two) in [
+                ("gc-dbg", "dbg1.o", "dbg2.o"),
+                ("gc-fn", "fn1.o", "fn2.o"),
+                ("gc-bare", "bare1.o", "bare2.o"),
+            ] {
+                let linked = link(&["--gc-sections", "-o", out, one, two]);
+                assert!(
+                    linked.status.success(),
+                    "{out}: {}",
+                    String::from_utf8_lossy(&linked.stderr)
+                );
+            }
 
-            let bare = link(&["--gc-sections", "-o", "gc-bare", "bare1.o", "bare2.o"]);
-            assert!(
-                bare.status.success(),
-                "gc without debug info: {}",
-                String::from_utf8_lossy(&bare.stderr)
-            );
+            // `-ffunction-sections` puts `dead` in a section of its own, so gc has
+            // something to drop and the debug relocations name a symbol that is gone.
+            let symbols = run("nm", &["gc-fn"], dir);
+            assert!(!symbols.contains(" dead"), "gc kept dead code:\n{symbols}");
 
-            let kept = link(&["-o", "dbg-only", "dbg1.o", "dbg2.o"]);
-            assert!(
-                kept.status.success(),
-                "debug info without gc: {}",
-                String::from_utf8_lossy(&kept.stderr)
-            );
-            let lines = run("readelf", &["--debug-dump=decodedline", "dbg-only"], dir);
-            assert!(
-                lines.contains("0x4") || lines.contains("0x2"),
-                "line table has no real addresses:\n{lines}"
-            );
+            for out in ["gc-dbg", "gc-fn"] {
+                let info = Command::new("readelf")
+                    .args(["--debug-dump=info", out])
+                    .current_dir(dir)
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&info.stdout);
+                assert!(
+                    !String::from_utf8_lossy(&info.stderr)
+                        .to_lowercase()
+                        .contains("warning")
+                        && !text.to_lowercase().contains("warning"),
+                    "{out}: readelf found malformed debug info"
+                );
+                let lines = run("readelf", &["--debug-dump=decodedline", out], dir);
+                let sections = run("readelf", &["-SW", out], dir);
+                let text_start = sections
+                    .lines()
+                    .find(|l| l.contains(" .text "))
+                    .and_then(|l| l.split_whitespace().nth(4))
+                    .and_then(|a| u64::from_str_radix(a, 16).ok())
+                    .expect("a .text section");
+                let highest = lines
+                    .lines()
+                    .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("0x")))
+                    .filter_map(|w| u64::from_str_radix(w.trim_start_matches("0x"), 16).ok())
+                    .max()
+                    .expect("line table addresses");
+                assert!(
+                    highest >= text_start,
+                    "{out}: line table addresses stop below .text at {text_start:#x}:\n{lines}"
+                );
+            }
         }
     }
 }
