@@ -179,7 +179,12 @@ pub fn apply_relocations(
                 .ok()
                 .and_then(|r| data_off.checked_add(r))
                 .filter(|&off| off <= merged.data.len())
-                .ok_or_else(|| format!("relocation offset {} out of bounds", rel.r_offset))?;
+                .ok_or_else(|| {
+                    format!(
+                        "relocation offset {} out of bounds in section {target_name}",
+                        rel.r_offset
+                    )
+                })?;
             let place = merged.vaddr + off as u64;
             let a = rel.r_addend;
             let p = place as i64;
@@ -190,7 +195,10 @@ pub fn apply_relocations(
                     let base = merged.vaddr as i64;
                     let val = base.wrapping_add(a) as u64;
                     if merged.data.len() < off + 8 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                        return Err(format!(
+                            "relocation offset {} out of bounds in section {target_name}",
+                            rel.r_offset
+                        ));
                     }
                     write_u64_le(&mut merged.data, off, val);
                 }
@@ -200,7 +208,10 @@ pub fn apply_relocations(
                     };
                     let val = s_addr.wrapping_add_signed(a);
                     if merged.data.len() < off + 8 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                        return Err(format!(
+                            "relocation offset {} out of bounds in section {target_name}",
+                            rel.r_offset
+                        ));
                     }
                     write_u64_le(&mut merged.data, off, val);
                 }
@@ -218,7 +229,10 @@ pub fn apply_relocations(
                         return Err(format!("R_X86_64_32 value {full} does not fit in u32"));
                     }
                     if merged.data.len() < off + 4 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                        return Err(format!(
+                            "relocation offset {} out of bounds in section {target_name}",
+                            rel.r_offset
+                        ));
                     }
                     write_u32_le(&mut merged.data, off, full as u32);
                 }
@@ -231,7 +245,10 @@ pub fn apply_relocations(
                         rel.r_type,
                     )?;
                     if merged.data.len() < off + 4 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                        return Err(format!(
+                            "relocation offset {} out of bounds in section {target_name}",
+                            rel.r_offset
+                        ));
                     }
                     write_u32_le(&mut merged.data, off, val);
                 }
@@ -251,7 +268,10 @@ pub fn apply_relocations(
                         rel.r_type,
                     )?;
                     if merged.data.len() < off + 4 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                        return Err(format!(
+                            "relocation offset {} out of bounds in section {target_name}",
+                            rel.r_offset
+                        ));
                     }
                     write_u32_le(&mut merged.data, off, val);
                 }
@@ -265,7 +285,10 @@ pub fn apply_relocations(
                         })?;
                     let start = off - 4;
                     if merged.data.len() < start + 16 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                        return Err(format!(
+                            "relocation offset {} out of bounds in section {target_name}",
+                            rel.r_offset
+                        ));
                     }
                     merged.data[start..start + 9].copy_from_slice(&LE_MOV_FS);
                     merged.data[start + 9..start + 12].copy_from_slice(&LE_LEA_RAX);
@@ -302,7 +325,10 @@ pub fn apply_relocations(
                     // `@dtpoff` operands after it carry the offsets.
                     let start = off - LD_LEA.len();
                     if merged.data.len() < start + LD_SEQUENCE {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                        return Err(format!(
+                            "relocation offset {} out of bounds in section {target_name}",
+                            rel.r_offset
+                        ));
                     }
                     merged.data[start..start + LD_SEQUENCE].copy_from_slice(&LE_LD_MOV_FS);
                 }
@@ -318,7 +344,10 @@ pub fn apply_relocations(
                         format!("R_X86_64_DTPOFF32 value {tp_offset} does not fit in i32")
                     })?;
                     if merged.data.len() < off + 4 {
-                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                        return Err(format!(
+                            "relocation offset {} out of bounds in section {target_name}",
+                            rel.r_offset
+                        ));
                     }
                     write_u32_le(&mut merged.data, off, value as u32);
                 }
