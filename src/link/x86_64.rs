@@ -157,9 +157,16 @@ pub fn apply_relocations(
             });
         let symbol_addrs = tombstoned.as_deref().unwrap_or(symbol_addrs);
         let merged = &mut layout.sections[merged_idx];
-        let data_off = section_offset
-            .and_then(|m| m.get(&target_name).copied())
-            .unwrap_or(0) as usize;
+        // A section that contributed nothing to the merge has nothing to relocate.
+        // Taking zero for its offset would apply its relocations over whichever object
+        // does start the merged section.
+        let data_off = match section_offset {
+            Some(offsets) => match offsets.get(&target_name) {
+                Some(&offset) => offset as usize,
+                None => continue,
+            },
+            None => 0,
+        };
         let relas = parse_rela_section(data, rela_sh)?;
         let gd_sites = general_dynamic_sites(data, sections, target_sh, &relas)?;
         let ld_sites = local_dynamic_sites(data, sections, target_sh, &relas)?;
