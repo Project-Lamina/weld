@@ -1,6 +1,5 @@
 //! x86_64 relocation application.
 
-use super::SHF_ALLOC;
 use super::merge::tls_segment;
 use super::symbols::symbol_names_by_index;
 use crate::collections::{HashMap, HashSet};
@@ -13,37 +12,78 @@ const GD_LEA: [u8; 4] = [0x66, 0x48, 0x8d, 0x3d];
 const GD_CALL: [u8; 4] = [0x66, 0x66, 0x48, 0xe8];
 const LE_MOV_FS: [u8; 9] = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
 const LE_LEA_RAX: [u8; 3] = [0x48, 0x8d, 0x80];
+/// `leaq x@tlsld(%rip),%rdi`, the three bytes before the displacement.
+const LD_LEA: [u8; 3] = [0x48, 0x8d, 0x3d];
+/// The whole local-dynamic sequence, `lea` then `call __tls_get_addr`, is twelve bytes.
+const LD_SEQUENCE: usize = 12;
+/// What those twelve bytes become in local exec: three `data16` prefixes padding out
+/// `movq %fs:0,%rax`, which leaves the thread pointer in `%rax` for the `@dtpoff`
+/// operands that follow. The x86-64 psABI gives this replacement.
+const LE_LD_MOV_FS: [u8; LD_SEQUENCE] =
+    [0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
 
-/// Rejects local-dynamic TLS, which needs a module-wide `__tls_get_addr` block
-/// that relaxation cannot replace.
-pub(super) fn reject_local_dynamic_tls(
+/// The local-dynamic TLS sites in `target`, as indices of the `lea` and its
+/// `__tls_get_addr` call in `relas`.
+///
+/// A site is the twelve-byte `leaq x@tlsld(%rip),%rdi` plus `call __tls_get_addr@PLT`
+/// pair. An executable has one module, so the call cannot return anything but this
+/// module's thread pointer, and the pair relaxes to local exec exactly as the
+/// general-dynamic one does.
+fn local_dynamic_sites(
     data: &[u8],
     sections: &[SectionHeader],
-    names: &[String],
-) -> Result<(), String> {
-    const SHT_RELA: u32 = 4;
-    for rela_sh in sections.iter().filter(|s| s.sh_type == SHT_RELA) {
-        let Some(target) = sections.get(rela_sh.sh_info as usize) else {
-            continue;
-        };
-        if target.sh_flags & SHF_ALLOC == 0 {
-            continue;
-        }
-        for rel in parse_rela_section(data, rela_sh)? {
-            let kind = match rel.r_type {
-                reloc_type::R_X86_64_TLSLD => "R_X86_64_TLSLD",
-                reloc_type::R_X86_64_DTPOFF32 => "R_X86_64_DTPOFF32",
-                _ => continue,
-            };
-            let section = names
-                .get(rela_sh.sh_info as usize)
-                .map_or("?", String::as_str);
+    target: &SectionHeader,
+    relas: &[RelaEntry],
+) -> Result<Vec<(usize, usize)>, String> {
+    if !relas
+        .iter()
+        .any(|rel| rel.r_type == reloc_type::R_X86_64_TLSLD)
+    {
+        return Ok(Vec::new());
+    }
+    let names = symbol_names_by_index(data, sections)?;
+    let code = data
+        .get(target.sh_offset as usize..(target.sh_offset + target.sh_size) as usize)
+        .unwrap_or(&[]);
+    let mut sites = Vec::new();
+    for (lea, rel) in relas
+        .iter()
+        .enumerate()
+        .filter(|(_, rel)| rel.r_type == reloc_type::R_X86_64_TLSLD)
+    {
+        let start = rel
+            .r_offset
+            .checked_sub(LD_LEA.len() as u64)
+            .and_then(|start| usize::try_from(start).ok());
+        let is_sequence = start
+            .and_then(|start| code.get(start..start + LD_SEQUENCE))
+            .is_some_and(|bytes| bytes[..LD_LEA.len()] == LD_LEA && bytes[7] == 0xe8);
+        if !is_sequence {
             return Err(format!(
-                "local dynamic TLS is not supported ({kind} in section {section}); use -ftls-model=global-dynamic or local-exec"
+                "local dynamic TLS at offset {} is not a __tls_get_addr call sequence",
+                rel.r_offset
             ));
         }
+        // The call's displacement sits five bytes past the `lea`'s, but rather than
+        // pin that, take the one __tls_get_addr call inside this twelve-byte sequence.
+        let sequence = rel.r_offset - LD_LEA.len() as u64
+            ..rel.r_offset - LD_LEA.len() as u64 + LD_SEQUENCE as u64;
+        let call = relas
+            .iter()
+            .position(|other| {
+                sequence.contains(&other.r_offset)
+                    && other.r_type == reloc_type::R_X86_64_PLT32
+                    && names.get(other.r_sym as usize).map(|n| n.as_ref()) == Some(TLS_GET_ADDR)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "local dynamic TLS at offset {} has no __tls_get_addr call relocation",
+                    rel.r_offset
+                )
+            })?;
+        sites.push((lea, call));
     }
-    Ok(())
+    Ok(sites)
 }
 
 fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
@@ -111,11 +151,17 @@ pub fn apply_relocations(
             .unwrap_or(0) as usize;
         let relas = parse_rela_section(data, rela_sh)?;
         let gd_sites = general_dynamic_sites(data, sections, target_sh, &relas)?;
+        let ld_sites = local_dynamic_sites(data, sections, target_sh, &relas)?;
         let gd_leas: HashSet<usize> = gd_sites.iter().map(|&(lea, _)| lea).collect();
-        let gd_calls: HashSet<usize> = gd_sites.iter().map(|&(_, call)| call).collect();
+        let ld_leas: HashSet<usize> = ld_sites.iter().map(|&(lea, _)| lea).collect();
+        let relaxed_calls: HashSet<usize> = gd_sites
+            .iter()
+            .chain(ld_sites.iter())
+            .map(|&(_, call)| call)
+            .collect();
 
         for (index, rel) in relas.iter().enumerate() {
-            if gd_calls.contains(&index) {
+            if relaxed_calls.contains(&index) {
                 continue;
             }
             let off = usize::try_from(rel.r_offset)
@@ -240,9 +286,32 @@ pub fn apply_relocations(
                         write_u32_le(&mut merged.data, off, value as u32);
                     }
                 }
-                reloc_type::R_X86_64_TLSGD
-                | reloc_type::R_X86_64_TLSLD
-                | reloc_type::R_X86_64_DTPOFF32 => {
+                reloc_type::R_X86_64_TLSLD if ld_leas.contains(&index) => {
+                    // The sequence loads the thread pointer and nothing else; the
+                    // `@dtpoff` operands after it carry the offsets.
+                    let start = off - LD_LEA.len();
+                    if merged.data.len() < start + LD_SEQUENCE {
+                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                    }
+                    merged.data[start..start + LD_SEQUENCE].copy_from_slice(&LE_LD_MOV_FS);
+                }
+                reloc_type::R_X86_64_DTPOFF32 => {
+                    // After the sequence above, the operand is read from the thread
+                    // pointer, so an offset within the module's block becomes the same
+                    // local-exec offset `@tpoff` would have given.
+                    let Some(Some(s_addr)) = symbol_addrs.get(rel.r_sym as usize) else {
+                        return Err(format!("undefined symbol index {}", rel.r_sym));
+                    };
+                    let tp_offset = local_exec_offset(tls.as_ref(), *s_addr, a)?;
+                    let value = i32::try_from(tp_offset).map_err(|_| {
+                        format!("R_X86_64_DTPOFF32 value {tp_offset} does not fit in i32")
+                    })?;
+                    if merged.data.len() < off + 4 {
+                        return Err(format!("relocation offset {} out of bounds", rel.r_offset));
+                    }
+                    write_u32_le(&mut merged.data, off, value as u32);
+                }
+                reloc_type::R_X86_64_TLSGD | reloc_type::R_X86_64_TLSLD => {
                     return Err(format!(
                         "unsupported x86_64 TLS relocation type {}",
                         rel.r_type
@@ -315,8 +384,8 @@ fn general_dynamic_sites(
     Ok(sites)
 }
 
-/// True when every relocation against `__tls_get_addr` in `data` is a general-dynamic
-/// call that is relaxed away, so the undefined symbol is never reached.
+/// True when every relocation against `__tls_get_addr` in `data` belongs to a dynamic
+/// TLS sequence that is relaxed away, so the undefined symbol is never reached.
 pub(super) fn tls_get_addr_only_relaxed(
     data: &[u8],
     sections: &[SectionHeader],
@@ -331,6 +400,7 @@ pub(super) fn tls_get_addr_only_relaxed(
         let relas = parse_rela_section(data, rela_sh)?;
         let calls: HashSet<usize> = general_dynamic_sites(data, sections, target, &relas)?
             .into_iter()
+            .chain(local_dynamic_sites(data, sections, target, &relas)?)
             .map(|(_, call)| call)
             .collect();
         for (index, rel) in relas.iter().enumerate() {
