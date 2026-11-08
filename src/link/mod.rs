@@ -33,7 +33,7 @@ pub(crate) use merge::segment_class;
 pub use merge::{
     MergedLayout, MergedSection, ObjectSectionContrib, merge_sections_multi_object, tls_segment,
 };
-use merge::{align_up, image_end, is_allocatable, is_debug_section, reserve_start_section};
+use merge::{align_up, image_end, is_allocatable, reserve_start_section};
 pub use relocatable::link_relocatable;
 pub use resolver::LibraryResolver;
 pub use symbols::OutputSymbol;
@@ -199,14 +199,6 @@ pub fn link_elf_objects(
 
     timer.mark("parse objects");
     if opts.gc_sections {
-        if parsed.iter().any(has_debug_section) {
-            return Err(
-                "debug info cannot be combined with --gc-sections yet: gc drops the \
-                .debug_* relocations, so line table addresses would be zero. Drop \
-                --gc-sections, or link without debug info"
-                    .into(),
-            );
-        }
         gc::collect(&mut parsed, &opts.gc_roots)?;
         for obj in &mut parsed {
             for (i, section) in obj.sections.iter().enumerate() {
@@ -219,13 +211,6 @@ pub fn link_elf_objects(
         }
     }
     link_multi_object_parsed(opts, &mut parsed, libs)
-}
-
-fn has_debug_section(obj: &ParsedObject) -> bool {
-    obj.sections
-        .iter()
-        .zip(&obj.names)
-        .any(|(section, name)| section.sh_size > 0 && is_debug_section(name))
 }
 
 fn link_multi_object_parsed(

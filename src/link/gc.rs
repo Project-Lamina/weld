@@ -1,3 +1,4 @@
+use super::merge::is_debug_section;
 use super::*;
 use crate::elf::RelaEntry;
 
@@ -213,11 +214,21 @@ pub(super) fn collect(parsed: &mut [ParsedObject], roots: &[String]) -> Result<(
             }
         }
         for j in 0..obj.sections.len() {
-            if obj.sections[j].sh_type == 4
-                && !live.contains(&(i, obj.sections[j].sh_info as usize))
-            {
-                obj.sections[j].sh_size = 0;
+            if obj.sections[j].sh_type != 4 {
+                continue;
             }
+            let target = obj.sections[j].sh_info as usize;
+            if live.contains(&(i, target)) {
+                continue;
+            }
+            // A debug section is never reachable from a root, so it is never live, but
+            // dropping its relocations would leave every address in it unrelocated.
+            // They stay, and the ones naming code that went away resolve to zero, which
+            // is the value a debug reader takes for an address that is not there.
+            if obj.names.get(target).is_some_and(|n| is_debug_section(n)) {
+                continue;
+            }
+            obj.sections[j].sh_size = 0;
         }
     }
     Ok(())

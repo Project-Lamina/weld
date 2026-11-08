@@ -145,6 +145,17 @@ pub fn apply_relocations(
         let Some(target_sh) = sections.get(target_section_idx) else {
             continue;
         };
+        // Debug sections name code that `--gc-sections` may have taken away. A reader
+        // takes address zero for something that is not in the image, so an unresolved
+        // symbol becomes zero here rather than failing the link.
+        let tombstoned: Option<Vec<Option<u64>>> = super::merge::is_debug_section(&target_name)
+            .then(|| {
+                symbol_addrs
+                    .iter()
+                    .map(|addr| Some(addr.unwrap_or(0)))
+                    .collect()
+            });
+        let symbol_addrs = tombstoned.as_deref().unwrap_or(symbol_addrs);
         let merged = &mut layout.sections[merged_idx];
         let data_off = section_offset
             .and_then(|m| m.get(&target_name).copied())
