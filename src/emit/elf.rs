@@ -3747,6 +3747,57 @@ mod tests {
             }
         }
 
+        /// An object whose section contributed nothing to the merge has nothing to
+        /// relocate. Reading its offset as zero instead would apply its relocations
+        /// over whichever object does start the merged section, which is how a stale
+        /// `.eh_frame` relocation reached past the end of a 44-byte merged section.
+        ///
+        /// A Rust binary is the case that reaches it: `libstd` brings objects whose
+        /// `.eh_frame` is pruned away while their relocations remain.
+        #[test]
+        fn links_a_rust_program_against_libstd() {
+            let guard = TempDir::new("weld-rustc");
+            let dir = guard.path();
+            fs::create_dir_all(dir).unwrap();
+            if Command::new("rustc").arg("--version").output().is_err() {
+                return;
+            }
+            std::os::unix::fs::symlink(weld_binary(), dir.join("ld")).unwrap();
+            fs::write(
+                dir.join("prog.rs"),
+                "use std::collections::HashMap;\n\
+                 fn main() {\n\
+                 let mut m = HashMap::new();\n\
+                 for i in 0..5 { m.insert(i, i * i); }\n\
+                 let mut keys: Vec<_> = m.keys().copied().collect();\n\
+                 keys.sort();\n\
+                 let sum: i32 = keys.iter().map(|k| m[k]).sum();\n\
+                 println!(\"{sum}\");\n\
+                 }\n",
+            )
+            .unwrap();
+            let built = Command::new("rustc")
+                .current_dir(dir)
+                .args([
+                    "-C",
+                    "linker=gcc",
+                    "-C",
+                    &format!("link-arg=-B{}/", dir.display()),
+                    "prog.rs",
+                    "-o",
+                    "prog",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                built.status.success(),
+                "rustc through weld: {}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+            let run = Command::new(dir.join("prog")).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&run.stdout), "30\n");
+        }
+
         /// `--gc-sections` keeps the debug sections and the addresses in them.
         ///
         /// A debug section is never reachable from a root, so gc must not take its
